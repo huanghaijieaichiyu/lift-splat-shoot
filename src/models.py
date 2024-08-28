@@ -3,12 +3,14 @@ Copyright (C) 2020 NVIDIA Corporation.  All rights reserved.
 Licensed under the NVIDIA Source Code License. See LICENSE at https://github.com/nv-tlabs/lift-splat-shoot.
 Authors: Jonah Philion and Sanja Fidler
 """
+import math
 
 import torch
 from torch import nn
 from efficientnet_pytorch import EfficientNet
 from torchvision.models.resnet import resnet18
 
+from models.common import PSA, SPPELAN, Gencov, C2fCIB, Concat, SCDown, C2f, SPPF
 from .tools import gen_dx_bx, cumsum_trick, QuickCumsum
 
 
@@ -22,10 +24,10 @@ class Up(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.SiLU(inplace=True)
         )
 
     def forward(self, x1, x2):
@@ -40,16 +42,17 @@ class CamEncode(nn.Module):
         self.D = D
         self.C = C
 
-        self.trunk = EfficientNet.from_pretrained("efficientnet-b0")
+        self.trunk = CamEncoder(3, 512)
 
-        self.up1 = Up(320+112, 512)
+        self.up1 = Up(320 + 112, 512)
         self.depthnet = nn.Conv2d(512, self.D + self.C, kernel_size=1, padding=0)
 
     def get_depth_dist(self, x, eps=1e-20):
         return x.softmax(dim=1)
 
     def get_depth_feat(self, x):
-        x = self.get_eff_depth(x)
+        # x = self.get_eff_depth(x)
+        x = self.trunk(x)
         # Depth
         x = self.depthnet(x)
 
@@ -70,14 +73,14 @@ class CamEncode(nn.Module):
         for idx, block in enumerate(self.trunk._blocks):
             drop_connect_rate = self.trunk._global_params.drop_connect_rate
             if drop_connect_rate:
-                drop_connect_rate *= float(idx) / len(self.trunk._blocks) # scale drop connect_rate
+                drop_connect_rate *= float(idx) / len(self.trunk._blocks)  # scale drop connect_rate
             x = block(x, drop_connect_rate=drop_connect_rate)
             if prev_x.size(2) > x.size(2):
-                endpoints['reduction_{}'.format(len(endpoints)+1)] = prev_x
+                endpoints['reduction_{}'.format(len(endpoints) + 1)] = prev_x
             prev_x = x
 
         # Head
-        endpoints['reduction_{}'.format(len(endpoints)+1)] = x
+        endpoints['reduction_{}'.format(len(endpoints) + 1)] = x
         x = self.up1(endpoints['reduction_5'], endpoints['reduction_4'])
         return x
 
@@ -91,28 +94,45 @@ class BevEncode(nn.Module):
     def __init__(self, inC, outC):
         super(BevEncode, self).__init__()
 
-        trunk = resnet18(pretrained=False, zero_init_residual=True)
-        self.conv1 = nn.Conv2d(inC, 64, kernel_size=7, stride=2, padding=3,
-                               bias=False)
-        self.bn1 = trunk.bn1
+        # trunk = resnet18(pretrained=False, zero_init_residual=True)
+        self.layer1 = nn.Sequential(
+            Gencov(inC, 8, 3, 2),
+            Gencov(8, 16)
+        )
+        self.layer2 = nn.Sequential(
+            Gencov(16, 32, 3, 2)
+        )
+        self.layer3 = nn.Sequential(
+            SPPF(32, 32),
+            PSA(32, 32)
+        )
+        self.layer4 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            Gencov(64, 128)
+        )
+        self.layer5 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            Gencov(128, outC)
+        )
+        """self.bn1 = trunk.bn1
         self.relu = trunk.relu
 
         self.layer1 = trunk.layer1
         self.layer2 = trunk.layer2
         self.layer3 = trunk.layer3
 
-        self.up1 = Up(64+256, 256, scale_factor=4)
+        self.up1 = Up(64 + 256, 256, scale_factor=4)
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear',
-                              align_corners=True),
+                        align_corners=True),
             nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, outC, kernel_size=1, padding=0),
-        )
+        )"""
 
     def forward(self, x):
-        x = self.conv1(x)
+        """x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
 
@@ -121,9 +141,14 @@ class BevEncode(nn.Module):
         x = self.layer3(x)
 
         x = self.up1(x, x1)
-        x = self.up2(x)
+        x = self.up2(x)"""
 
-        return x
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(torch.cat((x2, x3), 1))
+        x5 = self.layer5(x4)
+        return x5
 
 
 class LiftSplatShoot(nn.Module):
@@ -133,9 +158,9 @@ class LiftSplatShoot(nn.Module):
         self.data_aug_conf = data_aug_conf
 
         dx, bx, nx = gen_dx_bx(self.grid_conf['xbound'],
-                                              self.grid_conf['ybound'],
-                                              self.grid_conf['zbound'],
-                                              )
+                               self.grid_conf['ybound'],
+                               self.grid_conf['zbound'],
+                               )
         self.dx = nn.Parameter(dx, requires_grad=False)
         self.bx = nn.Parameter(bx, requires_grad=False)
         self.nx = nn.Parameter(nx, requires_grad=False)
@@ -149,7 +174,7 @@ class LiftSplatShoot(nn.Module):
 
         # toggle using QuickCumsum vs. autograd
         self.use_quickcumsum = True
-    
+
     def create_frustum(self):
         # make grid in image plane
         ogfH, ogfW = self.data_aug_conf['final_dim']
@@ -190,39 +215,39 @@ class LiftSplatShoot(nn.Module):
         """
         B, N, C, imH, imW = x.shape
 
-        x = x.view(B*N, C, imH, imW)
+        x = x.view(B * N, C, imH, imW)
         x = self.camencode(x)
-        x = x.view(B, N, self.camC, self.D, imH//self.downsample, imW//self.downsample)
+        x = x.view(B, N, self.camC, self.D, imH // self.downsample, imW // self.downsample)
         x = x.permute(0, 1, 3, 4, 5, 2)
 
         return x
 
     def voxel_pooling(self, geom_feats, x):
         B, N, D, H, W, C = x.shape
-        Nprime = B*N*D*H*W
+        Nprime = B * N * D * H * W
 
         # flatten x
         x = x.reshape(Nprime, C)
 
         # flatten indices
-        geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx).long()
+        geom_feats = ((geom_feats - (self.bx - self.dx / 2.)) / self.dx).long()
         geom_feats = geom_feats.view(Nprime, 3)
-        batch_ix = torch.cat([torch.full([Nprime//B, 1], ix,
-                             device=x.device, dtype=torch.long) for ix in range(B)])
+        batch_ix = torch.cat([torch.full([Nprime // B, 1], ix,
+                                         device=x.device, dtype=torch.long) for ix in range(B)])
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
 
         # filter out points that are outside box
-        kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0])\
-            & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1])\
-            & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
+        kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0]) \
+               & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1]) \
+               & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
         x = x[kept]
         geom_feats = geom_feats[kept]
 
         # get tensors from the same voxel next to each other
-        ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)\
-            + geom_feats[:, 1] * (self.nx[2] * B)\
-            + geom_feats[:, 2] * B\
-            + geom_feats[:, 3]
+        ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B) \
+                + geom_feats[:, 1] * (self.nx[2] * B) \
+                + geom_feats[:, 2] * B \
+                + geom_feats[:, 3]
         sorts = ranks.argsort()
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
 
@@ -257,3 +282,46 @@ class LiftSplatShoot(nn.Module):
 
 def compile_model(grid_conf, data_aug_conf, outC):
     return LiftSplatShoot(grid_conf, data_aug_conf, outC)
+
+
+class CamEncoder(nn.Module):
+
+    def __init__(self, c_in, c_out) -> None:
+        super(CamEncoder, self).__init__()
+        depth = 1.0
+        weight = 1.0
+        self.c_in = c_in
+        self.c_out = c_out
+        self.conv1 = Gencov(c_in, math.ceil(8 * depth))
+        self.conv2 = Gencov(math.ceil(8 * depth), math.ceil(16 * depth), math.ceil(weight), 2)
+
+        self.conv3 = SCDown(math.ceil(16 * depth), math.ceil(32 * depth), math.ceil(weight), 2)
+
+        self.conv4 = Gencov(math.ceil(32 * depth), math.ceil(64 * depth), math.ceil(weight), 2)
+
+        self.conv5 = nn.Sequential(
+            SPPELAN(math.ceil(64 * depth), math.ceil(64 * depth), math.ceil(32 * depth)),
+            PSA(math.ceil(64 * depth), math.ceil(64 * depth)),
+        )
+
+        self.conv6 = SCDown(math.ceil(64 * depth), math.ceil(128 * depth), 3, 2)
+        self.conv7 = C2fCIB(math.ceil(192 * depth), math.ceil(256 * depth))
+        self.conv8 = Gencov(math.ceil(256 * depth), c_out, math.ceil(weight), 2)
+        self.concat = Concat()
+        self.up = nn.Upsample(scale_factor=2, align_corners=True, mode='bilinear')
+
+    def forward(self, x):
+        # head net
+        x1 = self.conv1(x)
+        x2 = self.conv2(x1)
+        x3 = self.conv3(x2)
+        x4 = self.conv4(x3)
+        x5 = self.conv5(x4)
+        x6 = self.conv6(x5)
+
+        # neck net
+
+        x7 = self.conv7(self.concat((x4, self.up(x6))))
+        x8 = self.conv8(x7)
+
+        return x8.view(-1, self.c_out, 1, 1)

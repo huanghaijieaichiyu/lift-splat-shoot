@@ -287,7 +287,7 @@ def add_ego(bx, dx):
 def get_nusc_maps(map_folder):
     nusc_maps = {map_name: NuScenesMap(dataroot=map_folder,
                 map_name=map_name) for map_name in [
-                    "singapore-hollandvillage", 
+                    "singapore-hollandvillage",
                     "singapore-queenstown",
                     "boston-seaport",
                     "singapore-onenorth",
