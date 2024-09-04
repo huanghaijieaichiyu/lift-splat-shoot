@@ -8,7 +8,7 @@ import os.path
 import torch
 import matplotlib as mpl
 
-from .save_path import save_path
+from .tools import save_path
 
 mpl.use('Agg')
 import matplotlib.pyplot as plt
