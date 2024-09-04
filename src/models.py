@@ -320,10 +320,10 @@ class BEVEncoder(nn.Module):
         c_ = 2 * inC
         self.layer1 = nn.Sequential(
             Gencov(inC, c_, 3, 2),
-            C2f(c_, c_ * 0.5, 1, True)
+            C2f(c_, math.ceil(c_ * 0.5), 1, True)
         )
         self.layer2 = nn.Sequential(
-            Gencov(c_ * 0.5, c_, 3, 2)
+            Gencov(math.ceil(c_ * 0.5), c_, 3, 2)
         )
         self.layer3 = nn.Sequential(
             SPPF(c_, c_),
@@ -332,10 +332,10 @@ class BEVEncoder(nn.Module):
         self.layer4 = nn.Sequential(
             Gencov(2 * c_, c_),
             nn.Upsample(scale_factor=2),
-            C2fCIB(c_, c_ * 0.5)
+            C2fCIB(c_, math.ceil(c_ * 0.5))
         )
         self.layer5 = nn.Sequential(
-            Gencov(c_ * 0.5, math.ceil(c_ * 0.5 * 0.5), 3),
+            Gencov(math.ceil(c_ * 0.5), math.ceil(c_ * 0.5 * 0.5), 3),
             nn.Upsample(scale_factor=2),
             Gencov(math.ceil(c_ * 0.5 * 0.5), outC, act=False, bn=False)  # 注意输出层去sigmod，以及不要归一
         )

@@ -92,7 +92,7 @@ def train(version,
     for epoch in range(nepochs):
         np.random.seed()
         Iou = [0]
-        pbar = tqdm(enumerate(trainloader), total=len(trainloader), colour='#8762A5')
+        pbar = tqdm(enumerate(trainloader), total=len(trainloader), colour='#8762A5', ncols=200, nrows=5)
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0 = time()
             opt.zero_grad()
