@@ -218,6 +218,16 @@ class QuickCumsum(torch.autograd.Function):
 
         return val, None, None
 
+def save_path(path, model='train'):
+    file_path = os.path.join(path, model)
+    i = 1
+    while os.path.exists(file_path):
+
+        file_path = os.path.join(path, model+'(%i)' % i)
+        i += 1
+
+    return file_path
+
 
 class SimpleLoss(torch.nn.Module):
     def __init__(self, pos_weight):

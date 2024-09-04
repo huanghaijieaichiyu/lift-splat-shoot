@@ -15,7 +15,7 @@ import os
 
 from .models import compile_model
 from .data import compile_data
-from .save_path import save_path
+from .tools import save_path
 from .tools import SimpleLoss, get_batch_iou, get_val_info
 
 
@@ -42,7 +42,7 @@ def train(version,
           zbound=[-10.0, 10.0, 20.0],
           dbound=[4.0, 45.0, 1.0],
 
-          bsz=2,
+          bsz=4,
           nworkers=10,
           lr=1e-3,
           weight_decay=1e-7,

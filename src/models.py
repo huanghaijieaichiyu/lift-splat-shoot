@@ -267,19 +267,20 @@ class CamEncoder(nn.Module):
 
     def __init__(self, c_in, c_out) -> None:
         super(CamEncoder, self).__init__()
-        depth = 1.0
+        depth = 0.75
         weight = 1.0
         self.c_in = c_in
         self.c_out = c_out
         self.conv1 = Gencov(c_in, math.ceil(8 * depth))
         self.conv2 = nn.Sequential(
             Gencov(math.ceil(8 * depth), math.ceil(16 * depth), math.ceil(weight), 2),
-            C2f(math.ceil(16 * depth), math.ceil(32 * depth), math.ceil(weight), True)
+            Gencov(math.ceil(16 * depth), math.ceil(32 * depth), math.ceil(weight))
         )
 
         self.conv3 = nn.Sequential(
             Gencov(math.ceil(32 * depth), math.ceil(64 * depth), math.ceil(weight), 2),
-            C2f(math.ceil(64 * depth), math.ceil(128 * depth), math.ceil(weight), True))
+            Gencov(math.ceil(64 * depth), math.ceil(128 * depth), math.ceil(weight))
+        )
 
         self.conv4 = nn.Sequential(
             Gencov(math.ceil(128 * depth), math.ceil(256 * depth), math.ceil(weight), 2),
@@ -295,7 +296,7 @@ class CamEncoder(nn.Module):
         self.conv7 = C2fCIB(math.ceil(256 * depth), math.ceil(128 * depth))
         self.conv8 = Gencov(math.ceil(640 * depth), math.ceil(512 * depth), math.ceil(weight), 2)
         self.conv9 = Gencov(math.ceil(512 * depth), c_out)
-        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
 
     def forward(self, x):
         # head net
