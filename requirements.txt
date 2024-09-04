@@ -6,7 +6,7 @@ pyquaternion>=0.9.9
 torchvision>=0.10.0
 matplotlib>=3.5.2
 tqdm>=4.65.2
-tensorboardx>=2.6.2.2
 ptflops>=0.7.3
 timm>=1.0.9
 fire>=0.6.0
+tensorboard

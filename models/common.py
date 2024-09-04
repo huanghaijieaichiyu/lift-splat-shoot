@@ -1323,9 +1323,10 @@ class Gencov(nn.Module):
     g: groups
     """
 
-    def __init__(self, c1, c2, k=3, s=1, d=1, g=1, act=True, bias=False, bn=True):
+    def __init__(self, c1, c2, k=3, s=1, d=1, g=1, p=None, act=True, bias=False, bn=True):
         super(Gencov, self).__init__()
-        self.conv = Conv2dSame(c1, c2, k, s, groups=g, dilation=d, bias=bias)
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(
+            k, p, d), groups=g, dilation=d, bias=bias)
         self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
         self.act = nn.SiLU() if act else nn.Identity()
 

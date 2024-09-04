@@ -24,10 +24,10 @@ class Up(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.SiLU(inplace=True)
+            nn.LeakyReLU(inplace=True)
         )
 
     def forward(self, x1, x2):
@@ -45,7 +45,7 @@ class CamEncode(nn.Module):
         self.trunk = CamEncoder(3, 512)
 
         self.up1 = Up(320 + 112, 512)
-        self.depthnet = nn.Conv2d(512, self.D + self.C, kernel_size=1, padding=0)
+        self.depthnet = Gencov(512, self.D + self.C, bn=False, act=False)
 
     def get_depth_dist(self, x, eps=1e-20):
         return x.softmax(dim=1)
@@ -94,27 +94,11 @@ class BevEncode(nn.Module):
     def __init__(self, inC, outC):
         super(BevEncode, self).__init__()
 
-        # trunk = resnet18(pretrained=False, zero_init_residual=True)
-        self.layer1 = nn.Sequential(
-            Gencov(inC, 8, 3, 2),
-            Gencov(8, 16)
-        )
-        self.layer2 = nn.Sequential(
-            Gencov(16, 32, 3, 2)
-        )
-        self.layer3 = nn.Sequential(
-            SPPF(32, 32),
-            PSA(32, 32)
-        )
-        self.layer4 = nn.Sequential(
-            nn.Upsample(scale_factor=2),
-            Gencov(64, 128)
-        )
-        self.layer5 = nn.Sequential(
-            nn.Upsample(scale_factor=2),
-            Gencov(128, outC)
-        )
-        """self.bn1 = trunk.bn1
+        trunk = resnet18(pretrained=False, zero_init_residual=True)
+        self.conv1 = nn.Conv2d(inC, 64, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+
+        self.bn1 = trunk.bn1
         self.relu = trunk.relu
 
         self.layer1 = trunk.layer1
@@ -129,10 +113,10 @@ class BevEncode(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, outC, kernel_size=1, padding=0),
-        )"""
+        )
 
     def forward(self, x):
-        """x = self.conv1(x)
+        x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
 
@@ -141,14 +125,9 @@ class BevEncode(nn.Module):
         x = self.layer3(x)
 
         x = self.up1(x, x1)
-        x = self.up2(x)"""
+        x = self.up2(x)
 
-        x1 = self.layer1(x)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(torch.cat((x2, x3), 1))
-        x5 = self.layer5(x4)
-        return x5
+        return x
 
 
 class LiftSplatShoot(nn.Module):
@@ -170,7 +149,7 @@ class LiftSplatShoot(nn.Module):
         self.frustum = self.create_frustum()
         self.D, _, _, _ = self.frustum.shape
         self.camencode = CamEncode(self.D, self.camC, self.downsample)
-        self.bevencode = BevEncode(inC=self.camC, outC=outC)
+        self.bevencode = BEVEncoder(inC=self.camC, outC=outC)
 
         # toggle using QuickCumsum vs. autograd
         self.use_quickcumsum = True
@@ -293,22 +272,30 @@ class CamEncoder(nn.Module):
         self.c_in = c_in
         self.c_out = c_out
         self.conv1 = Gencov(c_in, math.ceil(8 * depth))
-        self.conv2 = Gencov(math.ceil(8 * depth), math.ceil(16 * depth), math.ceil(weight), 2)
-
-        self.conv3 = SCDown(math.ceil(16 * depth), math.ceil(32 * depth), math.ceil(weight), 2)
-
-        self.conv4 = Gencov(math.ceil(32 * depth), math.ceil(64 * depth), math.ceil(weight), 2)
-
-        self.conv5 = nn.Sequential(
-            SPPELAN(math.ceil(64 * depth), math.ceil(64 * depth), math.ceil(32 * depth)),
-            PSA(math.ceil(64 * depth), math.ceil(64 * depth)),
+        self.conv2 = nn.Sequential(
+            Gencov(math.ceil(8 * depth), math.ceil(16 * depth), math.ceil(weight), 2),
+            C2f(math.ceil(16 * depth), math.ceil(32 * depth), math.ceil(weight), True)
         )
 
-        self.conv6 = SCDown(math.ceil(64 * depth), math.ceil(128 * depth), 3, 2)
-        self.conv7 = C2fCIB(math.ceil(192 * depth), math.ceil(256 * depth))
-        self.conv8 = Gencov(math.ceil(256 * depth), c_out, math.ceil(weight), 2)
-        self.concat = Concat()
-        self.up = nn.Upsample(scale_factor=2, align_corners=True, mode='bilinear')
+        self.conv3 = nn.Sequential(
+            Gencov(math.ceil(32 * depth), math.ceil(64 * depth), math.ceil(weight), 2),
+            C2f(math.ceil(64 * depth), math.ceil(128 * depth), math.ceil(weight), True))
+
+        self.conv4 = nn.Sequential(
+            Gencov(math.ceil(128 * depth), math.ceil(256 * depth), math.ceil(weight), 2),
+            C2f(math.ceil(256 * depth), math.ceil(512 * depth), math.ceil(weight), True)
+        )
+
+        self.conv5 = nn.Sequential(
+            SPPELAN(math.ceil(512 * depth), math.ceil(512 * depth), math.ceil(256 * depth)),
+            PSA(math.ceil(512 * depth), math.ceil(512 * depth)),
+        )
+
+        self.conv6 = SCDown(math.ceil(512 * depth), math.ceil(256 * depth), 3, 2)
+        self.conv7 = C2fCIB(math.ceil(256 * depth), math.ceil(128 * depth))
+        self.conv8 = Gencov(math.ceil(640 * depth), math.ceil(512 * depth), math.ceil(weight), 2)
+        self.conv9 = Gencov(math.ceil(512 * depth), c_out)
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
 
     def forward(self, x):
         # head net
@@ -321,7 +308,42 @@ class CamEncoder(nn.Module):
 
         # neck net
 
-        x7 = self.conv7(self.concat((x4, self.up(x6))))
-        x8 = self.conv8(x7)
+        x7 = self.conv7(x6)
+        x8 = self.conv9(self.conv8(torch.cat((x4, self.up(x7)), 1)))
 
         return x8.view(-1, self.c_out, 1, 1)
+
+
+class BEVEncoder(nn.Module):
+    def __init__(self, inC, outC):
+        super(BEVEncoder, self).__init__()
+        c_ = 2 * inC
+        self.layer1 = nn.Sequential(
+            Gencov(inC, c_, 3, 2),
+            C2f(c_, c_ * 0.5, 1, True)
+        )
+        self.layer2 = nn.Sequential(
+            Gencov(c_ * 0.5, c_, 3, 2)
+        )
+        self.layer3 = nn.Sequential(
+            SPPF(c_, c_),
+            PSA(c_, c_)
+        )
+        self.layer4 = nn.Sequential(
+            Gencov(2 * c_, c_),
+            nn.Upsample(scale_factor=2),
+            C2fCIB(c_, c_ * 0.5)
+        )
+        self.layer5 = nn.Sequential(
+            Gencov(c_ * 0.5, math.ceil(c_ * 0.5 * 0.5), 3),
+            nn.Upsample(scale_factor=2),
+            Gencov(math.ceil(c_ * 0.5 * 0.5), outC, act=False, bn=False)  # 注意输出层去sigmod，以及不要归一
+        )
+
+    def forward(self, x):
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(torch.cat((x2, x3), 1))
+        x5 = self.layer5(x4)
+        return x5

@@ -3,9 +3,13 @@ Copyright (C) 2020 NVIDIA Corporation.  All rights reserved.
 Licensed under the NVIDIA Source Code License. See LICENSE at https://github.com/nv-tlabs/lift-splat-shoot.
 Authors: Jonah Philion and Sanja Fidler
 """
+import os.path
 
 import torch
 import matplotlib as mpl
+
+from .save_path import save_path
+
 mpl.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -46,17 +50,17 @@ def lidar_check(version,
         'dbound': dbound,
     }
     cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                             'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+            'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
     data_aug_conf = {
-                    'resize_lim': resize_lim,
-                    'final_dim': final_dim,
-                    'rot_lim': rot_lim,
-                    'H': H, 'W': W,
-                    'rand_flip': rand_flip,
-                    'bot_pct_lim': bot_pct_lim,
-                    'cams': cams,
-                    'Ncams': 5,
-                }
+        'resize_lim': resize_lim,
+        'final_dim': final_dim,
+        'rot_lim': rot_lim,
+        'H': H, 'W': W,
+        'rand_flip': rand_flip,
+        'bot_pct_lim': bot_pct_lim,
+        'cams': cams,
+        'Ncams': 5,
+    }
     trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
                                           parser_name='vizdata')
@@ -67,8 +71,8 @@ def lidar_check(version,
 
     rat = H / W
     val = 10.1
-    fig = plt.figure(figsize=(val + val/3*2*rat*3, val/3*2*rat))
-    gs = mpl.gridspec.GridSpec(2, 6, width_ratios=(1, 1, 1, 2*rat, 2*rat, 2*rat))
+    fig = plt.figure(figsize=(val + val / 3 * 2 * rat * 3, val / 3 * 2 * rat))
+    gs = mpl.gridspec.GridSpec(2, 6, width_ratios=(1, 1, 1, 2 * rat, 2 * rat, 2 * rat))
     gs.update(wspace=0.0, hspace=0.0, left=0.0, right=1.0, top=1.0, bottom=0.0)
 
     for epoch in range(nepochs):
@@ -89,14 +93,15 @@ def lidar_check(version,
                     plt.imshow(showimg)
                     if show_lidar:
                         plt.scatter(plot_pts[0, mask], plot_pts[1, mask], c=ego_pts[2, mask],
-                                s=5, alpha=0.1, cmap='jet')
+                                    s=5, alpha=0.1, cmap='jet')
                     # plot_pts = post_rots[si, imgi].matmul(img_pts[si, imgi].view(-1, 3).t()) + post_trans[si, imgi].unsqueeze(1)
                     # plt.scatter(img_pts[:, :, :, 0].view(-1), img_pts[:, :, :, 1].view(-1), s=1)
                     plt.axis('off')
 
                     plt.sca(final_ax)
-                    plt.plot(img_pts[si, imgi, :, :, :, 0].view(-1), img_pts[si, imgi, :, :, :, 1].view(-1), '.', label=cams[imgi].replace('_', ' '))
-                
+                    plt.plot(img_pts[si, imgi, :, :, :, 0].view(-1), img_pts[si, imgi, :, :, :, 1].view(-1), '.',
+                             label=cams[imgi].replace('_', ' '))
+
                 plt.legend(loc='upper right')
                 final_ax.set_aspect('equal')
                 plt.xlim((-50, 50))
@@ -117,24 +122,24 @@ def lidar_check(version,
 
 
 def cumsum_check(version,
-                dataroot='/data/nuscenes',
-                gpuid=1,
+                 dataroot='/data/nuscenes',
+                 gpuid=1,
 
-                H=900, W=1600,
-                resize_lim=(0.193, 0.225),
-                final_dim=(128, 352),
-                bot_pct_lim=(0.0, 0.22),
-                rot_lim=(-5.4, 5.4),
-                rand_flip=True,
+                 H=900, W=1600,
+                 resize_lim=(0.193, 0.225),
+                 final_dim=(128, 352),
+                 bot_pct_lim=(0.0, 0.22),
+                 rot_lim=(-5.4, 5.4),
+                 rand_flip=True,
 
-                xbound=[-50.0, 50.0, 0.5],
-                ybound=[-50.0, 50.0, 0.5],
-                zbound=[-10.0, 10.0, 20.0],
-                dbound=[4.0, 45.0, 1.0],
+                 xbound=[-50.0, 50.0, 0.5],
+                 ybound=[-50.0, 50.0, 0.5],
+                 zbound=[-10.0, 10.0, 20.0],
+                 dbound=[4.0, 45.0, 1.0],
 
-                bsz=4,
-                nworkers=10,
-                ):
+                 bsz=4,
+                 nworkers=10,
+                 ):
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,
@@ -142,16 +147,16 @@ def cumsum_check(version,
         'dbound': dbound,
     }
     data_aug_conf = {
-                    'resize_lim': resize_lim,
-                    'final_dim': final_dim,
-                    'rot_lim': rot_lim,
-                    'H': H, 'W': W,
-                    'rand_flip': rand_flip,
-                    'bot_pct_lim': bot_pct_lim,
-                    'cams': ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                             'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
-                    'Ncams': 6,
-                }
+        'resize_lim': resize_lim,
+        'final_dim': final_dim,
+        'rot_lim': rot_lim,
+        'H': H, 'W': W,
+        'rand_flip': rand_flip,
+        'bot_pct_lim': bot_pct_lim,
+        'cams': ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
+        'Ncams': 6,
+    }
     trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
                                           parser_name='segmentationdata')
@@ -164,53 +169,52 @@ def cumsum_check(version,
 
     model.eval()
     for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in enumerate(loader):
-
         model.use_quickcumsum = False
         model.zero_grad()
         out = model(imgs.to(device),
-                rots.to(device),
-                trans.to(device),
-                intrins.to(device),
-                post_rots.to(device),
-                post_trans.to(device),
-                )
+                    rots.to(device),
+                    trans.to(device),
+                    intrins.to(device),
+                    post_rots.to(device),
+                    post_trans.to(device),
+                    )
         out.mean().backward()
         print('autograd:    ', out.mean().detach().item(), model.camencode.depthnet.weight.grad.mean().item())
 
         model.use_quickcumsum = True
         model.zero_grad()
         out = model(imgs.to(device),
-                rots.to(device),
-                trans.to(device),
-                intrins.to(device),
-                post_rots.to(device),
-                post_trans.to(device),
-                )
+                    rots.to(device),
+                    trans.to(device),
+                    intrins.to(device),
+                    post_rots.to(device),
+                    post_trans.to(device),
+                    )
         out.mean().backward()
         print('quick cumsum:', out.mean().detach().item(), model.camencode.depthnet.weight.grad.mean().item())
         print()
 
 
 def eval_model_iou(version,
-                modelf,
-                dataroot='/data/nuscenes',
-                gpuid=1,
+                   modelf,
+                   dataroot='/data/nuscenes',
+                   gpuid=1,
 
-                H=900, W=1600,
-                resize_lim=(0.193, 0.225),
-                final_dim=(128, 352),
-                bot_pct_lim=(0.0, 0.22),
-                rot_lim=(-5.4, 5.4),
-                rand_flip=True,
+                   H=900, W=1600,
+                   resize_lim=(0.193, 0.225),
+                   final_dim=(128, 352),
+                   bot_pct_lim=(0.0, 0.22),
+                   rot_lim=(-5.4, 5.4),
+                   rand_flip=True,
 
-                xbound=[-50.0, 50.0, 0.5],
-                ybound=[-50.0, 50.0, 0.5],
-                zbound=[-10.0, 10.0, 20.0],
-                dbound=[4.0, 45.0, 1.0],
+                   xbound=[-50.0, 50.0, 0.5],
+                   ybound=[-50.0, 50.0, 0.5],
+                   zbound=[-10.0, 10.0, 20.0],
+                   dbound=[4.0, 45.0, 1.0],
 
-                bsz=4,
-                nworkers=10,
-                ):
+                   bsz=4,
+                   nworkers=10,
+                   ):
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,
@@ -218,16 +222,16 @@ def eval_model_iou(version,
         'dbound': dbound,
     }
     data_aug_conf = {
-                    'resize_lim': resize_lim,
-                    'final_dim': final_dim,
-                    'rot_lim': rot_lim,
-                    'H': H, 'W': W,
-                    'rand_flip': rand_flip,
-                    'bot_pct_lim': bot_pct_lim,
-                    'cams': ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                             'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
-                    'Ncams': 5,
-                }
+        'resize_lim': resize_lim,
+        'final_dim': final_dim,
+        'rot_lim': rot_lim,
+        'H': H, 'W': W,
+        'rand_flip': rand_flip,
+        'bot_pct_lim': bot_pct_lim,
+        'cams': ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
+        'Ncams': 5,
+    }
     trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
                                           parser_name='segmentationdata')
@@ -250,8 +254,8 @@ def viz_model_preds(version,
                     modelf,
                     dataroot='/data/nuscenes',
                     map_folder='/data/nuscenes/mini',
-                    gpuid=1,
-                    viz_train=False,
+                    gpuid=0,
+                    viz_train=False,  # lidar
 
                     H=900, W=1600,
                     resize_lim=(0.193, 0.225),
@@ -265,8 +269,8 @@ def viz_model_preds(version,
                     zbound=[-10.0, 10.0, 20.0],
                     dbound=[4.0, 45.0, 1.0],
 
-                    bsz=4,
-                    nworkers=10,
+                    bsz=1,
+                    nworkers=1,
                     ):
     grid_conf = {
         'xbound': xbound,
@@ -277,15 +281,15 @@ def viz_model_preds(version,
     cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
             'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
     data_aug_conf = {
-                    'resize_lim': resize_lim,
-                    'final_dim': final_dim,
-                    'rot_lim': rot_lim,
-                    'H': H, 'W': W,
-                    'rand_flip': rand_flip,
-                    'bot_pct_lim': bot_pct_lim,
-                    'cams': cams,
-                    'Ncams': 5,
-                }
+        'resize_lim': resize_lim,
+        'final_dim': final_dim,
+        'rot_lim': rot_lim,
+        'H': H, 'W': W,
+        'rand_flip': rand_flip,
+        'bot_pct_lim': bot_pct_lim,
+        'cams': cams,
+        'Ncams': 5,
+    }
     trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
                                           parser_name='segmentationdata')
@@ -307,24 +311,25 @@ def viz_model_preds(version,
         log = loader.dataset.nusc.get('log', rec['log_token'])
         scene2map[rec['name']] = log['location']
 
-
     val = 0.01
     fH, fW = final_dim
-    fig = plt.figure(figsize=(3*fW*val, (1.5*fW + 2*fH)*val))
-    gs = mpl.gridspec.GridSpec(3, 3, height_ratios=(1.5*fW, fH, fH))
+    fig = plt.figure(figsize=(3 * fW * val, (1.5 * fW + 2 * fH) * val))
+    gs = mpl.gridspec.GridSpec(3, 3, height_ratios=(1.5 * fW, fH, fH))
     gs.update(wspace=0.0, hspace=0.0, left=0.0, right=1.0, top=1.0, bottom=0.0)
-
+    logdir = 'runs/prediction'
+    path = save_path(logdir)
+    os.makedirs(path)
     model.eval()
     counter = 0
     with torch.no_grad():
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in enumerate(loader):
             out = model(imgs.to(device),
-                    rots.to(device),
-                    trans.to(device),
-                    intrins.to(device),
-                    post_rots.to(device),
-                    post_trans.to(device),
-                    )
+                        rots.to(device),
+                        trans.to(device),
+                        intrins.to(device),
+                        post_rots.to(device),
+                        post_trans.to(device),
+                        )
             out = out.sigmoid().cpu()
 
             for si in range(imgs.shape[0]):
@@ -359,5 +364,5 @@ def viz_model_preds(version,
 
                 imname = f'eval{batchi:06}_{si:03}.jpg'
                 print('saving', imname)
-                plt.savefig(imname)
+                plt.savefig(os.path.join(path, imname))
                 counter += 1

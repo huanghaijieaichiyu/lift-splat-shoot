@@ -22,9 +22,10 @@ from .tools import SimpleLoss, get_batch_iou, get_val_info
 def train(version,
           dataroot='/data/nuscenes',
           nepochs=10000,
-          gpuid=1,
+          gpuid=0,
           cuDNN=False,
-          amp=False,
+          resume='',
+          amp=True,
           H=900, W=1600,
           resize_lim=(0.193, 0.225),
           final_dim=(128, 352),
@@ -41,7 +42,7 @@ def train(version,
           zbound=[-10.0, 10.0, 20.0],
           dbound=[4.0, 45.0, 1.0],
 
-          bsz=4,
+          bsz=2,
           nworkers=10,
           lr=1e-3,
           weight_decay=1e-7,
@@ -70,7 +71,9 @@ def train(version,
     device = torch.device('cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
-    print('mode model info: \n')
+    if resume != '':
+        print("Loading checkpoint '{}'".format(resume))
+        model.load_state_dict(torch.load(resume))
     model.to(device)
     if cuDNN:
         cudnn.enabled = True
@@ -80,13 +83,15 @@ def train(version,
 
     loss_fn = SimpleLoss(pos_weight).cuda(gpuid)
     path = save_path(logdir)
-    os.makedirs(path)
+    if resume == '':
+        os.makedirs(path)
     writer = SummaryWriter(logdir=path)
     val_step = 10 if version == 'mini' else 100
     model.train()
     counter = 0
     for epoch in range(nepochs):
         np.random.seed()
+        Iou = [0]
         pbar = tqdm(enumerate(trainloader), total=len(trainloader), colour='#8762A5')
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0 = time()
@@ -99,10 +104,11 @@ def train(version,
                           post_trans.to(device),
                           )
             binimgs = binimgs.to(device)
+
             with autocast(enabled=amp):
                 loss = loss_fn(preds, binimgs)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm) # 梯度裁减
                 opt.step()
             counter += 1
             t1 = time()
@@ -110,24 +116,29 @@ def train(version,
             # print(counter, loss.item())
             pbar.set_description('||Epoch: [%d/%d]|-----|----- ||Batch: [%d/%d]||-----|-----|| Loss: %.4f||'
                                  % (epoch + 1, nepochs, batchi + 1, len(trainloader), loss.item()))
+        # Save the last model for resume
+        last_model = os.path.join(path, "last.pt")
+        torch.save(model.state_dict(), last_model)
+
         if (epoch + 1) % 10 == 0 and (epoch + 1) >= 10:
             writer.add_scalar('train/loss', loss, counter)
 
-        if (epoch + 1) % 50 == 0 and (epoch + 1) >= 50:
-            _, _, iou = get_batch_iou(preds, binimgs)
+        if (epoch + 1) % val_step == 0 and (epoch + 1) >= val_step:
+            intersect, union, iou = get_batch_iou(preds, binimgs)
+            # Save the bast model in iou
+
             writer.add_scalar('train/iou', iou, epoch + 1)
             writer.add_scalar('train/step_time', t1 - t0, epoch + 1)
-
-        if (epoch + 1) % val_step == 0 and (epoch + 1) >= val_step:
-            val_info = get_val_info(model, valloader, loss_fn, device)
-            print('||val/loss: %.4f ||-----|-----||val/iou: %.4f||', val_info['loss'], val_info['iou'])
+            val_info = get_val_info(model, valloader, loss_fn, device, True)
+            print('||val/loss:  ||-----|-----||val/iou: ||', val_info['loss'], val_info['iou'])
             writer.add_scalar('val/loss: %.4f', val_info['loss'], epoch + 1)
             writer.add_scalar('val/iou: %.4f', val_info['iou'], epoch + 1)
-
-        if (epoch + 1) % val_step == 0 and (epoch + 1) >= val_step:
-            model.eval()
-            mname = os.path.join(path, "model{}.pt".format(epoch + 1))
-            torch.save(model.state_dict(), mname)
-            model.train()
+            if val_info['iou'] > max(Iou):
+                best_model = os.path.join(path, "best.pt")
+                torch.save(model.state_dict(), best_model)
+            Iou.append(val_info['iou'])
+            print('---------|Debug data print here|-----------')
+            print('|intersect: {}|-----|-----|union: {}|-----|-----|iou: {}|'.format(intersect, union, iou))
+            print('-----------------|done|--------------------')
 
         pbar.close()

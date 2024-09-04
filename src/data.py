@@ -66,10 +66,10 @@ class NuscData(torch.utils.data.Dataset):
                 di, fi, fname = find_name(f)
                 info[f'sweeps/{di}/{fi}'] = fname
             for rec in self.nusc.sample_data:
-                if rec['channel'] == 'LIDAR_TOP' or (rec['is_key_frame'] and rec['channel'] in self.data_aug_conf['cams']):
+                if rec['channel'] == 'LIDAR_TOP' or (
+                        rec['is_key_frame'] and rec['channel'] in self.data_aug_conf['cams']):
                     rec['filename'] = info[rec['filename']]
 
-    
     def get_scenes(self):
         # filter by scene split
         split = {
@@ -92,15 +92,15 @@ class NuscData(torch.utils.data.Dataset):
         samples.sort(key=lambda x: (x['scene_token'], x['timestamp']))
 
         return samples
-    
+
     def sample_augmentation(self):
         H, W = self.data_aug_conf['H'], self.data_aug_conf['W']
         fH, fW = self.data_aug_conf['final_dim']
         if self.is_train:
             resize = np.random.uniform(*self.data_aug_conf['resize_lim'])
-            resize_dims = (int(W*resize), int(H*resize))
+            resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
-            crop_h = int((1 - np.random.uniform(*self.data_aug_conf['bot_pct_lim']))*newH) - fH
+            crop_h = int((1 - np.random.uniform(*self.data_aug_conf['bot_pct_lim'])) * newH) - fH
             crop_w = int(np.random.uniform(0, max(0, newW - fW)))
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
             flip = False
@@ -108,10 +108,10 @@ class NuscData(torch.utils.data.Dataset):
                 flip = True
             rotate = np.random.uniform(*self.data_aug_conf['rot_lim'])
         else:
-            resize = max(fH/H, fW/W)
-            resize_dims = (int(W*resize), int(H*resize))
+            resize = max(fH / H, fW / W)
+            resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
-            crop_h = int((1 - np.mean(self.data_aug_conf['bot_pct_lim']))*newH) - fH
+            crop_h = int((1 - np.mean(self.data_aug_conf['bot_pct_lim'])) * newH) - fH
             crop_w = int(max(0, newW - fW) / 2)
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
             flip = False
@@ -140,13 +140,13 @@ class NuscData(torch.utils.data.Dataset):
             # augmentation (resize, crop, horizontal flip, rotate)
             resize, resize_dims, crop, flip, rotate = self.sample_augmentation()
             img, post_rot2, post_tran2 = img_transform(img, post_rot, post_tran,
-                                                     resize=resize,
-                                                     resize_dims=resize_dims,
-                                                     crop=crop,
-                                                     flip=flip,
-                                                     rotate=rotate,
-                                                     )
-            
+                                                       resize=resize,
+                                                       resize_dims=resize_dims,
+                                                       crop=crop,
+                                                       flip=flip,
+                                                       rotate=rotate,
+                                                       )
+
             # for convenience, make augmentation matrices 3x3
             post_tran = torch.zeros(3)
             post_rot = torch.eye(3)
@@ -165,7 +165,7 @@ class NuscData(torch.utils.data.Dataset):
 
     def get_lidar_data(self, rec, nsweeps):
         pts = get_lidar_data(self.nusc, rec,
-                       nsweeps=nsweeps, min_distance=2.2)
+                             nsweeps=nsweeps, min_distance=2.2)
         return torch.Tensor(pts)[:3]  # x,y,z
 
     def get_binimg(self, rec):
@@ -185,8 +185,8 @@ class NuscData(torch.utils.data.Dataset):
 
             pts = box.bottom_corners()[:2].T
             pts = np.round(
-                (pts - self.bx[:2] + self.dx[:2]/2.) / self.dx[:2]
-                ).astype(np.int32)
+                (pts - self.bx[:2] + self.dx[:2] / 2.) / self.dx[:2]
+            ).astype(np.int32)
             pts[:, [1, 0]] = pts[:, [0, 1]]
             cv2.fillPoly(img, [pts], 1.0)
 
@@ -211,29 +211,29 @@ class NuscData(torch.utils.data.Dataset):
 class VizData(NuscData):
     def __init__(self, *args, **kwargs):
         super(VizData, self).__init__(*args, **kwargs)
-    
+
     def __getitem__(self, index):
         rec = self.ixes[index]
-        
+
         cams = self.choose_cams()
         imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(rec, cams)
         lidar_data = self.get_lidar_data(rec, nsweeps=3)
         binimg = self.get_binimg(rec)
-        
+
         return imgs, rots, trans, intrins, post_rots, post_trans, lidar_data, binimg
 
 
 class SegmentationData(NuscData):
     def __init__(self, *args, **kwargs):
         super(SegmentationData, self).__init__(*args, **kwargs)
-    
+
     def __getitem__(self, index):
         rec = self.ixes[index]
 
         cams = self.choose_cams()
         imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(rec, cams)
         binimg = self.get_binimg(rec)
-        
+
         return imgs, rots, trans, intrins, post_rots, post_trans, binimg
 
 
@@ -245,15 +245,15 @@ def compile_data(version, dataroot, data_aug_conf, grid_conf, bsz,
                  nworkers, parser_name):
     nusc = NuScenes(version='v1.0-{}'.format(version),
                     dataroot=os.path.join(dataroot, version),
-                    verbose=False)
+                    verbose=True)
     parser = {
         'vizdata': VizData,
         'segmentationdata': SegmentationData,
     }[parser_name]
     traindata = parser(nusc, is_train=True, data_aug_conf=data_aug_conf,
-                         grid_conf=grid_conf)
-    valdata = parser(nusc, is_train=False, data_aug_conf=data_aug_conf,
                        grid_conf=grid_conf)
+    valdata = parser(nusc, is_train=False, data_aug_conf=data_aug_conf,
+                     grid_conf=grid_conf)
 
     trainloader = torch.utils.data.DataLoader(traindata, batch_size=bsz,
                                               shuffle=True,
