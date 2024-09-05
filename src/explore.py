@@ -198,7 +198,7 @@ def cumsum_check(version,
 def eval_model_iou(version,
                    modelf,
                    dataroot='/data/nuscenes',
-                   gpuid=1,
+                   gpuid=0,
 
                    H=900, W=1600,
                    resize_lim=(0.193, 0.225),

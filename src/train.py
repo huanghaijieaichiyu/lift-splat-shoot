@@ -92,7 +92,7 @@ def train(version,
     for epoch in range(nepochs):
         np.random.seed()
         Iou = [0]
-        pbar = tqdm(enumerate(trainloader), total=len(trainloader), colour='#8762A5', ncols=200, nrows=5)
+        pbar = tqdm(enumerate(trainloader), total=len(trainloader), colour='#8762A5', ncols=200)
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0 = time()
             opt.zero_grad()
@@ -129,7 +129,7 @@ def train(version,
 
             writer.add_scalar('train/iou', iou, epoch + 1)
             writer.add_scalar('train/step_time', t1 - t0, epoch + 1)
-            val_info = get_val_info(model, valloader, loss_fn, device, True)
+            val_info = get_val_info(model, valloader, loss_fn, device)
             print('||val/loss: {} ||-----|-----||val/iou: {}||'.format(val_info['loss'], val_info['iou']))
             writer.add_scalar('val/loss: %.4f', val_info['loss'], epoch + 1)
             writer.add_scalar('val/iou: %.4f', val_info['iou'], epoch + 1)

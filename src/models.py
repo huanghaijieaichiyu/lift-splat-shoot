@@ -10,7 +10,7 @@ from torch import nn
 from efficientnet_pytorch import EfficientNet
 from torchvision.models.resnet import resnet18
 
-from models.common import PSA, SPPELAN, Gencov, C2fCIB, Concat, SCDown, C2f, SPPF
+from models.common import PSA, SPPELAN, Gencov, C2fCIB, Concat, SCDown, C2f, SPPF, Conv_trans
 from .tools import gen_dx_bx, cumsum_trick, QuickCumsum
 
 
@@ -43,7 +43,7 @@ class CamEncode(nn.Module):
         self.C = C
 
         self.trunk = CamEncoder(3, 512)
-
+        # self.trunk = EfficientNet.from_name('efficientnet-b0')
         self.up1 = Up(320 + 112, 512)
         self.depthnet = Gencov(512, self.D + self.C, bn=False, act=False)
 
@@ -149,7 +149,7 @@ class LiftSplatShoot(nn.Module):
         self.frustum = self.create_frustum()
         self.D, _, _, _ = self.frustum.shape
         self.camencode = CamEncode(self.D, self.camC, self.downsample)
-        self.bevencode = BEVEncoder(inC=self.camC, outC=outC)
+        self.bevencode = BevEncoder(inC=self.camC, outC=outC)
 
         # toggle using QuickCumsum vs. autograd
         self.use_quickcumsum = True
@@ -267,7 +267,7 @@ class CamEncoder(nn.Module):
 
     def __init__(self, c_in, c_out) -> None:
         super(CamEncoder, self).__init__()
-        depth = 0.75
+        depth = 1.0
         weight = 1.0
         self.c_in = c_in
         self.c_out = c_out
@@ -283,7 +283,7 @@ class CamEncoder(nn.Module):
         )
 
         self.conv4 = nn.Sequential(
-            Gencov(math.ceil(128 * depth), math.ceil(256 * depth), math.ceil(weight), 2),
+            SCDown(math.ceil(128 * depth), math.ceil(256 * depth), math.ceil(weight), 2),
             C2f(math.ceil(256 * depth), math.ceil(512 * depth), math.ceil(weight), True)
         )
 
@@ -292,7 +292,7 @@ class CamEncoder(nn.Module):
             PSA(math.ceil(512 * depth), math.ceil(512 * depth)),
         )
 
-        self.conv6 = SCDown(math.ceil(512 * depth), math.ceil(256 * depth), 3, 2)
+        self.conv6 = SCDown(math.ceil(512 * depth), math.ceil(256 * depth), 1, 2)
         self.conv7 = C2fCIB(math.ceil(256 * depth), math.ceil(128 * depth))
         self.conv8 = Gencov(math.ceil(640 * depth), math.ceil(512 * depth), math.ceil(weight), 2)
         self.conv9 = Gencov(math.ceil(512 * depth), c_out)
@@ -315,10 +315,10 @@ class CamEncoder(nn.Module):
         return x8.view(-1, self.c_out, 1, 1)
 
 
-class BEVEncoder(nn.Module):
+class BevEncoder(nn.Module):
     def __init__(self, inC, outC):
-        super(BEVEncoder, self).__init__()
-        c_ = 2 * inC
+        super(BevEncoder, self).__init__()
+        c_ = math.ceil(0.5 * inC)
         self.layer1 = nn.Sequential(
             Gencov(inC, c_, 3, 2),
             C2f(c_, math.ceil(c_ * 0.5), 1, True)

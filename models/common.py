@@ -1336,7 +1336,7 @@ class Gencov(nn.Module):
 
 class Conv_trans(nn.Module):
     """
-
+   Standard Conv Translation
     """
 
     def __init__(self, c1, c2, k=4, s=2, p=1, d=1, g=1, act=True, bias=False, bn=True):
