@@ -267,7 +267,7 @@ class CamEncoder(nn.Module):
 
     def __init__(self, c_in, c_out) -> None:
         super(CamEncoder, self).__init__()
-        depth = 1.0
+        depth = 0.75
         weight = 1.0
         self.c_in = c_in
         self.c_out = c_out
@@ -279,7 +279,7 @@ class CamEncoder(nn.Module):
 
         self.conv3 = nn.Sequential(
             Gencov(math.ceil(32 * depth), math.ceil(64 * depth), math.ceil(weight), 2),
-            Gencov(math.ceil(64 * depth), math.ceil(128 * depth), math.ceil(weight))
+            C2f(math.ceil(64 * depth), math.ceil(128 * depth), math.ceil(weight))
         )
 
         self.conv4 = nn.Sequential(
@@ -296,7 +296,7 @@ class CamEncoder(nn.Module):
         self.conv7 = C2fCIB(math.ceil(256 * depth), math.ceil(128 * depth))
         self.conv8 = Gencov(math.ceil(640 * depth), math.ceil(512 * depth), math.ceil(weight), 2)
         self.conv9 = Gencov(math.ceil(512 * depth), c_out)
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up = nn.Upsample(scale_factor=2)
 
     def forward(self, x):
         # head net
@@ -310,7 +310,7 @@ class CamEncoder(nn.Module):
         # neck net
 
         x7 = self.conv7(x6)
-        x8 = self.conv9(self.conv8(torch.cat((x4, self.up(x7)), 1)))
+        x8 = self.conv9(self.conv8(torch.cat((x5, self.up(x7)), 1)))
 
         return x8.view(-1, self.c_out, 1, 1)
 
@@ -318,27 +318,27 @@ class CamEncoder(nn.Module):
 class BevEncoder(nn.Module):
     def __init__(self, inC, outC):
         super(BevEncoder, self).__init__()
-        c_ = math.ceil(0.5 * inC)
+        # c_ = math.ceil(0.5 * inC)
         self.layer1 = nn.Sequential(
-            Gencov(inC, c_, 3, 2),
-            C2f(c_, math.ceil(c_ * 0.5), 1, True)
+            Gencov(inC, 16, 3, 2),
+            C2f(16, 32, 1, True)
         )
         self.layer2 = nn.Sequential(
-            Gencov(math.ceil(c_ * 0.5), c_, 3, 2)
+            Gencov(32, 64, 3, 2)
         )
         self.layer3 = nn.Sequential(
-            SPPF(c_, c_),
-            PSA(c_, c_)
+            SPPF(64, 64),
+            PSA(64, 64)
         )
         self.layer4 = nn.Sequential(
-            Gencov(2 * c_, c_),
-            nn.Upsample(scale_factor=2),
-            C2fCIB(c_, math.ceil(c_ * 0.5))
+            Gencov(128, 128),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            C2fCIB(128, 256)
         )
         self.layer5 = nn.Sequential(
-            Gencov(math.ceil(c_ * 0.5), math.ceil(c_ * 0.5 * 0.5), 3),
+            Gencov(256, 512, 3),
             nn.Upsample(scale_factor=2),
-            Gencov(math.ceil(c_ * 0.5 * 0.5), outC, act=False, bn=False)  # 注意输出层去sigmod，以及不要归一
+            Gencov(512, outC, act=False, bn=False)  # 注意输出层去sigmod，以及不要归一
         )
 
     def forward(self, x):

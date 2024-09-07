@@ -71,9 +71,7 @@ def train(version,
     device = torch.device('cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
-    if resume != '':
-        print("Loading checkpoint '{}'".format(resume))
-        model.load_state_dict(torch.load(resume))
+
     model.to(device)
     if cuDNN:
         cudnn.enabled = True
@@ -82,17 +80,29 @@ def train(version,
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     loss_fn = SimpleLoss(pos_weight).cuda(gpuid)
-    path = save_path(logdir)
-    if resume == '':
-        os.makedirs(path)
+
+    if resume != '':
+        path = os.path.dirname(resume)
+    else:
+        path = save_path(logdir)
     writer = SummaryWriter(logdir=path)
     val_step = 10 if version == 'mini' else 100
     model.train()
     counter = 0
-    for epoch in range(nepochs):
+    epoch = 0
+    while epoch < nepochs:
         np.random.seed()
         Iou = [0]
         pbar = tqdm(enumerate(trainloader), total=len(trainloader), colour='#8762A5', ncols=200)
+
+        if resume != '':
+            print("Loading checkpoint '{}'".format(resume))
+            checkpoint = torch.load(resume)
+            model.load_state_dict(checkpoint['net'])
+            opt.load_state_dict(checkpoint['optimizer'])
+            loss_fn.load_state_dict(checkpoint['loss'])
+            epoch = checkpoint['epoch']
+            resume = ''
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0 = time()
             opt.zero_grad()
@@ -108,7 +118,7 @@ def train(version,
             with autocast(enabled=amp):
                 loss = loss_fn(preds, binimgs)
                 loss.backward()
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm) # 梯度裁减
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # 梯度裁减
                 opt.step()
             counter += 1
             t1 = time()
@@ -117,8 +127,14 @@ def train(version,
             pbar.set_description('||Epoch: [%d/%d]|-----|----- ||Batch: [%d/%d]||-----|-----|| Loss: %.4f||'
                                  % (epoch + 1, nepochs, batchi + 1, len(trainloader), loss.item()))
         # Save the last model for resume
+        last_checkpoint = {
+            'net': model.state_dict(),
+            'optimizer': opt.state_dict(),
+            'epoch': epoch,
+            'loss': loss_fn.state_dict()
+        }
         last_model = os.path.join(path, "last.pt")
-        torch.save(model.state_dict(), last_model)
+        torch.save(last_checkpoint, last_model)
 
         if (epoch + 1) % 10 == 0 and (epoch + 1) >= 10:
             writer.add_scalar('train/loss', loss, counter)
@@ -134,11 +150,18 @@ def train(version,
             writer.add_scalar('val/loss: %.4f', val_info['loss'], epoch + 1)
             writer.add_scalar('val/iou: %.4f', val_info['iou'], epoch + 1)
             if val_info['iou'] > max(Iou):
+                best_checkpoint = {
+                    'net': model.state_dict(),
+                    'optimizer': opt.state_dict(),
+                    'epoch': epoch,
+                    'loss': loss_fn.state_dict()
+                }
                 best_model = os.path.join(path, "best.pt")
-                torch.save(model.state_dict(), best_model)
+                torch.save(best_checkpoint, best_model)
             Iou.append(val_info['iou'])
             print('---------|Debug data print here|-----------')
             print('|intersect: {}|-----|-----|union: {}|-----|-----|iou: {}|'.format(intersect, union, iou))
             print('-----------------|done|--------------------')
-
+        epoch += 1
         pbar.close()
+    writer.close()
