@@ -10,7 +10,8 @@ from torch import nn
 from efficientnet_pytorch import EfficientNet
 from torchvision.models.resnet import resnet18
 
-from models.common import PSA, SPPELAN, Gencov, C2fCIB, Concat, SCDown, C2f, SPPF, Conv_trans
+from models.RepVit import RepViTBlock
+from models.common import PSA, SPPELAN, Gencov, C2fCIB, SCDown, C2f, SPPF
 from .tools import gen_dx_bx, cumsum_trick, QuickCumsum
 
 
@@ -22,12 +23,14 @@ class Up(nn.Module):
                               align_corners=True)
 
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, out_channels,
+                      kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels,
+                      kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(inplace=True)
+            nn.ReLU(inplace=True)
         )
 
     def forward(self, x1, x2):
@@ -42,8 +45,8 @@ class CamEncode(nn.Module):
         self.D = D
         self.C = C
 
-        self.trunk = CamEncoder(3, 512)
-        # self.trunk = EfficientNet.from_name('efficientnet-b0')
+        # self.trunk = CamEncoder(3, 512)
+        self.trunk = EfficientNet.from_name('efficientnet-b0')
         self.up1 = Up(320 + 112, 512)
         self.depthnet = Gencov(512, self.D + self.C, bn=False, act=False)
 
@@ -51,13 +54,14 @@ class CamEncode(nn.Module):
         return x.softmax(dim=1)
 
     def get_depth_feat(self, x):
-        # x = self.get_eff_depth(x)
-        x = self.trunk(x)
+        x = self.get_eff_depth(x)
+        # x = self.trunk(x)
         # Depth
         x = self.depthnet(x)
 
         depth = self.get_depth_dist(x[:, :self.D])
-        new_x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
+        new_x = depth.unsqueeze(
+            1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
 
         return depth, new_x
 
@@ -73,7 +77,8 @@ class CamEncode(nn.Module):
         for idx, block in enumerate(self.trunk._blocks):
             drop_connect_rate = self.trunk._global_params.drop_connect_rate
             if drop_connect_rate:
-                drop_connect_rate *= float(idx) / len(self.trunk._blocks)  # scale drop connect_rate
+                # scale drop connect_rate
+                drop_connect_rate *= float(idx) / len(self.trunk._blocks)
             x = block(x, drop_connect_rate=drop_connect_rate)
             if prev_x.size(2) > x.size(2):
                 endpoints['reduction_{}'.format(len(endpoints) + 1)] = prev_x
@@ -158,10 +163,13 @@ class LiftSplatShoot(nn.Module):
         # make grid in image plane
         ogfH, ogfW = self.data_aug_conf['final_dim']
         fH, fW = ogfH // self.downsample, ogfW // self.downsample
-        ds = torch.arange(*self.grid_conf['dbound'], dtype=torch.float).view(-1, 1, 1).expand(-1, fH, fW)
+        ds = torch.arange(
+            *self.grid_conf['dbound'], dtype=torch.float).view(-1, 1, 1).expand(-1, fH, fW)
         D, _, _ = ds.shape
-        xs = torch.linspace(0, ogfW - 1, fW, dtype=torch.float).view(1, 1, fW).expand(D, fH, fW)
-        ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(D, fH, fW)
+        xs = torch.linspace(
+            0, ogfW - 1, fW, dtype=torch.float).view(1, 1, fW).expand(D, fH, fW)
+        ys = torch.linspace(
+            0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(D, fH, fW)
 
         # D x H x W x 3
         frustum = torch.stack((xs, ys, ds), -1)
@@ -177,7 +185,8 @@ class LiftSplatShoot(nn.Module):
         # undo post-transformation
         # B x N x D x H x W x 3
         points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
-        points = torch.inverse(post_rots).view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+        points = torch.inverse(post_rots).view(
+            B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
 
         # cam_to_ego
         points = torch.cat((points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
@@ -196,7 +205,8 @@ class LiftSplatShoot(nn.Module):
 
         x = x.view(B * N, C, imH, imW)
         x = self.camencode(x)
-        x = x.view(B, N, self.camC, self.D, imH // self.downsample, imW // self.downsample)
+        x = x.view(B, N, self.camC, self.D, imH //
+                   self.downsample, imW // self.downsample)
         x = x.permute(0, 1, 3, 4, 5, 2)
 
         return x
@@ -217,16 +227,16 @@ class LiftSplatShoot(nn.Module):
 
         # filter out points that are outside box
         kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0]) \
-               & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1]) \
-               & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
+            & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1]) \
+            & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
         x = x[kept]
         geom_feats = geom_feats[kept]
 
         # get tensors from the same voxel next to each other
         ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B) \
-                + geom_feats[:, 1] * (self.nx[2] * B) \
-                + geom_feats[:, 2] * B \
-                + geom_feats[:, 3]
+            + geom_feats[:, 1] * (self.nx[2] * B) \
+            + geom_feats[:, 2] * B \
+            + geom_feats[:, 3]
         sorts = ranks.argsort()
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
 
@@ -237,8 +247,10 @@ class LiftSplatShoot(nn.Module):
             x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
 
         # griddify (B x C x Z x X x Y)
-        final = torch.zeros((B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device)
-        final[geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 0], geom_feats[:, 1]] = x
+        final = torch.zeros(
+            (B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device)
+        final[geom_feats[:, 3], :, geom_feats[:, 2],
+              geom_feats[:, 0], geom_feats[:, 1]] = x
 
         # collapse Z
         final = torch.cat(final.unbind(dim=2), 1)
@@ -267,35 +279,44 @@ class CamEncoder(nn.Module):
 
     def __init__(self, c_in, c_out) -> None:
         super(CamEncoder, self).__init__()
-        depth = 0.75
+        depth = 1
         weight = 1.0
         self.c_in = c_in
         self.c_out = c_out
         self.conv1 = Gencov(c_in, math.ceil(8 * depth))
         self.conv2 = nn.Sequential(
-            Gencov(math.ceil(8 * depth), math.ceil(16 * depth), math.ceil(weight), 2),
-            Gencov(math.ceil(16 * depth), math.ceil(32 * depth), math.ceil(weight))
+            RepViTBlock(math.ceil(8 * depth), math.ceil(16 * depth),
+                        3 * math.ceil(weight), 2),
+            RepViTBlock(math.ceil(16 * depth),
+                        math.ceil(16 * depth), 1, 1, 0, 0)
         )
 
         self.conv3 = nn.Sequential(
-            Gencov(math.ceil(32 * depth), math.ceil(64 * depth), math.ceil(weight), 2),
-            C2f(math.ceil(64 * depth), math.ceil(128 * depth), math.ceil(weight))
+            RepViTBlock(math.ceil(16 * depth), math.ceil(32 * depth),
+                        3 * math.ceil(weight), 2),
+            RepViTBlock(math.ceil(32 * depth),
+                        math.ceil(32 * depth), 1, 1, 0, 0)
         )
 
         self.conv4 = nn.Sequential(
-            SCDown(math.ceil(128 * depth), math.ceil(256 * depth), math.ceil(weight), 2),
-            C2f(math.ceil(256 * depth), math.ceil(512 * depth), math.ceil(weight), True)
+            RepViTBlock(math.ceil(32 * depth),
+                        math.ceil(64 * depth), math.ceil(weight), 2),
+            C2f(math.ceil(64 * depth), math.ceil(128 * depth),
+                math.ceil(weight), True)
         )
 
         self.conv5 = nn.Sequential(
-            SPPELAN(math.ceil(512 * depth), math.ceil(512 * depth), math.ceil(256 * depth)),
-            PSA(math.ceil(512 * depth), math.ceil(512 * depth)),
+            SPPELAN(math.ceil(128 * depth),
+                    math.ceil(128 * depth), math.ceil(64 * depth)),
+            PSA(math.ceil(128 * depth), math.ceil(128 * depth)),
         )
 
-        self.conv6 = SCDown(math.ceil(512 * depth), math.ceil(256 * depth), 1, 2)
-        self.conv7 = C2fCIB(math.ceil(256 * depth), math.ceil(128 * depth))
-        self.conv8 = Gencov(math.ceil(640 * depth), math.ceil(512 * depth), math.ceil(weight), 2)
-        self.conv9 = Gencov(math.ceil(512 * depth), c_out)
+        self.conv6 = RepViTBlock(math.ceil(128 * depth),
+                                 math.ceil(256 * depth), 1, 2)
+        self.conv7 = C2fCIB(math.ceil(256 * depth), math.ceil(512 * depth))
+        self.conv8 = RepViTBlock(math.ceil(640 * depth),
+                                 math.ceil(1024 * depth), math.ceil(weight), 2)
+        self.conv9 = Gencov(math.ceil(1024 * depth), c_out)
         self.up = nn.Upsample(scale_factor=2)
 
     def forward(self, x):
@@ -320,11 +341,11 @@ class BevEncoder(nn.Module):
         super(BevEncoder, self).__init__()
         # c_ = math.ceil(0.5 * inC)
         self.layer1 = nn.Sequential(
-            Gencov(inC, 16, 3, 2),
+            RepViTBlock(inC, 16, 3, 2),
             C2f(16, 32, 1, True)
         )
         self.layer2 = nn.Sequential(
-            Gencov(32, 64, 3, 2)
+            RepViTBlock(32, 64, 3, 2)
         )
         self.layer3 = nn.Sequential(
             SPPF(64, 64),

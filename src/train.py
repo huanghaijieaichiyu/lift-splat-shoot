@@ -124,8 +124,10 @@ def train(version,
             t1 = time()
 
             # print(counter, loss.item())
-            pbar.set_description('||Epoch: [%d/%d]|-----|----- ||Batch: [%d/%d]||-----|-----|| Loss: %.4f||'
+            pbar.set_description('||Epoch: [%d/%d]|-----|-----||Batch: [%d/%d]||-----|-----|| Loss: %.4f||'
                                  % (epoch + 1, nepochs, batchi + 1, len(trainloader), loss.item()))
+
+
         # Save the last model for resume
         last_checkpoint = {
             'net': model.state_dict(),
@@ -142,14 +144,7 @@ def train(version,
         if (epoch + 1) % val_step == 0 and (epoch + 1) >= val_step:
             intersect, union, iou = get_batch_iou(preds, binimgs)
             # Save the bast model in iou
-
-            writer.add_scalar('train/iou', iou, epoch + 1)
-            writer.add_scalar('train/step_time', t1 - t0, epoch + 1)
-            val_info = get_val_info(model, valloader, loss_fn, device)
-            print('||val/loss: {} ||-----|-----||val/iou: {}||'.format(val_info['loss'], val_info['iou']))
-            writer.add_scalar('val/loss: %.4f', val_info['loss'], epoch + 1)
-            writer.add_scalar('val/iou: %.4f', val_info['iou'], epoch + 1)
-            if val_info['iou'] > max(Iou):
+            if iou > max(Iou):
                 best_checkpoint = {
                     'net': model.state_dict(),
                     'optimizer': opt.state_dict(),
@@ -158,10 +153,20 @@ def train(version,
                 }
                 best_model = os.path.join(path, "best.pt")
                 torch.save(best_checkpoint, best_model)
-            Iou.append(val_info['iou'])
+
+
+            Iou.append(iou)
+            writer.add_scalar('train/iou', iou, epoch + 1)
+            writer.add_scalar('train/step_time', t1 - t0, epoch + 1)
+            val_info = get_val_info(model, valloader, loss_fn, device)
+            print('||val/loss: {} ||-----|-----||val/iou: {}||'.format(val_info['loss'], val_info['iou']))
+            writer.add_scalar('val/loss: %.4f', val_info['loss'], epoch + 1)
+            writer.add_scalar('val/iou: %.4f', val_info['iou'], epoch + 1)
             print('---------|Debug data print here|-----------')
             print('|intersect: {}|-----|-----|union: {}|-----|-----|iou: {}|'.format(intersect, union, iou))
             print('-----------------|done|--------------------')
+
+
         epoch += 1
         pbar.close()
     writer.close()

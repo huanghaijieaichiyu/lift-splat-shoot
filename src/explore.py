@@ -300,7 +300,7 @@ def viz_model_preds(version,
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
     print('loading', modelf)
-    model.load_state_dict(torch.load(modelf))
+    model.load_state_dict(torch.load(modelf)['net'])
     model.to(device)
 
     dx, bx, _ = gen_dx_bx(grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'])
