@@ -87,9 +87,10 @@ class CamEncode(nn.Module):
         # Head
         endpoints['reduction_{}'.format(len(endpoints) + 1)] = x
         x = self.up1(endpoints['reduction_5'], endpoints['reduction_4'])
-        return x
+        return x  # x: 24 x 512 x 8 x 22
 
     def forward(self, x):
+        # depth: B*N x D x fH x fW(24 x 41 x 8 x 22)  x: B*N x C x D x fH x fW(24 x 64 x 41 x 8 x 22)
         depth, x = self.get_depth_feat(x)
 
         return x
@@ -333,7 +334,7 @@ class CamEncoder(nn.Module):
         x7 = self.conv7(x6)
         x8 = self.conv9(self.conv8(torch.cat((x5, self.up(x7)), 1)))
 
-        return x8.view(-1, self.c_out, 1, 1)
+        return x8.view(-1, self.c_out, 8, 22)
 
 
 class BevEncoder(nn.Module):
@@ -359,7 +360,7 @@ class BevEncoder(nn.Module):
         )
         self.layer5 = nn.Sequential(
             RepViTBlock(256, 256, 3, 1, 1, 0),
-            nn.Upsample(scale_factor=2),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             Gencov(256, outC, act=False, bn=False)  # 注意输出层去sigmod，以及不要归一
         )
 
