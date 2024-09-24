@@ -45,8 +45,8 @@ class CamEncode(nn.Module):
         self.D = D
         self.C = C
 
-        # self.trunk = CamEncoder(3, 512)
-        self.trunk = EfficientNet.from_name('efficientnet-b0')
+        self.trunk = CamEncoder(3, 512)
+        # self.trunk = EfficientNet.from_name('efficientnet-b0')
         self.up1 = Up(320 + 112, 512)
         self.depthnet = Gencov(512, self.D + self.C, bn=False, act=False)
 
@@ -54,8 +54,8 @@ class CamEncode(nn.Module):
         return x.softmax(dim=1)
 
     def get_depth_feat(self, x):
-        x = self.get_eff_depth(x)
-        # x = self.trunk(x)
+        # x = self.get_eff_depth(x)
+        x = self.trunk(x)
         # Depth
         x = self.depthnet(x)
 
@@ -345,21 +345,22 @@ class BevEncoder(nn.Module):
             C2f(16, 32, 1, True)
         )
         self.layer2 = nn.Sequential(
-            RepViTBlock(32, 64, 3, 2)
+            RepViTBlock(32, 64, 3, 2),
+            RepViTBlock(64, 64, 1, 1, 0, 0)
         )
         self.layer3 = nn.Sequential(
             SPPF(64, 64),
             PSA(64, 64)
         )
         self.layer4 = nn.Sequential(
-            Gencov(128, 128),
+            RepViTBlock(128, 128, 3, 1, 1, 0),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             C2fCIB(128, 256)
         )
         self.layer5 = nn.Sequential(
-            Gencov(256, 512, 3),
+            RepViTBlock(256, 256, 3, 1, 1, 0),
             nn.Upsample(scale_factor=2),
-            Gencov(512, outC, act=False, bn=False)  # 注意输出层去sigmod，以及不要归一
+            Gencov(256, outC, act=False, bn=False)  # 注意输出层去sigmod，以及不要归一
         )
 
     def forward(self, x):
