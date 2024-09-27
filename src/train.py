@@ -9,7 +9,7 @@ from time import time
 from tensorboardX import SummaryWriter
 from torch.backends import cudnn
 from tqdm import tqdm
-from torch.cuda.amp import autocast
+from torch.cuda.amp.autocast_mode import autocast
 import numpy as np
 import os
 
@@ -93,28 +93,26 @@ def train(version,
     model.train()
     counter = 0
     epoch = 0
+    if resume != '':
+        print("Loading checkpoint '{}'".format(resume))
+        checkpoint = torch.load(resume)
+        model.load_state_dict(checkpoint['net'])
+        opt.load_state_dict(checkpoint['optimizer'])
+        loss_fn.load_state_dict(checkpoint['loss'])
+        epoch = checkpoint['epoch']
+
+    if load_weight != '':
+        print("Loading weight '{}'".format(load_weight))
+        checkpoint = torch.load(load_weight)
+        model.load_state_dict(checkpoint['net'], strict=False)
+        opt.load_state_dict(checkpoint['optimizer'])
+        loss_fn.load_state_dict(checkpoint['loss'])
+
     while epoch < nepochs:
         np.random.seed()
         Iou = [0]
         pbar = tqdm(enumerate(trainloader), total=len(
             trainloader), colour='#8762A5', ncols=200)
-
-        if resume != '':
-            print("Loading checkpoint '{}'".format(resume))
-            checkpoint = torch.load(resume)
-            model.load_state_dict(checkpoint['net'])
-            opt.load_state_dict(checkpoint['optimizer'])
-            loss_fn.load_state_dict(checkpoint['loss'])
-            epoch = checkpoint['epoch']
-            resume = ''
-
-        if load_weight != '':
-            print("Loading weight '{}'".format(load_weight))
-            checkpoint = torch.load(load_weight)
-            model.load_state_dict(checkpoint['net'])
-            opt.load_state_dict(checkpoint['optimizer'])
-            loss_fn.load_state_dict(checkpoint['loss'])
-            load_weight = ''
 
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0 = time()
