@@ -25,6 +25,7 @@ def train(version,
           gpuid=0,
           cuDNN=False,
           resume='',
+          load_weight='',
           amp=True,
           H=900, W=1600,
           resize_lim=(0.193, 0.225),
@@ -68,7 +69,8 @@ def train(version,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
                                           parser_name='segmentationdata')
 
-    device = torch.device('cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
+    device = torch.device(
+        'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
 
@@ -77,7 +79,8 @@ def train(version,
         cudnn.enabled = True
         cudnn.benchmark = True
         cudnn.deterministic = True
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = torch.optim.Adam(model.parameters(), lr=lr,
+                           weight_decay=weight_decay)
 
     loss_fn = SimpleLoss(pos_weight).cuda(gpuid)
 
@@ -93,7 +96,8 @@ def train(version,
     while epoch < nepochs:
         np.random.seed()
         Iou = [0]
-        pbar = tqdm(enumerate(trainloader), total=len(trainloader), colour='#8762A5', ncols=200)
+        pbar = tqdm(enumerate(trainloader), total=len(
+            trainloader), colour='#8762A5', ncols=200)
 
         if resume != '':
             print("Loading checkpoint '{}'".format(resume))
@@ -103,6 +107,15 @@ def train(version,
             loss_fn.load_state_dict(checkpoint['loss'])
             epoch = checkpoint['epoch']
             resume = ''
+
+        if load_weight != '':
+            print("Loading weight '{}'".format(load_weight))
+            checkpoint = torch.load(load_weight)
+            model.load_state_dict(checkpoint['net'])
+            opt.load_state_dict(checkpoint['optimizer'])
+            loss_fn.load_state_dict(checkpoint['loss'])
+            load_weight = ''
+
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0 = time()
             opt.zero_grad()
@@ -118,7 +131,8 @@ def train(version,
             with autocast(enabled=amp):
                 loss = loss_fn(preds, binimgs)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # 梯度裁减
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm)  # 梯度裁减
                 opt.step()
             counter += 1
             t1 = time()
@@ -126,7 +140,6 @@ def train(version,
             # print(counter, loss.item())
             pbar.set_description('||Epoch: [%d/%d]|-----|-----||Batch: [%d/%d]||-----|-----|| Loss: %.4f||'
                                  % (epoch + 1, nepochs, batchi + 1, len(trainloader), loss.item()))
-
 
         # Save the last model for resume
         last_checkpoint = {
@@ -154,18 +167,18 @@ def train(version,
                 best_model = os.path.join(path, "best.pt")
                 torch.save(best_checkpoint, best_model)
 
-
             Iou.append(iou)
             writer.add_scalar('train/iou', iou, epoch + 1)
             writer.add_scalar('train/step_time', t1 - t0, epoch + 1)
             val_info = get_val_info(model, valloader, loss_fn, device)
-            print('||val/loss: {} ||-----|-----||val/iou: {}||'.format(val_info['loss'], val_info['iou']))
+            print(
+                '||val/loss: {} ||-----|-----||val/iou: {}||'.format(val_info['loss'], val_info['iou']))
             writer.add_scalar('val/loss: %.4f', val_info['loss'], epoch + 1)
             writer.add_scalar('val/iou: %.4f', val_info['iou'], epoch + 1)
             print('---------|Debug data print here|-----------')
-            print('|intersect: {}|-----|-----|union: {}|-----|-----|iou: {}|'.format(intersect, union, iou))
+            print(
+                '|intersect: {}|-----|-----|union: {}|-----|-----|iou: {}|'.format(intersect, union, iou))
             print('-----------------|done|--------------------')
-
 
         epoch += 1
         pbar.close()
