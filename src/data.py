@@ -28,7 +28,8 @@ class NuscData(torch.utils.data.Dataset):
         self.scenes = self.get_scenes()
         self.ixes = self.prepro()
 
-        dx, bx, nx = gen_dx_bx(grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'])
+        dx, bx, nx = gen_dx_bx(
+            grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'])
         self.dx, self.bx, self.nx = dx.numpy(), bx.numpy(), nx.numpy()
 
         self.fix_nuscenes_formatting()
@@ -55,13 +56,16 @@ class NuscData(torch.utils.data.Dataset):
         # adjust the image paths if needed
         if not os.path.isfile(imgname):
             print('adjusting nuscenes file paths')
-            fs = glob(os.path.join(self.nusc.dataroot, 'samples/*/samples/CAM*/*.jpg'))
-            fs += glob(os.path.join(self.nusc.dataroot, 'samples/*/samples/LIDAR_TOP/*.pcd.bin'))
+            fs = glob(os.path.join(self.nusc.dataroot,
+                      'samples/*/samples/CAM*/*.jpg'))
+            fs += glob(os.path.join(self.nusc.dataroot,
+                       'samples/*/samples/LIDAR_TOP/*.pcd.bin'))
             info = {}
             for f in fs:
                 di, fi, fname = find_name(f)
                 info[f'samples/{di}/{fi}'] = fname
-            fs = glob(os.path.join(self.nusc.dataroot, 'sweeps/*/sweeps/LIDAR_TOP/*.pcd.bin'))
+            fs = glob(os.path.join(self.nusc.dataroot,
+                      'sweeps/*/sweeps/LIDAR_TOP/*.pcd.bin'))
             for f in fs:
                 di, fi, fname = find_name(f)
                 info[f'sweeps/{di}/{fi}'] = fname
@@ -100,7 +104,8 @@ class NuscData(torch.utils.data.Dataset):
             resize = np.random.uniform(*self.data_aug_conf['resize_lim'])
             resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
-            crop_h = int((1 - np.random.uniform(*self.data_aug_conf['bot_pct_lim'])) * newH) - fH
+            crop_h = int(
+                (1 - np.random.uniform(*self.data_aug_conf['bot_pct_lim'])) * newH) - fH
             crop_w = int(np.random.uniform(0, max(0, newW - fW)))
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
             flip = False
@@ -111,7 +116,8 @@ class NuscData(torch.utils.data.Dataset):
             resize = max(fH / H, fW / W)
             resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
-            crop_h = int((1 - np.mean(self.data_aug_conf['bot_pct_lim'])) * newH) - fH
+            crop_h = int(
+                (1 - np.mean(self.data_aug_conf['bot_pct_lim'])) * newH) - fH
             crop_w = int(max(0, newW - fW) / 2)
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
             flip = False
@@ -132,7 +138,8 @@ class NuscData(torch.utils.data.Dataset):
             post_rot = torch.eye(2)
             post_tran = torch.zeros(2)
 
-            sens = self.nusc.get('calibrated_sensor', samp['calibrated_sensor_token'])
+            sens = self.nusc.get('calibrated_sensor',
+                                 samp['calibrated_sensor_token'])
             intrin = torch.Tensor(sens['camera_intrinsic'])
             rot = torch.Tensor(Quaternion(sens['rotation']).rotation_matrix)
             tran = torch.Tensor(sens['translation'])
@@ -179,7 +186,8 @@ class NuscData(torch.utils.data.Dataset):
             # add category for lyft
             if not inst['category_name'].split('.')[0] == 'vehicle':
                 continue
-            box = Box(inst['translation'], inst['size'], Quaternion(inst['rotation']))
+            box = Box(inst['translation'], inst['size'],
+                      Quaternion(inst['rotation']))
             box.translate(trans)
             box.rotate(rot)
 
@@ -216,7 +224,8 @@ class VizData(NuscData):
         rec = self.ixes[index]
 
         cams = self.choose_cams()
-        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(rec, cams)
+        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(
+            rec, cams)
         lidar_data = self.get_lidar_data(rec, nsweeps=3)
         binimg = self.get_binimg(rec)
 
@@ -231,7 +240,8 @@ class SegmentationData(NuscData):
         rec = self.ixes[index]
 
         cams = self.choose_cams()
-        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(rec, cams)
+        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(
+            rec, cams)
         binimg = self.get_binimg(rec)
 
         return imgs, rots, trans, intrins, post_rots, post_trans, binimg
@@ -244,7 +254,7 @@ def worker_rnd_init(x):
 def compile_data(version, dataroot, data_aug_conf, grid_conf, bsz,
                  nworkers, parser_name):
     nusc = NuScenes(version='v1.0-{}'.format(version),
-                    dataroot=os.path.join(dataroot, version),
+                    dataroot=dataroot,
                     verbose=True)
     parser = {
         'vizdata': VizData,
