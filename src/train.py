@@ -156,14 +156,8 @@ def train(version,
             intersect, union, iou = get_batch_iou(preds, binimgs)
             # Save the bast model in iou
             if iou > max(Iou):
-                best_checkpoint = {
-                    'net': model.state_dict(),
-                    'optimizer': opt.state_dict(),
-                    'epoch': epoch,
-                    'loss': loss_fn.state_dict()
-                }
                 best_model = os.path.join(path, "best.pt")
-                torch.save(best_checkpoint, best_model)
+                torch.save(model, best_model)
 
             Iou.append(iou)
             writer.add_scalar('train/iou', iou, epoch + 1)
