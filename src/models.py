@@ -365,9 +365,9 @@ class BevEncoder(nn.Module):
         )
 
     def forward(self, x):
-        x1 = self.layer1(x)
-        x2 = self.layer2(x1)
+        x = self.layer1(x)
+        x2 = self.layer2(x)
         x3 = self.layer3(x2)
-        x4 = self.layer4(torch.cat((x2, x3), 1))
-        x5 = self.layer5(x4)
-        return x5
+        x = self.layer4(torch.cat((x2, x3), 1))
+        x = self.layer5(x)
+        return x

@@ -3,6 +3,15 @@ Copyright (C) 2020 NVIDIA Corporation.  All rights reserved.
 Licensed under the NVIDIA Source Code License. See LICENSE at https://github.com/nv-tlabs/lift-splat-shoot.
 Authors: Jonah Philion and Sanja Fidler
 """
+
+from .models import compile_model
+from .tools import (ego_to_cam, get_only_in_img_mask, denormalize_img,
+                    SimpleLoss, get_val_info, add_ego, gen_dx_bx,
+                    get_nusc_maps, plot_nusc_map)
+from .data import compile_data
+import matplotlib.patches as mpatches
+from PIL import Image
+import matplotlib.pyplot as plt
 import os.path
 
 import torch
@@ -11,15 +20,6 @@ import matplotlib as mpl
 from .tools import save_path
 
 mpl.use('Agg')
-import matplotlib.pyplot as plt
-from PIL import Image
-import matplotlib.patches as mpatches
-
-from .data import compile_data
-from .tools import (ego_to_cam, get_only_in_img_mask, denormalize_img,
-                    SimpleLoss, get_val_info, add_ego, gen_dx_bx,
-                    get_nusc_maps, plot_nusc_map)
-from .models import compile_model
 
 
 def lidar_check(version,
@@ -72,21 +72,25 @@ def lidar_check(version,
     rat = H / W
     val = 10.1
     fig = plt.figure(figsize=(val + val / 3 * 2 * rat * 3, val / 3 * 2 * rat))
-    gs = mpl.gridspec.GridSpec(2, 6, width_ratios=(1, 1, 1, 2 * rat, 2 * rat, 2 * rat))
+    gs = mpl.gridspec.GridSpec(2, 6, width_ratios=(
+        1, 1, 1, 2 * rat, 2 * rat, 2 * rat))
     gs.update(wspace=0.0, hspace=0.0, left=0.0, right=1.0, top=1.0, bottom=0.0)
 
     for epoch in range(nepochs):
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, pts, binimgs) in enumerate(loader):
 
-            img_pts = model.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            img_pts = model.get_geometry(
+                rots, trans, intrins, post_rots, post_trans)
 
             for si in range(imgs.shape[0]):
                 plt.clf()
                 final_ax = plt.subplot(gs[:, 5:6])
                 for imgi, img in enumerate(imgs[si]):
-                    ego_pts = ego_to_cam(pts[si], rots[si, imgi], trans[si, imgi], intrins[si, imgi])
+                    ego_pts = ego_to_cam(
+                        pts[si], rots[si, imgi], trans[si, imgi], intrins[si, imgi])
                     mask = get_only_in_img_mask(ego_pts, H, W)
-                    plot_pts = post_rots[si, imgi].matmul(ego_pts) + post_trans[si, imgi].unsqueeze(1)
+                    plot_pts = post_rots[si, imgi].matmul(
+                        ego_pts) + post_trans[si, imgi].unsqueeze(1)
 
                     ax = plt.subplot(gs[imgi // 3, imgi % 3])
                     showimg = denormalize_img(img)
@@ -108,13 +112,15 @@ def lidar_check(version,
                 plt.ylim((-50, 50))
 
                 ax = plt.subplot(gs[:, 3:4])
-                plt.scatter(pts[si, 0], pts[si, 1], c=pts[si, 2], vmin=-5, vmax=5, s=5)
+                plt.scatter(pts[si, 0], pts[si, 1],
+                            c=pts[si, 2], vmin=-5, vmax=5, s=5)
                 plt.xlim((-50, 50))
                 plt.ylim((-50, 50))
                 ax.set_aspect('equal')
 
                 ax = plt.subplot(gs[:, 4:5])
-                plt.imshow(binimgs[si].squeeze(0).T, origin='lower', cmap='Greys', vmin=0, vmax=1)
+                plt.imshow(binimgs[si].squeeze(
+                    0).T, origin='lower', cmap='Greys', vmin=0, vmax=1)
 
                 imname = f'lcheck{epoch:03}_{batchi:05}_{si:02}.jpg'
                 print('saving', imname)
@@ -161,7 +167,8 @@ def cumsum_check(version,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
                                           parser_name='segmentationdata')
 
-    device = torch.device('cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
+    device = torch.device(
+        'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
     loader = trainloader
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
@@ -179,7 +186,8 @@ def cumsum_check(version,
                     post_trans.to(device),
                     )
         out.mean().backward()
-        print('autograd:    ', out.mean().detach().item(), model.camencode.depthnet.weight.grad.mean().item())
+        print('autograd:    ', out.mean().detach().item(),
+              model.camencode.depthnet.weight.grad.mean().item())
 
         model.use_quickcumsum = True
         model.zero_grad()
@@ -191,7 +199,8 @@ def cumsum_check(version,
                     post_trans.to(device),
                     )
         out.mean().backward()
-        print('quick cumsum:', out.mean().detach().item(), model.camencode.depthnet.weight.grad.mean().item())
+        print('quick cumsum:', out.mean().detach().item(),
+              model.camencode.depthnet.weight.grad.mean().item())
         print()
 
 
@@ -236,11 +245,15 @@ def eval_model_iou(version,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
                                           parser_name='segmentationdata')
 
-    device = torch.device('cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
+    device = torch.device(
+        'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
     print('loading', modelf)
-    model.load_state_dict(torch.load(modelf))
+    if torch.load(modelf)["net"] is not None:
+        model.load_state_dict(torch.load(modelf)['net'])
+    else:
+        model.load_state_dict(torch.load(modelf))
     model.to(device)
 
     loss_fn = SimpleLoss(1.0).cuda(gpuid)
@@ -296,14 +309,16 @@ def viz_model_preds(version,
     loader = trainloader if viz_train else valloader
     nusc_maps = get_nusc_maps(map_folder)
 
-    device = torch.device('cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
+    device = torch.device(
+        'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
     print('loading', modelf)
     model.load_state_dict(torch.load(modelf)['net'])
     model.to(device)
 
-    dx, bx, _ = gen_dx_bx(grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'])
+    dx, bx, _ = gen_dx_bx(grid_conf['xbound'],
+                          grid_conf['ybound'], grid_conf['zbound'])
     dx, bx = dx[:2].numpy(), bx[:2].numpy()
 
     scene2map = {}
@@ -342,22 +357,26 @@ def viz_model_preds(version,
                         showimg = showimg.transpose(Image.FLIP_LEFT_RIGHT)
                     plt.imshow(showimg)
                     plt.axis('off')
-                    plt.annotate(cams[imgi].replace('_', ' '), (0.01, 0.92), xycoords='axes fraction')
+                    plt.annotate(cams[imgi].replace('_', ' '),
+                                 (0.01, 0.92), xycoords='axes fraction')
 
                 ax = plt.subplot(gs[0, :])
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
                 plt.setp(ax.spines.values(), color='b', linewidth=2)
                 plt.legend(handles=[
-                    mpatches.Patch(color=(0.0, 0.0, 1.0, 1.0), label='Output Vehicle Segmentation'),
+                    mpatches.Patch(color=(0.0, 0.0, 1.0, 1.0),
+                                   label='Output Vehicle Segmentation'),
                     mpatches.Patch(color='#76b900', label='Ego Vehicle'),
-                    mpatches.Patch(color=(1.00, 0.50, 0.31, 0.8), label='Map (for visualization purposes only)')
+                    mpatches.Patch(color=(1.00, 0.50, 0.31, 0.8),
+                                   label='Map (for visualization purposes only)')
                 ], loc=(0.01, 0.86))
                 plt.imshow(out[si].squeeze(0), vmin=0, vmax=1, cmap='Blues')
 
                 # plot static map (improves visualization)
                 rec = loader.dataset.ixes[counter]
-                plot_nusc_map(rec, nusc_maps, loader.dataset.nusc, scene2map, dx, bx)
+                plot_nusc_map(rec, nusc_maps, loader.dataset.nusc,
+                              scene2map, dx, bx)
                 plt.xlim((out.shape[3], 0))
                 plt.ylim((0, out.shape[3]))
                 add_ego(bx, dx)
