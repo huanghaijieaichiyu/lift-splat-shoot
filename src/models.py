@@ -284,7 +284,7 @@ class CamEncoder(nn.Module):
         weight = 1.0
         self.c_in = c_in
         self.c_out = c_out
-        self.conv1 = Gencov(c_in, math.ceil(8 * depth))
+        self.conv1 = RepViTBlock(c_in, math.ceil(8 * depth), 3, 2)
         self.conv2 = nn.Sequential(
             RepViTBlock(math.ceil(8 * depth), math.ceil(16 * depth),
                         3 * math.ceil(weight), 2),
@@ -302,8 +302,8 @@ class CamEncoder(nn.Module):
         self.conv4 = nn.Sequential(
             RepViTBlock(math.ceil(32 * depth),
                         math.ceil(64 * depth), math.ceil(weight), 2),
-            C2f(math.ceil(64 * depth), math.ceil(128 * depth),
-                math.ceil(weight), True)
+            RepViTBlock(math.ceil(64 * depth), math.ceil(128 * depth),
+                        math.ceil(weight), 2)
         )
 
         self.conv5 = nn.Sequential(
@@ -314,10 +314,11 @@ class CamEncoder(nn.Module):
 
         self.conv6 = RepViTBlock(math.ceil(128 * depth),
                                  math.ceil(256 * depth), 1, 2)
-        self.conv7 = C2fCIB(math.ceil(256 * depth), math.ceil(512 * depth))
+        self.conv7 = RepViTBlock(
+            math.ceil(256 * depth), math.ceil(512 * depth), 1, 2)
         self.conv8 = RepViTBlock(math.ceil(640 * depth),
                                  math.ceil(1024 * depth), math.ceil(weight), 2)
-        self.conv9 = Gencov(math.ceil(1024 * depth), c_out)
+        self.conv9 = RepViTBlock(math.ceil(1024 * depth), c_out, 1, 2, 0, 0)
         self.up = nn.Upsample(scale_factor=2)
 
     def forward(self, x):
@@ -332,7 +333,7 @@ class CamEncoder(nn.Module):
         # neck net
 
         x7 = self.conv7(x6)
-        x8 = self.conv9(self.conv8(torch.cat((x5, self.up(x7)), 1)))
+        x8 = self.conv9(self.conv8(x7))
 
         return x8.view(-1, self.c_out, 8, 22)
 
