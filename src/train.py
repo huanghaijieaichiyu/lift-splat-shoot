@@ -89,7 +89,7 @@ def train(version,
     else:
         path = save_path(logdir)
     writer = SummaryWriter(logdir=path)
-    val_step = 10 if version == 'mini' else 100
+    val_step = 10 if version == 'mini' else 30
     model.train()
     counter = 0
     epoch = 0
