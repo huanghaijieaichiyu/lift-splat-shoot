@@ -7,7 +7,7 @@ Authors: Jonah Philion and Sanja Fidler
 from fire import Fire
 
 import src
-import src.vediomaker
+import src.vedio_writer
 
 
 if __name__ == '__main__':
@@ -17,5 +17,5 @@ if __name__ == '__main__':
         'train': src.train.train,
         'eval_model_iou': src.explore.eval_model_iou,
         'viz_model_preds': src.explore.viz_model_preds,
-        'vedio_writer': src.vediomaker.vedio_writer
+        'vedio_writer': src.vedio_writer.vedio_writer
     })
