@@ -312,12 +312,12 @@ def viz_model_preds(version,
     device = torch.device(
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
-    model = compile_model(grid_conf, data_aug_conf, outC=1)
+    model = compile_model(grid_conf, data_aug_conf, outC=1, model='lss')
     print('loading', modelf)
     try:
         model.load_state_dict(torch.load(modelf)['net'])
     except:
-        model = torch.load(modelf)
+        model.load_state_dict(torch.load(modelf))
     model.to(device)
 
     dx, bx, _ = gen_dx_bx(grid_conf['xbound'],
