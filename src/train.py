@@ -112,7 +112,7 @@ def train(version,
         np.random.seed()
         Iou = [0]
         pbar = tqdm(enumerate(trainloader), total=len(
-            trainloader), colour='#8762A5', ncols=200)
+            trainloader), colour='#8762A5')
 
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0 = time()
