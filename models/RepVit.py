@@ -1,9 +1,6 @@
 """
 This package implements the Repvit model, copy from the :https://github.com/THU-MIG/RepViT
 """
-
-
-from timm.models._registry import register_model
 from timm.layers.weight_init import trunc_normal_
 import torch
 from timm.layers.squeeze_excite import SqueezeExcite
