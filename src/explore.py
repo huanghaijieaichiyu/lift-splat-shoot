@@ -12,6 +12,7 @@ from .data import compile_data
 import matplotlib.patches as mpatches
 from PIL import Image
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm  # 正确导入matplotlib的colormap模块
 from matplotlib import gridspec
 import os.path
 
@@ -19,6 +20,9 @@ import torch
 import numpy as np
 
 from .tools import save_path
+
+# 在PIL.Image中，常量值0表示水平翻转
+FLIP_LEFT_RIGHT = 0  # PIL标准值
 
 plt.switch_backend('Agg')
 
@@ -187,8 +191,15 @@ def cumsum_check(version,
                     post_trans.to(device),
                     )
         out.mean().backward()
-        print('autograd:    ', out.mean().detach().item(),
-              model.camencode.depthnet.weight.grad.mean().item())
+
+        # 安全访问梯度
+        try:
+            grad_value = model.camencode.depthnet.weight.grad.mean().item() \
+                if hasattr(model, 'camencode') and hasattr(model.camencode, 'depthnet') else "N/A"
+            print('autograd:    ', out.mean().detach().item(), grad_value)
+        except (AttributeError, ValueError) as e:
+            print(f"访问模型属性时出错: {e}")
+            print('autograd:    ', out.mean().detach().item(), "N/A")
 
         model.use_quickcumsum = True
         model.zero_grad()
@@ -200,8 +211,15 @@ def cumsum_check(version,
                     post_trans.to(device),
                     )
         out.mean().backward()
-        print('quick cumsum:', out.mean().detach().item(),
-              model.camencode.depthnet.weight.grad.mean().item())
+
+        # 安全访问梯度
+        try:
+            grad_value = model.camencode.depthnet.weight.grad.mean().item() \
+                if hasattr(model, 'camencode') and hasattr(model.camencode, 'depthnet') else "N/A"
+            print('quick cumsum:', out.mean().detach().item(), grad_value)
+        except (AttributeError, ValueError) as e:
+            print(f"访问模型属性时出错: {e}")
+            print('quick cumsum:', out.mean().detach().item(), "N/A")
         print()
 
 
@@ -326,9 +344,16 @@ def viz_model_preds(version,
     dx, bx = dx[:2].numpy(), bx[:2].numpy()
 
     scene2map = {}
-    for rec in loader.dataset.nusc.scene:
-        log = loader.dataset.nusc.get('log', rec['log_token'])
-        scene2map[rec['name']] = log['location']
+    try:
+        if hasattr(loader.dataset, 'nusc'):
+            for rec in loader.dataset.nusc.scene:
+                try:
+                    log = loader.dataset.nusc.get('log', rec['log_token'])
+                    scene2map[rec['name']] = log['location']
+                except (KeyError, AttributeError) as e:
+                    print(f"处理场景数据时出错: {e}")
+    except AttributeError:
+        print("数据集没有nusc属性，跳过地图加载")
 
     val = 0.01
     fH, fW = final_dim
@@ -356,10 +381,10 @@ def viz_model_preds(version,
                 for imgi, img in enumerate(imgs[si]):
                     ax = plt.subplot(gs[1 + imgi // 3, imgi % 3])
                     showimg = denormalize_img(img)
-                    # 修复PIL翻转常量问题
+                    # 翻转底部图像
                     if imgi > 2:
-                        # 使用 PIL.Image.FLIP_LEFT_RIGHT 常量
-                        showimg = showimg.transpose(Image.FLIP_LEFT_RIGHT)
+                        # 使用常量值0
+                        showimg = showimg.transpose(0)
                     plt.imshow(showimg)
                     plt.axis('off')
                     plt.annotate(cams[imgi].replace('_', ' '),
@@ -368,20 +393,27 @@ def viz_model_preds(version,
                 ax = plt.subplot(gs[0, :])
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
-                plt.setp(ax.spines.values(), color='b', linewidth=2)
+                # 修复spines遍历
+                for spine_name, spine in ax.spines.items():
+                    plt.setp(spine, color='b', linewidth=2)
                 plt.legend(handles=[
-                    mpatches.Patch(color=(0.0, 0.0, 1.0, 1.0),
+                    mpatches.Patch(color=(0.0, 0.0, 1.0),
                                    label='Output Vehicle Segmentation'),
                     mpatches.Patch(color='#76b900', label='Ego Vehicle'),
-                    mpatches.Patch(color=(1.00, 0.50, 0.31, 0.8),
+                    mpatches.Patch(color=(1.00, 0.50, 0.31),
                                    label='Map (for visualization purposes only)')
                 ], loc=(0.01, 0.86))
                 plt.imshow(out[si].squeeze(0), vmin=0, vmax=1, cmap='Blues')
 
                 # plot static map (improves visualization)
-                rec = loader.dataset.ixes[counter]
-                plot_nusc_map(rec, nusc_maps, loader.dataset.nusc,
-                              scene2map, dx, bx)
+                try:
+                    if hasattr(loader.dataset, 'ixes') and hasattr(loader.dataset, 'nusc'):
+                        rec = loader.dataset.ixes[counter]
+                        plot_nusc_map(rec, nusc_maps, loader.dataset.nusc,
+                                      scene2map, dx, bx)
+                except (AttributeError, IndexError) as e:
+                    print(f"访问数据集属性时出错: {e}")
+
                 plt.xlim((out.shape[3], 0))
                 plt.ylim((0, out.shape[3]))
                 add_ego(bx, dx)
@@ -470,12 +502,19 @@ def viz_3d_detection(version,
     dx, bx = dx[:2].numpy(), bx[:2].numpy()
 
     scene2map = {}
-    for rec in loader.dataset.nusc.scene:
-        log = loader.dataset.nusc.get('log', rec['log_token'])
-        scene2map[rec['name']] = log['location']
+    try:
+        if hasattr(loader.dataset, 'nusc'):
+            for rec in loader.dataset.nusc.scene:
+                try:
+                    log = loader.dataset.nusc.get('log', rec['log_token'])
+                    scene2map[rec['name']] = log['location']
+                except (KeyError, AttributeError) as e:
+                    print(f"处理场景数据时出错: {e}")
+    except AttributeError:
+        print("数据集没有nusc属性，跳过地图加载")
 
     # 设置颜色映射，用于不同类别的可视化
-    cmap = plt.cm.get_cmap(colormap, num_classes)
+    cmap = cm.get_cmap(colormap, num_classes)
 
     # 设置可视化图表大小和布局
     val = 0.01
@@ -507,9 +546,9 @@ def viz_3d_detection(version,
                               )
 
             # 获取预测的类别、边界框等信息
-            pred_cls = preds['cls_preds'].sigmoid().cpu() if isinstance(
+            pred_cls = preds['cls_pred'].sigmoid().cpu() if isinstance(
                 preds, dict) else preds[:, :num_classes].sigmoid().cpu()
-            pred_boxes = preds['reg_preds'].cpu() if isinstance(
+            pred_boxes = preds['reg_pred'].cpu() if isinstance(
                 preds, dict) else preds[:, num_classes:].cpu()
 
             for si in range(imgs.shape[0]):
@@ -521,8 +560,8 @@ def viz_3d_detection(version,
                     showimg = denormalize_img(img)
                     # 翻转底部图像
                     if imgi > 2:
-                        showimg = showimg.transpose(
-                            Image.TRANSPOSE_FLIP_LEFT_RIGHT)
+                        # 使用常量值0
+                        showimg = showimg.transpose(0)
                     plt.imshow(showimg)
                     plt.axis('off')
                     plt.annotate(cams[imgi].replace('_', ' '),
@@ -532,16 +571,22 @@ def viz_3d_detection(version,
                 ax = plt.subplot(gs[0, :])
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
-                for spine in ax.spines.values():
-                    spine.set_color('b')
-                    spine.set_linewidth(2)
+                for spine_name, spine in ax.spines.items():
+                    plt.setp(spine, color='b', linewidth=2)
 
                 # 绘制地图
-                rec = loader.dataset.ixes[counter] if hasattr(
-                    loader.dataset, 'ixes') else None
-                if rec:
-                    plot_nusc_map(rec, nusc_maps,
-                                  loader.dataset.nusc, scene2map, dx, bx)
+                try:
+                    if hasattr(loader.dataset, 'ixes') and hasattr(loader.dataset, 'nusc'):
+                        rec = loader.dataset.ixes[counter]
+                        plot_nusc_map(rec, nusc_maps,
+                                      loader.dataset.nusc, scene2map, dx, bx)
+                except (AttributeError, IndexError) as e:
+                    print(f"访问数据集属性时出错: {e}")
+
+                plt.xlim((pred_boxes[si, :, 0].max(),
+                         pred_boxes[si, :, 0].min()))
+                plt.ylim((pred_boxes[si, :, 1].max(),
+                         pred_boxes[si, :, 1].min()))
 
                 # 可视化预测结果
                 # 创建一个热力图来显示检测置信度
@@ -580,9 +625,8 @@ def viz_3d_detection(version,
                 ax = plt.subplot(gs[1, :])
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
-                for spine in ax.spines.values():
-                    spine.set_color('g')
-                    spine.set_linewidth(2)
+                for spine_name, spine in ax.spines.items():
+                    plt.setp(spine, color='g', linewidth=2)
                 plt.title("Confidence Heatmap")
 
                 # 计算所有类别的最大置信度
@@ -600,7 +644,7 @@ def viz_3d_detection(version,
                 counter += 1
 
                 # 限制处理的批次数，避免生成过多图像
-                if counter >= 20:
+                if counter >= 200:
                     print(f"已生成{counter}张可视化图像，停止处理更多批次。")
                     return
 
@@ -685,12 +729,19 @@ def viz_fusion_detection(version,
     dx, bx = dx[:2].numpy(), bx[:2].numpy()
 
     scene2map = {}
-    for rec in loader.dataset.nusc.scene:
-        log = loader.dataset.nusc.get('log', rec['log_token'])
-        scene2map[rec['name']] = log['location']
+    try:
+        if hasattr(loader.dataset, 'nusc'):
+            for rec in loader.dataset.nusc.scene:
+                try:
+                    log = loader.dataset.nusc.get('log', rec['log_token'])
+                    scene2map[rec['name']] = log['location']
+                except (KeyError, AttributeError) as e:
+                    print(f"处理场景数据时出错: {e}")
+    except AttributeError:
+        print("数据集没有nusc属性，跳过地图加载")
 
     # 设置颜色映射，用于不同类别的可视化
-    cmap = plt.cm.get_cmap(colormap, num_classes)
+    cmap = cm.get_cmap(colormap, num_classes)
 
     # 设置可视化图表大小和布局 - 增加一行用于LiDAR可视化
     val = 0.01
@@ -723,9 +774,9 @@ def viz_fusion_detection(version,
                               )
 
             # 获取预测的类别、边界框等信息
-            pred_cls = preds['cls_preds'].sigmoid().cpu() if isinstance(
+            pred_cls = preds['cls_pred'].sigmoid().cpu() if isinstance(
                 preds, dict) else preds[:, :num_classes].sigmoid().cpu()
-            pred_boxes = preds['reg_preds'].cpu() if isinstance(
+            pred_boxes = preds['reg_pred'].cpu() if isinstance(
                 preds, dict) else preds[:, num_classes:].cpu()
 
             for si in range(imgs.shape[0]):
@@ -737,8 +788,8 @@ def viz_fusion_detection(version,
                     showimg = denormalize_img(img)
                     # 翻转底部图像
                     if imgi > 2:
-                        showimg = showimg.transpose(
-                            Image.TRANSPOSE_FLIP_LEFT_RIGHT)
+                        # 使用常量值0
+                        showimg = showimg.transpose(0)
                     plt.imshow(showimg)
                     plt.axis('off')
                     plt.annotate(cams[imgi].replace('_', ' '),
@@ -748,16 +799,22 @@ def viz_fusion_detection(version,
                 ax = plt.subplot(gs[0, :])
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
-                for spine in ax.spines.values():
-                    spine.set_color('b')
-                    spine.set_linewidth(2)
+                for spine_name, spine in ax.spines.items():
+                    plt.setp(spine, color='b', linewidth=2)
 
                 # 绘制地图
-                rec = loader.dataset.ixes[counter] if hasattr(
-                    loader.dataset, 'ixes') else None
-                if rec:
-                    plot_nusc_map(rec, nusc_maps,
-                                  loader.dataset.nusc, scene2map, dx, bx)
+                try:
+                    if hasattr(loader.dataset, 'ixes') and hasattr(loader.dataset, 'nusc'):
+                        rec = loader.dataset.ixes[counter]
+                        plot_nusc_map(rec, nusc_maps,
+                                      loader.dataset.nusc, scene2map, dx, bx)
+                except (AttributeError, IndexError) as e:
+                    print(f"访问数据集属性时出错: {e}")
+
+                plt.xlim((pred_boxes[si, :, 0].max(),
+                         pred_boxes[si, :, 0].min()))
+                plt.ylim((pred_boxes[si, :, 1].max(),
+                         pred_boxes[si, :, 1].min()))
 
                 # 可视化预测结果
                 # 创建一个热力图来显示检测置信度
@@ -796,9 +853,8 @@ def viz_fusion_detection(version,
                 ax = plt.subplot(gs[1, :])
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
-                for spine in ax.spines.values():
-                    spine.set_color('g')
-                    spine.set_linewidth(2)
+                for spine_name, spine in ax.spines.items():
+                    plt.setp(spine, color='g', linewidth=2)
                 plt.title("Confidence Heatmap")
 
                 # 计算所有类别的最大置信度
@@ -813,9 +869,8 @@ def viz_fusion_detection(version,
                 ax = plt.subplot(gs[2, :])
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
-                for spine in ax.spines.values():
-                    spine.set_color('r')
-                    spine.set_linewidth(2)
+                for spine_name, spine in ax.spines.items():
+                    plt.setp(spine, color='r', linewidth=2)
                 plt.title("LiDAR BEV")
 
                 # 可视化LiDAR BEV图

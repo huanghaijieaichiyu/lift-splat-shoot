@@ -342,40 +342,118 @@ def add_ego(bx, dx):
 
 
 def get_nusc_maps(map_folder):
-    nusc_maps = {map_name: NuScenesMap(dataroot=map_folder,
-                                       map_name=map_name) for map_name in [
+    """
+    获取NuScenes地图，支持优雅地处理找不到地图文件的情况
+    """
+    nusc_maps = {}
+    map_names = [
         "singapore-hollandvillage",
         "singapore-queenstown",
         "boston-seaport",
         "singapore-onenorth",
-    ]}
+    ]
+
+    for map_name in map_names:
+        try:
+            # 适配Windows路径
+            map_path = os.path.join(
+                map_folder, "maps", "expansion").replace("\\", "/")
+            print(f"尝试加载地图: {map_path}/{map_name}")
+            nusc_maps[map_name] = NuScenesMap(
+                dataroot=map_folder, map_name=map_name)
+        except Exception as e:
+            print(f"无法加载地图 {map_name}: {e}")
+            # 创建一个空的地图对象替代
+            from collections import defaultdict
+
+            class EmptyMap:
+                def __init__(self):
+                    self.road_segment = []
+                    self.lane = []
+                    self.road_divider = []
+                    self.lane_divider = []
+
+                def get_records_in_patch(self, *args, **kwargs):
+                    return defaultdict(list)
+
+                def get(self, *args, **kwargs):
+                    return {'polygon_token': None}
+
+                def extract_polygon(self, *args, **kwargs):
+                    from shapely.geometry import Polygon
+                    return Polygon()
+
+                def extract_line(self, *args, **kwargs):
+                    from shapely.geometry import LineString
+                    return LineString()
+
+            nusc_maps[map_name] = EmptyMap()
+
     return nusc_maps
 
 
 def plot_nusc_map(rec, nusc_maps, nusc, scene2map, dx, bx):
-    egopose = nusc.get('ego_pose', nusc.get(
-        'sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
-    map_name = scene2map[nusc.get('scene', rec['scene_token'])['name']]
+    try:
+        if rec is None:
+            return
 
-    rot = Quaternion(egopose['rotation']).rotation_matrix
-    rot = np.arctan2(rot[1, 0], rot[0, 0])
-    center = np.array([egopose['translation'][0],
-                      egopose['translation'][1], np.cos(rot), np.sin(rot)])
+        # 获取自车位姿
+        try:
+            egopose = nusc.get('ego_pose', nusc.get(
+                'sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
+        except (KeyError, TypeError):
+            print("无法获取自车位姿信息")
+            return
 
-    poly_names = ['road_segment', 'lane']
-    line_names = ['road_divider', 'lane_divider']
-    lmap = get_local_map(nusc_maps[map_name], center,
-                         50.0, poly_names, line_names)
-    for name in poly_names:
-        for la in lmap[name]:
-            pts = (la - bx) / dx
-            plt.fill(pts[:, 1], pts[:, 0], c=(1.00, 0.50, 0.31), alpha=0.2)
-    for la in lmap['road_divider']:
-        pts = (la - bx) / dx
-        plt.plot(pts[:, 1], pts[:, 0], c=(0.0, 0.0, 1.0), alpha=0.5)
-    for la in lmap['lane_divider']:
-        pts = (la - bx) / dx
-        plt.plot(pts[:, 1], pts[:, 0], c=(159./255., 0.0, 1.0), alpha=0.5)
+        # 获取场景对应的地图
+        try:
+            scene_name = nusc.get('scene', rec['scene_token'])['name']
+            if scene_name not in scene2map:
+                print(f"场景 {scene_name} 没有对应的地图")
+                return
+            map_name = scene2map[scene_name]
+            if map_name not in nusc_maps:
+                print(f"找不到地图 {map_name}")
+                return
+        except (KeyError, TypeError):
+            print("无法获取场景或地图信息")
+            return
+
+        rot = Quaternion(egopose['rotation']).rotation_matrix
+        rot = np.arctan2(rot[1, 0], rot[0, 0])
+        center = np.array([egopose['translation'][0],
+                          egopose['translation'][1], np.cos(rot), np.sin(rot)])
+
+        poly_names = ['road_segment', 'lane']
+        line_names = ['road_divider', 'lane_divider']
+
+        try:
+            lmap = get_local_map(nusc_maps[map_name], center,
+                                 50.0, poly_names, line_names)
+
+            for name in poly_names:
+                if name in lmap:
+                    for la in lmap[name]:
+                        pts = (la - bx) / dx
+                        plt.fill(pts[:, 1], pts[:, 0], c=(
+                            1.00, 0.50, 0.31), alpha=0.2)
+
+            if 'road_divider' in lmap:
+                for la in lmap['road_divider']:
+                    pts = (la - bx) / dx
+                    plt.plot(pts[:, 1], pts[:, 0], c=(
+                        0.0, 0.0, 1.0), alpha=0.5)
+
+            if 'lane_divider' in lmap:
+                for la in lmap['lane_divider']:
+                    pts = (la - bx) / dx
+                    plt.plot(pts[:, 1], pts[:, 0], c=(
+                        159./255., 0.0, 1.0), alpha=0.5)
+        except Exception as e:
+            print(f"绘制地图时出错: {e}")
+    except Exception as e:
+        print(f"绘制地图时出现未知错误: {e}")
+        # 记录错误但继续执行
 
 
 def get_local_map(nmap, center, stretch, layer_names, line_names):
