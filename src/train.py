@@ -519,25 +519,70 @@ def train_3d(version,
                         f'val/scale{i+3}_loss', avg_loss, epoch + 1)
 
             # 评估mAP
-            from .evaluate_3d import compute_map
-            # 修复 use_amp 参数
-            val_map = compute_map(model, valloader, device,
-                                  amp=amp)  # 使用混合精度加速评估
-            writer.add_scalar('val/mAP', val_map, epoch + 1)
+            from .evaluate_3d import compute_map, calculate_map
 
-            print('||Val Loss: %.4f|Val mAP: %.4f||' % (val_loss, val_map))
+            # 使用compute_map获取预测结果和目标信息
+            with torch.no_grad():
+                all_predictions = []
+                all_targets = []
+
+                for imgs, rots, trans, intrins, post_rots, post_trans, targets_list in valloader:
+                    if amp and device.type == 'cuda':
+                        with torch.cuda.amp.autocast():
+                            preds = model(imgs.to(device),
+                                          rots.to(device),
+                                          trans.to(device),
+                                          intrins.to(device),
+                                          post_rots.to(device),
+                                          post_trans.to(device))
+                    else:
+                        preds = model(imgs.to(device),
+                                      rots.to(device),
+                                      trans.to(device),
+                                      intrins.to(device),
+                                      post_rots.to(device),
+                                      post_trans.to(device))
+
+                    # 解码预测和目标
+                    from .evaluate_3d import decode_predictions, decode_targets
+                    batch_dets = decode_predictions(preds, device)
+                    batch_gts = decode_targets(targets_list, device)
+
+                    all_predictions.extend(batch_dets)
+                    all_targets.extend(batch_gts)
+
+            # 计算mAP，可以指定参数
+            val_results = calculate_map(all_predictions, all_targets,
+                                        iou_thresholds=[0.5, 0.7],
+                                        num_classes=num_classes,
+                                        consider_rotation=True)
+
+            # 记录多个IoU阈值下的mAP
+            writer.add_scalar('val/mAP@0.5', val_results['mAP@0.5'], epoch + 1)
+            writer.add_scalar('val/mAP@0.7', val_results['mAP@0.7'], epoch + 1)
+
+            # 记录每个类别的AP
+            for cls_id, ap in val_results['class_aps']['AP@0.5'].items():
+                cls_name = val_results['class_names'].get(
+                    cls_id, f"Class {cls_id}")
+                writer.add_scalar(f'val/AP@0.5/{cls_name}', ap, epoch + 1)
+
+            val_map_score = val_results['mAP@0.5']  # 使用0.5阈值的mAP作为主要指标
+
+            print('||Val Loss: %.4f|mAP@0.5: %.4f|mAP@0.7: %.4f||' %
+                  (val_loss, val_results['mAP@0.5'], val_results['mAP@0.7']))
 
             # 保存最佳模型
-            if val_map > best_map:
-                best_map = val_map
+            if val_map_score > best_map:
+                best_map = val_map_score
                 best_checkpoint = {
                     'net': model.state_dict(),
                     'optimizer': opt.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'epoch': epoch,
                     'best_map': best_map,
-                    'model_configs': model_configs,  # 保存模型配置
-                    'amp_scaler': scaler.state_dict(),  # 保存混合精度训练状态
+                    'model_configs': model_configs,
+                    'amp_scaler': scaler.state_dict() if scaler else None,
                 }
                 best_model = os.path.join(path, "best.pt")
                 torch.save(best_checkpoint, best_model)
@@ -891,15 +936,64 @@ def train_fusion(version,
                         f'val/scale{i+3}_loss', avg_loss, epoch + 1)
 
             # 评估mAP
-            from .evaluate_3d import compute_map
-            val_map = compute_map(model, valloader, device, amp=amp)
-            writer.add_scalar('val/mAP', val_map, epoch + 1)
+            from .evaluate_3d import compute_map, calculate_map
 
-            print('||Val Loss: %.4f|Val mAP: %.4f||' % (val_loss, val_map))
+            # 使用compute_map获取预测结果和目标信息
+            with torch.no_grad():
+                all_predictions = []
+                all_targets = []
+
+                for imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets in valloader:
+                    if amp and device.type == 'cuda':
+                        with torch.cuda.amp.autocast():
+                            preds = model(imgs.to(device),
+                                          rots.to(device),
+                                          trans.to(device),
+                                          intrins.to(device),
+                                          post_rots.to(device),
+                                          post_trans.to(device),
+                                          lidar_bev.to(device))
+                    else:
+                        preds = model(imgs.to(device),
+                                      rots.to(device),
+                                      trans.to(device),
+                                      intrins.to(device),
+                                      post_rots.to(device),
+                                      post_trans.to(device),
+                                      lidar_bev.to(device))
+
+                    # 解码预测和目标
+                    from .evaluate_3d import decode_predictions, decode_targets
+                    batch_dets = decode_predictions(preds, device)
+                    batch_gts = decode_targets(targets, device)
+
+                    all_predictions.extend(batch_dets)
+                    all_targets.extend(batch_gts)
+
+            # 计算mAP，可以指定参数
+            val_results = calculate_map(all_predictions, all_targets,
+                                        iou_thresholds=[0.5, 0.7],
+                                        num_classes=num_classes,
+                                        consider_rotation=True)
+
+            # 记录多个IoU阈值下的mAP
+            writer.add_scalar('val/mAP@0.5', val_results['mAP@0.5'], epoch + 1)
+            writer.add_scalar('val/mAP@0.7', val_results['mAP@0.7'], epoch + 1)
+
+            # 记录每个类别的AP
+            for cls_id, ap in val_results['class_aps']['AP@0.5'].items():
+                cls_name = val_results['class_names'].get(
+                    cls_id, f"Class {cls_id}")
+                writer.add_scalar(f'val/AP@0.5/{cls_name}', ap, epoch + 1)
+
+            val_map_score = val_results['mAP@0.5']  # 使用0.5阈值的mAP作为主要指标
+
+            print('||Val Loss: %.4f|mAP@0.5: %.4f|mAP@0.7: %.4f||' %
+                  (val_loss, val_results['mAP@0.5'], val_results['mAP@0.7']))
 
             # 保存最佳模型
-            if val_map > best_map:
-                best_map = val_map
+            if val_map_score > best_map:
+                best_map = val_map_score
                 best_checkpoint = {
                     'net': model.state_dict(),
                     'optimizer': opt.state_dict(),
@@ -907,7 +1001,7 @@ def train_fusion(version,
                     'epoch': epoch,
                     'best_map': best_map,
                     'model_configs': model_configs,
-                    'amp_scaler': scaler.state_dict(),
+                    'amp_scaler': scaler.state_dict() if scaler else None,
                 }
                 best_model = os.path.join(path, "best.pt")
                 torch.save(best_checkpoint, best_model)

@@ -193,18 +193,20 @@ def decode_targets(targets_list, device):
     return gt_list
 
 
-def calculate_map(predictions, targets, iou_thresh=0.5, num_classes=10):
+def calculate_map(predictions, targets, iou_thresholds=[0.5, 0.7], num_classes=10, consider_rotation=True):
     """
-    计算平均精度 (mAP)
+    计算平均精度 (mAP)，支持多个IoU阈值
     Args:
         predictions: 预测结果列表
         targets: 目标数据列表
-        iou_thresh: IoU阈值
+        iou_thresholds: IoU阈值列表
         num_classes: 类别数量
+        consider_rotation: 是否考虑旋转
     Returns:
-        float: mAP值
+        dict: 包含mAP和每个类别AP的字典
     """
-    aps = []
+    results = {f'mAP@{iou_thresh:.1f}': 0.0 for iou_thresh in iou_thresholds}
+    class_aps = {f'AP@{iou_thresh:.1f}': {} for iou_thresh in iou_thresholds}
 
     # 按类别计算AP
     for cls_id in range(1, num_classes):  # 忽略背景类(0)
@@ -236,26 +238,35 @@ def calculate_map(predictions, targets, iou_thresh=0.5, num_classes=10):
         if sum(len(gt['box_xyz']) for gt in all_gts) == 0:
             continue
 
-        # 计算该类别的AP
-        ap = calculate_ap_for_class(all_preds, all_gts, iou_thresh)
-        aps.append(ap)
+        # 计算不同IoU阈值下的AP
+        for iou_thresh in iou_thresholds:
+            ap = calculate_ap_for_class(
+                all_preds, all_gts, iou_thresh, consider_rotation)
+            class_aps[f'AP@{iou_thresh:.1f}'][cls_id] = ap
 
-    # 计算mAP
-    if len(aps) > 0:
-        mean_ap = sum(aps) / len(aps)
-    else:
-        mean_ap = 0.0
+    # 计算每个IoU阈值下的mAP
+    for iou_thresh in iou_thresholds:
+        ap_values = list(class_aps[f'AP@{iou_thresh:.1f}'].values())
+        if len(ap_values) > 0:
+            results[f'mAP@{iou_thresh:.1f}'] = sum(ap_values) / len(ap_values)
 
-    return mean_ap
+    # 添加类别信息
+    results['class_aps'] = class_aps
+    results['class_names'] = {
+        cls_id: f"Class {cls_id}" for cls_id in range(1, num_classes)
+    }
+
+    return results
 
 
-def calculate_ap_for_class(predictions, targets, iou_thresh=0.5):
+def calculate_ap_for_class(predictions, targets, iou_thresh=0.5, consider_rotation=True):
     """
     计算单个类别的AP
     Args:
         predictions: 该类别的预测结果
         targets: 该类别的目标数据
         iou_thresh: IoU阈值
+        consider_rotation: 是否考虑旋转信息
     Returns:
         float: AP值
     """
@@ -286,7 +297,8 @@ def calculate_ap_for_class(predictions, targets, iou_thresh=0.5):
             continue
 
         # 计算IoU
-        ious = compute_3d_iou(pred_boxes, gt_boxes)  # [N, M]
+        ious = compute_3d_iou(pred_boxes, gt_boxes,
+                              consider_rotation=consider_rotation)  # [N, M]
 
         # 对每个预测找到最大IoU的目标
         max_ious, max_idx = ious.max(dim=1)
@@ -325,7 +337,7 @@ def calculate_ap_for_class(predictions, targets, iou_thresh=0.5):
     total_gt = sum(len(gt['box_xyz']) for gt in targets)
     recall = cum_tp / total_gt if total_gt > 0 else np.zeros_like(cum_tp)
 
-    # 11点插值AP计算
+    # 计算平均精度 (使用VOC方法的11点插值AP)
     ap = 0
     for t in np.arange(0, 1.1, 0.1):
         if np.sum(recall >= t) == 0:
@@ -337,54 +349,118 @@ def calculate_ap_for_class(predictions, targets, iou_thresh=0.5):
     return ap
 
 
-def compute_3d_iou(boxes1, boxes2):
+def compute_3d_iou(boxes1, boxes2, consider_rotation=True):
     """
-    计算两组3D边界框之间的IoU
+    计算两组3D边界框之间的IoU，支持考虑旋转
     Args:
         boxes1: [N, 7] - x, y, z, w, l, h, θ
         boxes2: [M, 7] - x, y, z, w, l, h, θ
+        consider_rotation: 是否考虑旋转信息
     Returns:
         Tensor: [N, M] IoU矩阵
     """
-    # 简化计算，暂时不考虑旋转，只计算轴对齐的3D IoU
-    def get_box_min_max(boxes):
-        # boxes: [..., 7] - x, y, z, w, l, h, θ
-        centers = boxes[..., :3]
-        dimensions = boxes[..., 3:6]
+    if not consider_rotation:
+        # 简化计算，不考虑旋转，只计算轴对齐的3D IoU
+        def get_box_min_max(boxes):
+            # boxes: [..., 7] - x, y, z, w, l, h, θ
+            centers = boxes[..., :3]
+            dimensions = boxes[..., 3:6]
 
-        # 计算边界框的最小/最大坐标
-        half_dimensions = dimensions / 2
-        mins = centers - half_dimensions
-        maxs = centers + half_dimensions
-        return mins, maxs
+            # 计算边界框的最小/最大坐标
+            half_dimensions = dimensions / 2
+            mins = centers - half_dimensions
+            maxs = centers + half_dimensions
+            return mins, maxs
 
-    # 获取两组边界框的最小/最大坐标
-    mins1, maxs1 = get_box_min_max(boxes1)  # [N, 3], [N, 3]
-    mins2, maxs2 = get_box_min_max(boxes2)  # [M, 3], [M, 3]
+        # 获取两组边界框的最小/最大坐标
+        mins1, maxs1 = get_box_min_max(boxes1)  # [N, 3], [N, 3]
+        mins2, maxs2 = get_box_min_max(boxes2)  # [M, 3], [M, 3]
 
-    # 计算交集边界框的最小/最大坐标
-    mins1 = mins1.unsqueeze(1)  # [N, 1, 3]
-    maxs1 = maxs1.unsqueeze(1)  # [N, 1, 3]
-    mins2 = mins2.unsqueeze(0)  # [1, M, 3]
-    maxs2 = maxs2.unsqueeze(0)  # [1, M, 3]
+        # 计算交集边界框的最小/最大坐标
+        mins1 = mins1.unsqueeze(1)  # [N, 1, 3]
+        maxs1 = maxs1.unsqueeze(1)  # [N, 1, 3]
+        mins2 = mins2.unsqueeze(0)  # [1, M, 3]
+        maxs2 = maxs2.unsqueeze(0)  # [1, M, 3]
 
-    intersect_mins = torch.max(mins1, mins2)  # [N, M, 3]
-    intersect_maxs = torch.min(maxs1, maxs2)  # [N, M, 3]
+        intersect_mins = torch.max(mins1, mins2)  # [N, M, 3]
+        intersect_maxs = torch.min(maxs1, maxs2)  # [N, M, 3]
 
-    # 计算交集体积
-    intersect_dimensions = torch.clamp(
-        intersect_maxs - intersect_mins, min=0)  # [N, M, 3]
-    intersect_volumes = intersect_dimensions.prod(dim=2)  # [N, M]
+        # 计算交集体积
+        intersect_dimensions = torch.clamp(
+            intersect_maxs - intersect_mins, min=0)  # [N, M, 3]
+        intersect_volumes = intersect_dimensions.prod(dim=2)  # [N, M]
 
-    # 计算两组边界框的体积
-    volumes1 = boxes1[:, 3:6].prod(dim=1).unsqueeze(1)  # [N, 1]
-    volumes2 = boxes2[:, 3:6].prod(dim=1).unsqueeze(0)  # [1, M]
+        # 计算两组边界框的体积
+        volumes1 = boxes1[:, 3:6].prod(dim=1).unsqueeze(1)  # [N, 1]
+        volumes2 = boxes2[:, 3:6].prod(dim=1).unsqueeze(0)  # [1, M]
 
-    # 计算并集体积
-    union_volumes = volumes1 + volumes2 - intersect_volumes  # [N, M]
+        # 计算并集体积
+        union_volumes = volumes1 + volumes2 - intersect_volumes  # [N, M]
 
-    # 计算IoU
-    iou = intersect_volumes / (union_volumes + 1e-7)  # [N, M]
+        # 计算IoU
+        iou = intersect_volumes / (union_volumes + 1e-7)  # [N, M]
+    else:
+        # 考虑旋转的3D IoU计算 - 使用近似方法
+        # 提取位置、尺寸和角度
+        centers1 = boxes1[:, :3]  # [N, 3]
+        dimensions1 = boxes1[:, 3:6]  # [N, 3]
+        rotations1 = boxes1[:, 6]  # [N]
+
+        centers2 = boxes2[:, :3]  # [M, 3]
+        dimensions2 = boxes2[:, 3:6]  # [M, 3]
+        rotations2 = boxes2[:, 6]  # [M]
+
+        # 计算中心点距离
+        center_dist = torch.cdist(centers1, centers2)  # [N, M]
+
+        # 计算角度差异的影响因子
+        rot1 = rotations1.unsqueeze(1).expand(-1, boxes2.size(0))  # [N, M]
+        rot2 = rotations2.unsqueeze(0).expand(boxes1.size(0), -1)  # [N, M]
+        angle_diff = torch.abs(rot1 - rot2)  # [N, M]
+        # 将角度差异限制在[0, π/2]范围内
+        angle_diff = torch.min(angle_diff, torch.abs(
+            angle_diff - torch.tensor(3.14159, device=angle_diff.device)))
+        angle_factor = torch.cos(angle_diff)  # [N, M] 角度差异影响因子
+
+        # 计算两组边界框的体积
+        volumes1 = dimensions1.prod(dim=1).unsqueeze(1)  # [N, 1]
+        volumes2 = dimensions2.prod(dim=1).unsqueeze(0)  # [1, M]
+
+        # 计算近似的交集体积
+        # 1. 判断中心点距离是否小于两个框大小之和的一半
+        size_sum = (dimensions1.norm(dim=1).unsqueeze(1) +
+                    dimensions2.norm(dim=1).unsqueeze(0)) / 2  # [N, M]
+
+        # 2. 如果中心距离过大，则IoU为0
+        mask = (center_dist < size_sum)  # [N, M]
+
+        # 3. 根据尺寸重叠程度和角度差异估计交集体积
+        dim1 = dimensions1.unsqueeze(1)  # [N, 1, 3]
+        dim2 = dimensions2.unsqueeze(0)  # [1, M, 3]
+
+        # 计算轴对齐的交集体积（不考虑旋转）
+        min_dims = torch.min(dim1, dim2)  # [N, M, 3]
+        max_dims = torch.max(dim1, dim2)  # [N, M, 3]
+
+        # 体积交集比估计 (0-1之间)
+        vol_ratio = min_dims.prod(
+            dim=2) / max_dims.prod(dim=2).clamp(min=1e-7)  # [N, M]
+
+        # 综合考虑角度差异和体积交集
+        intersect_ratio = vol_ratio * (0.5 + 0.5 * angle_factor)  # [N, M]
+
+        # 估计交集体积
+        mean_volumes = (volumes1 + volumes2) / 2  # [N, M]
+        intersect_volumes = intersect_ratio * mean_volumes  # [N, M]
+
+        # 应用遮罩：如果中心距离过大，则交集为0
+        intersect_volumes = intersect_volumes * mask.float()
+
+        # 计算并集体积
+        union_volumes = volumes1 + volumes2 - intersect_volumes  # [N, M]
+
+        # 计算IoU
+        iou = intersect_volumes / (union_volumes + 1e-7)  # [N, M]
 
     return iou
 
@@ -409,12 +485,54 @@ def evaluate_3d_detection(
     nworkers=0,
     num_classes=10,
     amp=True,
+    consider_rotation=True,
+    iou_thresholds=[0.5, 0.7],
+    class_names=None,
+    verbose=True,
 ):
     """
     使用保存的模型检查点评估3D检测性能
+    Args:
+        checkpoint_path: 模型检查点路径
+        version: 数据集版本
+        dataroot: 数据集根目录
+        gpuid: GPU ID
+        H, W: 原始图像高度和宽度
+        resize_lim: 调整大小的限制
+        final_dim: 最终图像尺寸
+        bot_pct_lim: 底部百分比限制
+        rot_lim: 旋转限制
+        rand_flip: 是否随机翻转
+        ncams: 相机数量
+        xbound, ybound, zbound, dbound: 边界设置
+        bsz: 批次大小
+        nworkers: 数据加载器的工作线程数
+        num_classes: 类别数量
+        amp: 是否使用混合精度
+        consider_rotation: 是否在IoU计算中考虑旋转
+        iou_thresholds: IoU阈值列表
+        class_names: 类别名称字典，格式为 {class_id: class_name}
+        verbose: 是否打印详细信息
+    Returns:
+        dict: 包含各项评估指标的字典
     """
+    from nuscenes.utils.data_classes import Box
     from .models import compile_model
     from .data import compile_data
+
+    # 设置默认类别名称
+    if class_names is None:
+        class_names = {
+            1: 'Car',
+            2: 'Truck',
+            3: 'Bus',
+            4: 'Trailer',
+            5: 'Construction',
+            6: 'Pedestrian',
+            7: 'Motorcycle',
+            8: 'Bicycle',
+            9: 'Traffic Cone'
+        }
 
     grid_conf = {
         'xbound': xbound,
@@ -443,7 +561,8 @@ def evaluate_3d_detection(
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     # 加载模型
-    print(f"Loading model from {checkpoint_path}")
+    if verbose:
+        print(f"Loading model from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     # 使用正确的参数初始化模型
@@ -455,7 +574,9 @@ def evaluate_3d_detection(
         raise ValueError("模型初始化失败，请检查compile_model函数")
 
     # 加载权重
-    if 'net' in checkpoint:
+    if 'state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['state_dict'])
+    elif 'net' in checkpoint:
         model.load_state_dict(checkpoint['net'])
     else:
         model.load_state_dict(checkpoint)
@@ -463,8 +584,64 @@ def evaluate_3d_detection(
     model.to(device)
     model.eval()
 
-    # 计算mAP
-    map_value = compute_map(model, valloader, device, amp=amp)
-    print(f"mAP: {map_value:.4f}")
+    # 收集预测和目标
+    all_predictions = []
+    all_targets = []
 
-    return map_value
+    with torch.no_grad():
+        for imgs, rots, trans, intrins, post_rots, post_trans, targets in tqdm(valloader, desc="Evaluating", disable=not verbose):
+            # 使用上下文管理器进行混合精度计算
+            if amp and device.type == 'cuda':
+                with torch.cuda.amp.autocast():
+                    preds = model(imgs.to(device),
+                                  rots.to(device),
+                                  trans.to(device),
+                                  intrins.to(device),
+                                  post_rots.to(device),
+                                  post_trans.to(device),
+                                  )
+            else:
+                preds = model(imgs.to(device),
+                              rots.to(device),
+                              trans.to(device),
+                              intrins.to(device),
+                              post_rots.to(device),
+                              post_trans.to(device),
+                              )
+
+            # 收集预测和目标
+            batch_dets = decode_predictions(preds, device)
+            batch_gts = decode_targets(targets, device)
+
+            all_predictions.extend(batch_dets)
+            all_targets.extend(batch_gts)
+
+    # 计算各项评估指标
+    results = calculate_map(all_predictions, all_targets,
+                            iou_thresholds=iou_thresholds,
+                            num_classes=num_classes,
+                            consider_rotation=consider_rotation)
+
+    # 替换类别ID为类别名称
+    for iou_thresh in iou_thresholds:
+        renamed_aps = {}
+        for cls_id, ap in results['class_aps'][f'AP@{iou_thresh:.1f}'].items():
+            cls_name = class_names.get(cls_id, f"Class {cls_id}")
+            renamed_aps[cls_name] = ap
+        results['class_aps'][f'AP@{iou_thresh:.1f}'] = renamed_aps
+
+    # 添加类别名称
+    results['class_names'] = class_names
+
+    # 打印评估结果
+    if verbose:
+        print("\n===== 3D Detection Evaluation Results =====")
+        for key, value in results.items():
+            if key.startswith('mAP'):
+                print(f"{key}: {value:.4f}")
+
+        print("\n----- Per-class AP@0.5 -----")
+        for cls_name, ap in results['class_aps']['AP@0.5'].items():
+            print(f"{cls_name}: {ap:.4f}")
+
+    return results
