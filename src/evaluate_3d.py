@@ -297,7 +297,9 @@ def calculate_ap_for_class(predictions, targets, iou_thresh=0.5, consider_rotati
             continue
 
         # 计算IoU
-        ious = compute_3d_iou(pred_boxes, gt_boxes,
+        ious = compute_3d_iou(pred_boxes[:, :3], gt_boxes[:, :3],
+                              pred_boxes[:, 3:6], gt_boxes[:, 3:6],
+                              pred_boxes[:, 6], gt_boxes[:, 6],
                               consider_rotation=consider_rotation)  # [N, M]
 
         # 对每个预测找到最大IoU的目标
@@ -349,23 +351,35 @@ def calculate_ap_for_class(predictions, targets, iou_thresh=0.5, consider_rotati
     return ap
 
 
-def compute_3d_iou(boxes1, boxes2, consider_rotation=True):
+def compute_3d_iou(centers1, centers2, sizes1, sizes2, angles1=None, angles2=None, consider_rotation=False):
     """
-    计算两组3D边界框之间的IoU，支持考虑旋转
+    计算两组3D边界框之间的IoU
+
     Args:
-        boxes1: [N, 7] - x, y, z, w, l, h, θ
-        boxes2: [M, 7] - x, y, z, w, l, h, θ
-        consider_rotation: 是否考虑旋转信息
+        centers1: 第一组框的中心点坐标 [N, 3]
+        centers2: 第二组框的中心点坐标 [M, 3]
+        sizes1: 第一组框的尺寸 [N, 3]
+        sizes2: 第二组框的尺寸 [M, 3]
+        angles1: 第一组框的旋转角度 [N] (如果考虑旋转)
+        angles2: 第二组框的旋转角度 [M] (如果考虑旋转)
+        consider_rotation: 是否考虑旋转
+
     Returns:
-        Tensor: [N, M] IoU矩阵
+        IoU矩阵 [N, M]
     """
+    # 确保所有输入都是float32类型，防止类型不匹配错误
+    centers1 = centers1.float()
+    centers2 = centers2.float()
+    sizes1 = sizes1.float()
+    sizes2 = sizes2.float()
+
+    if consider_rotation and angles1 is not None and angles2 is not None:
+        angles1 = angles1.float()
+        angles2 = angles2.float()
+
     if not consider_rotation:
         # 简化计算，不考虑旋转，只计算轴对齐的3D IoU
-        def get_box_min_max(boxes):
-            # boxes: [..., 7] - x, y, z, w, l, h, θ
-            centers = boxes[..., :3]
-            dimensions = boxes[..., 3:6]
-
+        def get_box_min_max(centers, dimensions):
             # 计算边界框的最小/最大坐标
             half_dimensions = dimensions / 2
             mins = centers - half_dimensions
@@ -373,8 +387,8 @@ def compute_3d_iou(boxes1, boxes2, consider_rotation=True):
             return mins, maxs
 
         # 获取两组边界框的最小/最大坐标
-        mins1, maxs1 = get_box_min_max(boxes1)  # [N, 3], [N, 3]
-        mins2, maxs2 = get_box_min_max(boxes2)  # [M, 3], [M, 3]
+        mins1, maxs1 = get_box_min_max(centers1, sizes1)  # [N, 3], [N, 3]
+        mins2, maxs2 = get_box_min_max(centers2, sizes2)  # [M, 3], [M, 3]
 
         # 计算交集边界框的最小/最大坐标
         mins1 = mins1.unsqueeze(1)  # [N, 1, 3]
@@ -391,8 +405,8 @@ def compute_3d_iou(boxes1, boxes2, consider_rotation=True):
         intersect_volumes = intersect_dimensions.prod(dim=2)  # [N, M]
 
         # 计算两组边界框的体积
-        volumes1 = boxes1[:, 3:6].prod(dim=1).unsqueeze(1)  # [N, 1]
-        volumes2 = boxes2[:, 3:6].prod(dim=1).unsqueeze(0)  # [1, M]
+        volumes1 = sizes1.prod(dim=1).unsqueeze(1)  # [N, 1]
+        volumes2 = sizes2.prod(dim=1).unsqueeze(0)  # [1, M]
 
         # 计算并集体积
         union_volumes = volumes1 + volumes2 - intersect_volumes  # [N, M]
@@ -401,42 +415,40 @@ def compute_3d_iou(boxes1, boxes2, consider_rotation=True):
         iou = intersect_volumes / (union_volumes + 1e-7)  # [N, M]
     else:
         # 考虑旋转的3D IoU计算 - 使用近似方法
-        # 提取位置、尺寸和角度
-        centers1 = boxes1[:, :3]  # [N, 3]
-        dimensions1 = boxes1[:, 3:6]  # [N, 3]
-        rotations1 = boxes1[:, 6]  # [N]
-
-        centers2 = boxes2[:, :3]  # [M, 3]
-        dimensions2 = boxes2[:, 3:6]  # [M, 3]
-        rotations2 = boxes2[:, 6]  # [M]
-
         # 计算中心点距离
         center_dist = torch.cdist(centers1, centers2)  # [N, M]
 
         # 计算角度差异的影响因子
-        rot1 = rotations1.unsqueeze(1).expand(-1, boxes2.size(0))  # [N, M]
-        rot2 = rotations2.unsqueeze(0).expand(boxes1.size(0), -1)  # [N, M]
-        angle_diff = torch.abs(rot1 - rot2)  # [N, M]
-        # 将角度差异限制在[0, π/2]范围内
-        angle_diff = torch.min(angle_diff, torch.abs(
-            angle_diff - torch.tensor(3.14159, device=angle_diff.device)))
-        angle_factor = torch.cos(angle_diff)  # [N, M] 角度差异影响因子
+        if angles1 is not None and angles2 is not None:
+            rot1 = angles1.squeeze(-1).unsqueeze(1).expand(-1,
+                                                           centers2.size(0))  # [N, M]
+            # [N, M]
+            rot2 = angles2.squeeze(-1).unsqueeze(0).expand(centers1.size(0), -1)
+            angle_diff = torch.abs(rot1 - rot2)  # [N, M]
+            # 将角度差异限制在[0, π/2]范围内
+            angle_diff = torch.min(angle_diff, torch.abs(
+                angle_diff - torch.tensor(3.14159, device=angle_diff.device)))
+            angle_factor = torch.cos(angle_diff)  # [N, M] 角度差异影响因子
+        else:
+            # 如果没有提供角度信息，则假设所有框都是同向的
+            angle_factor = torch.ones((centers1.size(0), centers2.size(0)),
+                                      device=centers1.device)
 
         # 计算两组边界框的体积
-        volumes1 = dimensions1.prod(dim=1).unsqueeze(1)  # [N, 1]
-        volumes2 = dimensions2.prod(dim=1).unsqueeze(0)  # [1, M]
+        volumes1 = sizes1.prod(dim=1).unsqueeze(1)  # [N, 1]
+        volumes2 = sizes2.prod(dim=1).unsqueeze(0)  # [1, M]
 
         # 计算近似的交集体积
         # 1. 判断中心点距离是否小于两个框大小之和的一半
-        size_sum = (dimensions1.norm(dim=1).unsqueeze(1) +
-                    dimensions2.norm(dim=1).unsqueeze(0)) / 2  # [N, M]
+        size_sum = (sizes1.norm(dim=1).unsqueeze(1) +
+                    sizes2.norm(dim=1).unsqueeze(0)) / 2  # [N, M]
 
         # 2. 如果中心距离过大，则IoU为0
         mask = (center_dist < size_sum)  # [N, M]
 
         # 3. 根据尺寸重叠程度和角度差异估计交集体积
-        dim1 = dimensions1.unsqueeze(1)  # [N, 1, 3]
-        dim2 = dimensions2.unsqueeze(0)  # [1, M, 3]
+        dim1 = sizes1.unsqueeze(1)  # [N, 1, 3]
+        dim2 = sizes2.unsqueeze(0)  # [1, M, 3]
 
         # 计算轴对齐的交集体积（不考虑旋转）
         min_dims = torch.min(dim1, dim2)  # [N, M, 3]

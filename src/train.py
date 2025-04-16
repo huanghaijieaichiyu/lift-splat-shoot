@@ -17,6 +17,7 @@ from .models import compile_model
 from .data import compile_data
 from .tools import save_path
 from .tools import SimpleLoss, get_batch_iou, get_val_info
+from contextlib import nullcontext  # 导入nullcontext
 
 
 def train(version,
@@ -186,7 +187,7 @@ def train_3d(version,
              cuDNN=False,
              resume='',
              load_weight='',
-             amp=True,  # 默认禁用混合精度训练，以避免张量类型不匹配错误
+             amp=True,  # 默认启用混合精度训练，但在验证时需要注意类型一致性
              H=900, W=1600,
              resize_lim=(0.193, 0.225),
              final_dim=(128, 352),
@@ -321,7 +322,8 @@ def train_3d(version,
 
     # 自动混合精度训练
     if amp:
-        scaler = GradScaler()
+        # 使用正确的API，注意torch.cuda.amp仍然有效
+        scaler = GradScaler() if torch.cuda.is_available() else None
     else:
         scaler = None
 
@@ -342,9 +344,12 @@ def train_3d(version,
 
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list) in pbar:
             t0 = time.time()  # 确保是浮点数
+            # 只有在新的累积周期开始时才清零梯度
             opt.zero_grad()
 
-            with autocast(enabled=amp):
+            # 处理当前批次
+            # 使用autocast进行混合精度训练
+            with autocast(enabled=amp) if amp and torch.cuda.is_available() else nullcontext():
                 preds = model(imgs.to(device),
                               rots.to(device),
                               trans.to(device),
@@ -446,7 +451,7 @@ def train_3d(version,
             'epoch': epoch,
             'best_map': best_map,
             'model_configs': model_configs,  # 保存模型配置
-            'amp_scaler': scaler.state_dict(),  # 保存混合精度训练状态
+            'amp_scaler': scaler.state_dict() if scaler is not None else None,  # 修复None调用问题
         }
         last_model = os.path.join(path, "last.pt")
         torch.save(last_checkpoint, last_model)
@@ -465,7 +470,8 @@ def train_3d(version,
 
             with torch.no_grad():
                 for imgs, rots, trans, intrins, post_rots, post_trans, targets_list in valloader:
-                    with autocast(enabled=amp):
+                    # 使用autocast进行混合精度训练
+                    with autocast(enabled=amp) if amp and torch.cuda.is_available() else nullcontext():
                         preds = model(imgs.to(device),
                                       rots.to(device),
                                       trans.to(device),
@@ -527,21 +533,24 @@ def train_3d(version,
                 all_targets = []
 
                 for imgs, rots, trans, intrins, post_rots, post_trans, targets_list in valloader:
-                    if amp and device.type == 'cuda':
-                        with torch.cuda.amp.autocast():
-                            preds = model(imgs.to(device),
-                                          rots.to(device),
-                                          trans.to(device),
-                                          intrins.to(device),
-                                          post_rots.to(device),
-                                          post_trans.to(device))
-                    else:
-                        preds = model(imgs.to(device),
-                                      rots.to(device),
-                                      trans.to(device),
-                                      intrins.to(device),
-                                      post_rots.to(device),
-                                      post_trans.to(device))
+                    # 不使用混合精度进行评估，确保数据类型一致性
+                    preds = model(imgs.to(device),
+                                  rots.to(device),
+                                  trans.to(device),
+                                  intrins.to(device),
+                                  post_rots.to(device),
+                                  post_trans.to(device))
+
+                    # 确保预测结果为float32类型，避免类型不匹配
+                    if hasattr(preds, 'float'):
+                        preds = preds.float()
+                    elif isinstance(preds, dict):
+                        for k in preds:
+                            if hasattr(preds[k], 'float'):
+                                preds[k] = preds[k].float()
+                    elif isinstance(preds, (list, tuple)):
+                        preds = [p.float() if hasattr(p, 'float')
+                                 else p for p in preds]
 
                     # 解码预测和目标
                     from .evaluate_3d import decode_predictions, decode_targets
@@ -551,26 +560,39 @@ def train_3d(version,
                     all_predictions.extend(batch_dets)
                     all_targets.extend(batch_gts)
 
-            # 计算mAP，可以指定参数
-            val_results = calculate_map(all_predictions, all_targets,
-                                        iou_thresholds=[0.5, 0.7],
-                                        num_classes=num_classes,
-                                        consider_rotation=True)
+            # 计算mAP，确保结果类型正确
+            try:
+                val_results = calculate_map(all_predictions, all_targets,
+                                            iou_thresholds=[0.5, 0.7],
+                                            num_classes=num_classes,
+                                            consider_rotation=True)
 
-            # 记录多个IoU阈值下的mAP
-            writer.add_scalar('val/mAP@0.5', val_results['mAP@0.5'], epoch + 1)
-            writer.add_scalar('val/mAP@0.7', val_results['mAP@0.7'], epoch + 1)
+                # 记录多个IoU阈值下的mAP
+                writer.add_scalar(
+                    'val/mAP@0.5', float(val_results['mAP@0.5']), epoch + 1)
+                writer.add_scalar(
+                    'val/mAP@0.7', float(val_results['mAP@0.7']), epoch + 1)
 
-            # 记录每个类别的AP
-            for cls_id, ap in val_results['class_aps']['AP@0.5'].items():
-                cls_name = val_results['class_names'].get(
-                    cls_id, f"Class {cls_id}")
-                writer.add_scalar(f'val/AP@0.5/{cls_name}', ap, epoch + 1)
+                # 记录每个类别的AP，确保数据类型正确
+                if isinstance(val_results['class_aps'], dict) and 'AP@0.5' in val_results['class_aps']:
+                    for cls_id, ap in val_results['class_aps']['AP@0.5'].items():
+                        if isinstance(val_results.get('class_names', {}), dict):
+                            cls_name = val_results['class_names'].get(
+                                cls_id, f"Class {cls_id}")
+                        else:
+                            cls_name = f"Class {cls_id}"
+                        writer.add_scalar(
+                            f'val/AP@0.5/{cls_name}', float(ap), epoch + 1)
 
-            val_map_score = val_results['mAP@0.5']  # 使用0.5阈值的mAP作为主要指标
+                # 使用0.5阈值的mAP作为主要指标
+                val_map_score = float(val_results['mAP@0.5'])
+            except Exception as e:
+                print(f"计算mAP时出错: {e}")
+                val_map_score = 0.0
+                val_results = {'mAP@0.5': 0.0, 'mAP@0.7': 0.0}  # 创建默认结果字典
 
             print('||Val Loss: %.4f|mAP@0.5: %.4f|mAP@0.7: %.4f||' %
-                  (val_loss, val_results['mAP@0.5'], val_results['mAP@0.7']))
+                  (val_loss, val_map_score, float(val_results['mAP@0.7'])))
 
             # 保存最佳模型
             if val_map_score > best_map:
@@ -582,7 +604,7 @@ def train_3d(version,
                     'epoch': epoch,
                     'best_map': best_map,
                     'model_configs': model_configs,
-                    'amp_scaler': scaler.state_dict() if scaler else None,
+                    'amp_scaler': scaler.state_dict() if scaler is not None else None,
                 }
                 best_model = os.path.join(path, "best.pt")
                 torch.save(best_checkpoint, best_model)
@@ -727,7 +749,8 @@ def train_fusion(version,
 
     # 自动混合精度训练
     if amp:
-        scaler = GradScaler()
+        # 使用正确的API
+        scaler = GradScaler() if torch.cuda.is_available() else None
     else:
         scaler = None
 
@@ -753,7 +776,8 @@ def train_fusion(version,
                 opt.zero_grad()
 
             # 处理当前批次
-            with autocast(enabled=amp):
+            # 使用autocast进行混合精度训练
+            with autocast(enabled=amp) if amp and torch.cuda.is_available() else nullcontext():
                 preds = model(imgs.to(device),
                               rots.to(device),
                               trans.to(device),
@@ -805,7 +829,6 @@ def train_fusion(version,
                     scaler.update()
                     scheduler.step()
 
-            # 累计损失统计 (使用未缩放的损失值)
             epoch_loss += total_loss.item()
             epoch_cls_loss += cls_loss.item()
             epoch_reg_loss += reg_loss.item()
@@ -862,7 +885,7 @@ def train_fusion(version,
             'epoch': epoch,
             'best_map': best_map,
             'model_configs': model_configs,
-            'amp_scaler': scaler.state_dict(),
+            'amp_scaler': scaler.state_dict() if scaler is not None else None,  # 修复None调用问题
         }
         last_model = os.path.join(path, "last.pt")
         torch.save(last_checkpoint, last_model)
@@ -881,15 +904,15 @@ def train_fusion(version,
 
             with torch.no_grad():
                 for imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_list in valloader:
-                    with autocast(enabled=amp):
+                    # 使用autocast进行混合精度训练
+                    with autocast(enabled=amp) if amp and torch.cuda.is_available() else nullcontext():
                         preds = model(imgs.to(device),
                                       rots.to(device),
                                       trans.to(device),
                                       intrins.to(device),
                                       post_rots.to(device),
                                       post_trans.to(device),
-                                      lidar_bev.to(device)
-                                      )
+                                      lidar_bev.to(device))
 
                         # Unpack the list and create the target dictionary
                         cls_map = targets_list[0].to(device)        # 类别地图
@@ -943,53 +966,68 @@ def train_fusion(version,
                 all_predictions = []
                 all_targets = []
 
-                for imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets in valloader:
-                    if amp and device.type == 'cuda':
-                        with torch.cuda.amp.autocast():
-                            preds = model(imgs.to(device),
-                                          rots.to(device),
-                                          trans.to(device),
-                                          intrins.to(device),
-                                          post_rots.to(device),
-                                          post_trans.to(device),
-                                          lidar_bev.to(device))
-                    else:
-                        preds = model(imgs.to(device),
-                                      rots.to(device),
-                                      trans.to(device),
-                                      intrins.to(device),
-                                      post_rots.to(device),
-                                      post_trans.to(device),
-                                      lidar_bev.to(device))
+                for imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_list in valloader:
+                    # 不使用混合精度进行评估，确保数据类型一致性
+                    preds = model(imgs.to(device),
+                                  rots.to(device),
+                                  trans.to(device),
+                                  intrins.to(device),
+                                  post_rots.to(device),
+                                  post_trans.to(device),
+                                  lidar_bev.to(device))
+
+                    # 确保预测结果为float32类型，避免类型不匹配
+                    if hasattr(preds, 'float'):
+                        preds = preds.float()
+                    elif isinstance(preds, dict):
+                        for k in preds:
+                            if hasattr(preds[k], 'float'):
+                                preds[k] = preds[k].float()
+                    elif isinstance(preds, (list, tuple)):
+                        preds = [p.float() if hasattr(p, 'float')
+                                 else p for p in preds]
 
                     # 解码预测和目标
                     from .evaluate_3d import decode_predictions, decode_targets
                     batch_dets = decode_predictions(preds, device)
-                    batch_gts = decode_targets(targets, device)
+                    batch_gts = decode_targets(targets_list, device)
 
                     all_predictions.extend(batch_dets)
                     all_targets.extend(batch_gts)
 
-            # 计算mAP，可以指定参数
-            val_results = calculate_map(all_predictions, all_targets,
-                                        iou_thresholds=[0.5, 0.7],
-                                        num_classes=num_classes,
-                                        consider_rotation=True)
+            # 计算mAP，确保结果类型正确
+            try:
+                val_results = calculate_map(all_predictions, all_targets,
+                                            iou_thresholds=[0.5, 0.7],
+                                            num_classes=num_classes,
+                                            consider_rotation=True)
 
-            # 记录多个IoU阈值下的mAP
-            writer.add_scalar('val/mAP@0.5', val_results['mAP@0.5'], epoch + 1)
-            writer.add_scalar('val/mAP@0.7', val_results['mAP@0.7'], epoch + 1)
+                # 记录多个IoU阈值下的mAP
+                writer.add_scalar(
+                    'val/mAP@0.5', float(val_results['mAP@0.5']), epoch + 1)
+                writer.add_scalar(
+                    'val/mAP@0.7', float(val_results['mAP@0.7']), epoch + 1)
 
-            # 记录每个类别的AP
-            for cls_id, ap in val_results['class_aps']['AP@0.5'].items():
-                cls_name = val_results['class_names'].get(
-                    cls_id, f"Class {cls_id}")
-                writer.add_scalar(f'val/AP@0.5/{cls_name}', ap, epoch + 1)
+                # 记录每个类别的AP，确保数据类型正确
+                if isinstance(val_results['class_aps'], dict) and 'AP@0.5' in val_results['class_aps']:
+                    for cls_id, ap in val_results['class_aps']['AP@0.5'].items():
+                        if isinstance(val_results.get('class_names', {}), dict):
+                            cls_name = val_results['class_names'].get(
+                                cls_id, f"Class {cls_id}")
+                        else:
+                            cls_name = f"Class {cls_id}"
+                        writer.add_scalar(
+                            f'val/AP@0.5/{cls_name}', float(ap), epoch + 1)
 
-            val_map_score = val_results['mAP@0.5']  # 使用0.5阈值的mAP作为主要指标
+                # 使用0.5阈值的mAP作为主要指标
+                val_map_score = float(val_results['mAP@0.5'])
+            except Exception as e:
+                print(f"计算mAP时出错: {e}")
+                val_map_score = 0.0
+                val_results = {'mAP@0.5': 0.0, 'mAP@0.7': 0.0}  # 创建默认结果字典
 
             print('||Val Loss: %.4f|mAP@0.5: %.4f|mAP@0.7: %.4f||' %
-                  (val_loss, val_results['mAP@0.5'], val_results['mAP@0.7']))
+                  (val_loss, val_map_score, float(val_results['mAP@0.7'])))
 
             # 保存最佳模型
             if val_map_score > best_map:
@@ -1001,7 +1039,7 @@ def train_fusion(version,
                     'epoch': epoch,
                     'best_map': best_map,
                     'model_configs': model_configs,
-                    'amp_scaler': scaler.state_dict() if scaler else None,
+                    'amp_scaler': scaler.state_dict() if scaler is not None else None,
                 }
                 best_model = os.path.join(path, "best.pt")
                 torch.save(best_checkpoint, best_model)
