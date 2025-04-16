@@ -9,7 +9,7 @@ import torch.nn as nn
 import time  # 直接导入time模块
 from tensorboardX import SummaryWriter
 from torch.backends import cudnn
-from torch.cuda.amp import autocast
+from torch.cuda.amp import autocast, GradScaler  # 正确导入
 from tqdm import tqdm
 import numpy as np
 import os
@@ -117,13 +117,14 @@ def train(version,
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0 = time.time()  # 确保是浮点数
             opt.zero_grad()
-            preds = model(imgs.to(device),
-                          rots.to(device),
-                          trans.to(device),
-                          intrins.to(device),
-                          post_rots.to(device),
-                          post_trans.to(device),
-                          )
+            with autocast(enabled=amp):
+                preds = model(imgs.to(device),
+                              rots.to(device),
+                              trans.to(device),
+                              intrins.to(device),
+                              post_rots.to(device),
+                              post_trans.to(device),
+                              )
             binimgs = binimgs.to(device)
 
             with autocast(enabled=amp):
@@ -319,7 +320,10 @@ def train_3d(version,
         model.load_state_dict(checkpoint['net'], strict=False)
 
     # 自动混合精度训练
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    if amp:
+        scaler = GradScaler()
+    else:
+        scaler = None
 
     while epoch < nepochs:
         np.random.seed()
@@ -374,15 +378,17 @@ def train_3d(version,
                     scale_losses = losses['scale_losses']
 
             # 使用混合精度训练
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(opt)  # 反向传播前解缩放，以便进行梯度裁剪
+            if scaler:
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(opt)  # 反向传播前解缩放，以便进行梯度裁剪
 
             # 梯度裁剪，避免梯度爆炸
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-            scaler.step(opt)
-            scaler.update()
-            scheduler.step()
+            if scaler:
+                scaler.step(opt)
+                scaler.update()
+                scheduler.step()
 
             epoch_loss += total_loss.item()
             epoch_cls_loss += cls_loss.item()
@@ -675,7 +681,10 @@ def train_fusion(version,
         model.load_state_dict(checkpoint['net'], strict=False)
 
     # 自动混合精度训练
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    if amp:
+        scaler = GradScaler()
+    else:
+        scaler = None
 
     while epoch < nepochs:
         np.random.seed()
@@ -737,17 +746,19 @@ def train_fusion(version,
                     scale_losses = losses['scale_losses']
 
             # 使用混合精度训练
-            scaler.scale(scaled_loss).backward()
+            if scaler:
+                scaler.scale(scaled_loss).backward()
 
             # 只有在累积周期结束时才更新参数
             if (batchi + 1) % grad_accum_steps == 0 or (batchi + 1) == len(trainloader):
-                scaler.unscale_(opt)  # 反向传播前解缩放，以便进行梯度裁剪
-                # 梯度裁剪，避免梯度爆炸
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_grad_norm)
-                scaler.step(opt)
-                scaler.update()
-                scheduler.step()
+                if scaler:
+                    scaler.unscale_(opt)  # 反向传播前解缩放，以便进行梯度裁剪
+                    # 梯度裁剪，避免梯度爆炸
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm)
+                    scaler.step(opt)
+                    scaler.update()
+                    scheduler.step()
 
             # 累计损失统计 (使用未缩放的损失值)
             epoch_loss += total_loss.item()

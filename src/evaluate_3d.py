@@ -5,7 +5,6 @@ Authors: Jonah Philion and Sanja Fidler
 """
 
 import torch
-from torch.cuda.amp import autocast
 import numpy as np
 from tqdm import tqdm
 
@@ -27,7 +26,17 @@ def compute_map(model, valloader, device, amp=True):
 
     with torch.no_grad():
         for imgs, rots, trans, intrins, post_rots, post_trans, targets in tqdm(valloader, desc="Evaluating mAP"):
-            with autocast(enabled=amp):
+            # 使用上下文管理器进行混合精度计算
+            if amp and device.type == 'cuda':
+                with torch.cuda.amp.autocast():
+                    preds = model(imgs.to(device),
+                                  rots.to(device),
+                                  trans.to(device),
+                                  intrins.to(device),
+                                  post_rots.to(device),
+                                  post_trans.to(device),
+                                  )
+            else:
                 preds = model(imgs.to(device),
                               rots.to(device),
                               trans.to(device),
@@ -36,12 +45,12 @@ def compute_map(model, valloader, device, amp=True):
                               post_trans.to(device),
                               )
 
-                # 收集预测和目标
-                batch_dets = decode_predictions(preds, device)
-                batch_gts = decode_targets(targets, device)
+            # 收集预测和目标
+            batch_dets = decode_predictions(preds, device)
+            batch_gts = decode_targets(targets, device)
 
-                all_predictions.extend(batch_dets)
-                all_targets.extend(batch_gts)
+            all_predictions.extend(batch_dets)
+            all_targets.extend(batch_gts)
 
     # 计算mAP
     mean_ap = calculate_map(all_predictions, all_targets)
@@ -86,8 +95,9 @@ def decode_predictions(preds, device):
 
             # 获取回归预测值
             h, w = mask.shape
+            # 修复meshgrid警告，添加indexing参数
             ys, xs = torch.meshgrid(torch.arange(
-                h, device=device), torch.arange(w, device=device))
+                h, device=device), torch.arange(w, device=device), indexing='ij')
             xs, ys = xs[mask], ys[mask]  # [N], [N]
 
             reg_pred = reg_pred.permute(1, 2, 0)  # [H, W, 9]
@@ -122,22 +132,28 @@ def decode_predictions(preds, device):
     return predictions
 
 
-def decode_targets(targets, device):
+def decode_targets(targets_list, device):
     """
     解码目标数据为3D检测框
     Args:
-        targets: 目标数据
+        targets_list: 目标数据列表，包含 [cls_map, reg_map, reg_weight, iou_map]
         device: 设备
     Returns:
         list: 包含目标数据的列表
     """
-    batch_size = targets['cls_targets'].shape[0]
+    # 解包目标列表
+    cls_map = targets_list[0].to(device)        # 类别地图
+    reg_map = targets_list[1].to(device)        # 回归地图
+    reg_weight = targets_list[2].to(device)     # 回归权重
+    iou_map = targets_list[3].to(device)        # IoU地图
+
+    batch_size = cls_map.shape[0]
     gt_list = []
 
     for b in range(batch_size):
         # 获取当前批次的目标
-        cls_targets = targets['cls_targets'][b].to(device)  # [H, W]
-        reg_targets = targets['reg_targets'][b].to(device)  # [9, H, W]
+        cls_targets = cls_map[b]  # [H, W]
+        reg_targets = reg_map[b]  # [9, H, W]
 
         # 过滤掉背景 (类别ID=0)
         mask = cls_targets > 0  # [H, W]
@@ -390,7 +406,9 @@ def evaluate_3d_detection(
     zbound=[-10.0, 10.0, 20.0],
     dbound=[4.0, 45.0, 1.0],
     bsz=4,
-    nworkers=10,
+    nworkers=0,
+    num_classes=10,
+    amp=True,
 ):
     """
     使用保存的模型检查点评估3D检测性能
@@ -427,16 +445,26 @@ def evaluate_3d_detection(
     # 加载模型
     print(f"Loading model from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    num_classes = 10  # 默认类别数
 
+    # 使用正确的参数初始化模型
+    # 对于3D检测任务，outC应该是num_classes*9
     model = compile_model(grid_conf, data_aug_conf,
-                          outC=num_classes*9, model='beve')
-    model.load_state_dict(checkpoint['net'])
+                          outC=num_classes*9, model='beve', num_classes=num_classes)
+
+    if model is None:
+        raise ValueError("模型初始化失败，请检查compile_model函数")
+
+    # 加载权重
+    if 'net' in checkpoint:
+        model.load_state_dict(checkpoint['net'])
+    else:
+        model.load_state_dict(checkpoint)
+
     model.to(device)
     model.eval()
 
     # 计算mAP
-    map_value = compute_map(model, valloader, device)
+    map_value = compute_map(model, valloader, device, amp=amp)
     print(f"mAP: {map_value:.4f}")
 
     return map_value

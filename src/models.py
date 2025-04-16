@@ -371,34 +371,56 @@ class LiftSplatShoot(nn.Module):
 
 
 def compile_model(grid_conf, data_aug_conf, outC, model='vit', num_classes=10, lidar_channels=64):
-    if model == 'lss':
-        return LiftSplatShoot(grid_conf, data_aug_conf, outC)
-    elif model == 'beve':
-        # 确保类别数至少为1
+    """
+    根据配置编译不同类型的模型
+    Args:
+        grid_conf: 网格配置
+        data_aug_conf: 数据增强配置
+        outC: 输出通道数
+        model: 模型类型 ('lss', 'beve', 'fusion', '3d')
+        num_classes: 类别数量
+        lidar_channels: LiDAR通道数量（仅用于融合模型）
+    Returns:
+        nn.Module: 编译好的模型
+    """
+    try:
+        if model == 'lss':
+            return LiftSplatShoot(grid_conf, data_aug_conf, outC)
+        elif model == 'beve':
+            # 确保类别数至少为1
+            actual_num_classes = max(1, num_classes)
+            # 适应检测头的要求
+            if 'detection' in str(model).lower() or outC == actual_num_classes*9:
+                # 如果outC已经设置为类别数*9
+                return BEVENet(grid_conf, data_aug_conf, outC, num_classes=actual_num_classes, model_type='beve')
+            else:
+                # 默认情况下，为检测模型设置outC=num_classes*9
+                return BEVENet(grid_conf, data_aug_conf, actual_num_classes*9, num_classes=actual_num_classes, model_type='beve')
+        elif model == 'fusion':
+            # 使用多模态融合模型
+            actual_num_classes = max(1, num_classes)
+            try:
+                # 导入多模态融合模型
+                from models.MultiModalBEVENet import create_multimodal_bevenet
+                return create_multimodal_bevenet(grid_conf, data_aug_conf, actual_num_classes*9, actual_num_classes, lidar_channels)
+            except ImportError as e:
+                print(f"无法导入多模态融合模型: {e}")
+                print("回退到使用标准BEVENet模型")
+                return BEVENet(grid_conf, data_aug_conf, actual_num_classes*9, num_classes=actual_num_classes, model_type='beve')
+        elif model == '3d':
+            # 使用ViT模型
+            actual_num_classes = max(1, num_classes)
+            return BEVENet(grid_conf, data_aug_conf, actual_num_classes*9, num_classes=actual_num_classes, model_type='3d')
+        else:
+            print(f"警告: 未知的模型类型 '{model}'。回退到使用标准BEVENet模型")
+            actual_num_classes = max(1, num_classes)
+            return BEVENet(grid_conf, data_aug_conf, actual_num_classes*9, num_classes=actual_num_classes, model_type='beve')
+    except Exception as e:
+        print(f"编译模型时发生错误: {e}")
+        print("回退到使用标准BEVENet模型")
+        # 在出错的情况下回退到最基本的模型
         actual_num_classes = max(1, num_classes)
-        # 对于检测任务，outC应该是9*num_classes，因为每个类需要9个回归参数
-        # 但如果传入的outC已经是正确的值，则不需要修改
-        # 这里我们假设如果num_classes=0（分割任务），则直接使用outC
-        if num_classes > 0 and outC % 9 != 0:
-            # 调整outC为9的倍数，以适应检测头的要求
-            outC = actual_num_classes * 9
-        return BEVENet(grid_conf, data_aug_conf, outC, num_classes=actual_num_classes, model_type='beve')
-    elif model == 'fusion':
-        # 使用多模态融合模型
-        actual_num_classes = max(1, num_classes)
-        # 同样处理outC
-        if num_classes > 0 and outC % 9 != 0:
-            outC = actual_num_classes * 9
-        # 导入多模态融合模型
-        from models.MultiModalBEVENet import create_multimodal_bevenet
-        return create_multimodal_bevenet(grid_conf, data_aug_conf, outC, actual_num_classes, lidar_channels)
-    else:
-        # 使用ViT模型
-        actual_num_classes = max(1, num_classes)
-        # 同样处理outC
-        if num_classes > 0 and outC % 9 != 0:
-            outC = actual_num_classes * 9
-        return BEVENet(grid_conf, data_aug_conf, outC, num_classes=actual_num_classes, model_type='vit')
+        return BEVENet(grid_conf, data_aug_conf, actual_num_classes*9, num_classes=actual_num_classes, model_type='beve')
 
 
 class CamEncoder(nn.Module):
@@ -722,7 +744,7 @@ class BEVENet(nn.Module):
         self.proj_matrix_cache = None
 
         # 根据模型类型选择相机编码器
-        if model_type == 'vit':
+        if model_type == '3d':
             # 使用ViT相机编码
             self.camencode = create_cam_encoder(
                 self.D, self.camC, self.downsample)

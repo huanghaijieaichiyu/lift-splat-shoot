@@ -20,6 +20,8 @@ if __name__ == '__main__':
         'train_fusion': src.train.train_fusion,  # 训练融合目标检测模型
         'eval_model_iou': src.explore.eval_model_iou,
         'viz_model_preds': src.explore.viz_model_preds,
+        'viz_3d_detection': src.explore.viz_3d_detection,
+        'viz_fusion_detection': src.explore.viz_fusion_detection,
         'vedio_writer': src.vedio_writer.vedio_writer,
         'train_3d_detection': src.train.train_3d,  # 训练3D目标检测模型
         'eval_3d_detection': src.evaluate_3d.evaluate_3d_detection  # 评估3D目标检测性能
