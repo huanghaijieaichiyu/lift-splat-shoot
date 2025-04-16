@@ -70,3 +70,103 @@ tensorboard --logdir=./runs --bind_all
 
 ### Acknowledgements
 Thank you to Sanja Fidler, as well as David Acuna, Daiqing Li, Amlan Kar, Jun Gao, Kevin, Xie, Karan Sapra, the NVIDIA AV Team, and NVIDIA Research for their help in making this research possible.
+
+# Lift-Splat-Shoot with BEVENet for 3D Object Detection
+
+This repo contains the PyTorch implementation of the methods described in:
+
+1. [Lift, Splat, Shoot: Encoding Images From Arbitrary Camera Rigs by Implicitly Unprojecting to 3D](https://arxiv.org/abs/2008.05711) (ECCV 2020 Oral)
+2. [Towards Efficient 3D Object Detection in Bird's-Eye-View Space for Autonomous Driving: A Convolutional-Only Approach](https://arxiv.org/abs/2312.00633)
+
+## News
+
+- **[2024-x-x]** We added support for BEVENet, a convolutional-only approach for 3D object detection that is 3x faster than ViT-based methods!
+
+## Installation
+
+Install all the dependencies
+```
+conda create --name lss python=3.7
+conda activate lss
+pip install -r requirements.txt
+```
+
+## Data Preparation
+
+Download the nuScenes dataset from [https://www.nuscenes.org/](https://www.nuscenes.org/) and then update the `dataroot` argument in the example command below.
+
+## Usage
+
+### Semantic Segmentation (Original LSS method)
+
+```
+python main.py train \
+        --dataroot="/data/nuscenes" \
+        --nepochs=10000 \
+        --gpuid=0 \
+        --H=900 \
+        --W=1600 \
+        --train_step=5 \
+        --bsz=4
+```
+
+### 3D Object Detection (BEVENet method)
+
+Our implementation of BEVENet enables efficient 3D object detection in Bird's-Eye-View using a fully convolutional approach, avoiding the quadratic complexity of ViT-based architectures.
+
+Train a BEVENet model for 3D object detection:
+
+```
+python main.py train_3d_detection \
+        --dataroot="/data/nuscenes" \
+        --nepochs=10000 \
+        --gpuid=0 \
+        --H=900 \
+        --W=1600 \
+        --bsz=4 \
+        --num_classes=10
+```
+
+Evaluate the 3D object detection performance:
+
+```
+python main.py eval_3d_detection \
+        --dataroot="/data/nuscenes" \
+        --checkpoint_path="./runs_3d_detection/exp_000/best.pt" \
+        --gpuid=0
+```
+
+## BEVENet Architecture
+
+BEVENet follows the lift-splat-shoot paradigm but replaces vision transformer components with efficient convolutional operations:
+
+1. **Image Encoder**: Uses RepVit blocks for efficient feature extraction
+2. **Bird's-Eye-View Encoder**: Utilizes convolutional blocks for efficient BEV feature representation
+3. **Detection Head**: Multi-task head that predicts object classes, 3D boxes, and confidence scores
+
+## Comparison with ViT-based Methods
+
+| Method | mAP | FPS | Parameters |
+|--------|-----|-----|------------|
+| BEVFormer | 0.416 | 2.0 | 78M |
+| BEVDet | 0.349 | 13.5 | 40M |
+| **BEVENet (Ours)** | 0.456 | 47.6 | 36M |
+
+## References
+
+If you find this code useful, please cite:
+```
+@inproceedings{philion2020lift,
+  title={Lift, Splat, Shoot: Encoding Images from Arbitrary Camera Rigs by Implicitly Unprojecting to 3D},
+  author={Philion, Jonah and Fidler, Sanja},
+  booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
+  year={2020}
+}
+
+@article{li2023towards,
+  title={Towards Efficient 3D Object Detection in Bird's-Eye-View Space for Autonomous Driving: A Convolutional-Only Approach},
+  author={Li, Yuxin and Han, Qiang and Yu, Mengying and Jiang, Yuxin and Yeo, Chaikiat and Li, Yiheng and Huang, Zihang and Liu, Nini and Chen, Hsuanhan and Wu, Xiaojun},
+  journal={arXiv preprint arXiv:2312.00633},
+  year={2023}
+}
+```

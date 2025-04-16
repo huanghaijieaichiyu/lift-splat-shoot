@@ -14,7 +14,7 @@ __init__ = ['calc_same_pad', 'Conv2dSame', 'Mlp', 'DilateAttention', 'MultiDilat
 
 
 class Conv2dSame(torch.nn.Conv2d):
-    # 解决pytorch conv2d stride与padding=‘same’ 不能同时使用问题
+    # 解决pytorch conv2d stride与padding='same' 不能同时使用问题
     def calc_same_pad(self, i: int, k: int, s: int, d: int) -> int:
         return max((math.ceil(i / s) - 1) * s + (k - 1) * d + 1 - i, 0)
 
@@ -177,11 +177,11 @@ class Conv(nn.Module):
     # Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)
     default_act = nn.SiLU()  # default activation
 
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, bn=True):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(
             k, p, d), groups=g, dilation=d, bias=False)
-        self.bn = nn.BatchNorm2d(c2)
+        self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
         self.act = self.default_act if act is True else act if isinstance(
             act, nn.Module) else nn.Identity()
 
@@ -1022,9 +1022,12 @@ def fuse_conv_and_bn(conv, bn):
     fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.shape))
 
     # Prepare spatial bias
-    b_conv = torch.zeros(conv.weight.shape[0], device=conv.weight.device) if conv.bias is None else conv.bias
-    b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-    fusedconv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
+    b_conv = torch.zeros(
+        conv.weight.shape[0], device=conv.weight.device) if conv.bias is None else conv.bias
+    b_bn = bn.bias - \
+        bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
+    fusedconv.bias.copy_(
+        torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
 
     return fusedconv
 
@@ -1050,12 +1053,16 @@ def fuse_deconv_and_bn(deconv, bn):
     # Prepare filters
     w_deconv = deconv.weight.clone().view(deconv.out_channels, -1)
     w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
-    fuseddconv.weight.copy_(torch.mm(w_bn, w_deconv).view(fuseddconv.weight.shape))
+    fuseddconv.weight.copy_(
+        torch.mm(w_bn, w_deconv).view(fuseddconv.weight.shape))
 
     # Prepare spatial bias
-    b_conv = torch.zeros(deconv.weight.shape[1], device=deconv.weight.device) if deconv.bias is None else deconv.bias
-    b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-    fuseddconv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
+    b_conv = torch.zeros(
+        deconv.weight.shape[1], device=deconv.weight.device) if deconv.bias is None else deconv.bias
+    b_bn = bn.bias - \
+        bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
+    fuseddconv.bias.copy_(
+        torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
 
     return fuseddconv
 
@@ -1138,6 +1145,16 @@ class EMA(nn.Module):
                                  padding=1)  # 3×3卷积分支
 
     def forward(self, x):
+        # 确保输入是4D张量 [B, C, H, W]
+        if x.dim() != 4:
+            orig_shape = x.shape
+            # 如果不是4D，尝试reshape为4D
+            if x.dim() == 5:  # 例如 [B, C, D, H, W]
+                x = x.view(-1, x.shape[1], x.shape[3], x.shape[4])
+            else:
+                raise ValueError(
+                    f"EMA模块期望4D输入张量 [B,C,H,W]，但收到了形状为 {orig_shape} 的张量")
+
         b, c, h, w = x.size()
         group_x = x.reshape(b * self.groups, -1, h, w)  # b*g,c//g,h,w
         x_h = self.pool_h(group_x)  # 得到平均池化之后的h
@@ -1168,7 +1185,8 @@ class C2fCIB(C2f):
         expansion.
         """
         super().__init__(c1, c2, n, shortcut, g, e)
-        self.m = nn.ModuleList(CIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
+        self.m = nn.ModuleList(
+            CIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
 
 
 class Attention(nn.Module):
@@ -1189,13 +1207,15 @@ class Attention(nn.Module):
         B, _, H, W = x.shape
         N = H * W
         qkv = self.qkv(x)
-        q, k, v = qkv.view(B, self.num_heads, -1, N).split([self.key_dim, self.key_dim, self.head_dim], dim=2)
+        q, k, v = qkv.view(
+            B, self.num_heads, -1, N).split([self.key_dim, self.key_dim, self.head_dim], dim=2)
 
         attn = (
-                (q.transpose(-2, -1) @ k) * self.scale
+            (q.transpose(-2, -1) @ k) * self.scale
         )
         attn = attn.softmax(dim=-1)
-        x = (v @ attn.transpose(-2, -1)).view(B, -1, H, W) + self.pe(v.reshape(B, -1, H, W))
+        x = (v @ attn.transpose(-2, -1)).view(B, -1, H, W) + \
+            self.pe(v.reshape(B, -1, H, W))
         x = self.proj(x)
         return x
 
@@ -1244,6 +1264,16 @@ class ChannelAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
+        # 确保所有计算都在相同的设备和数据类型上
+        orig_type = x.dtype
+        orig_device = x.device
+
+        # 确保权重和输入在同一设备和数据类型上
+        self.f1.weight = nn.Parameter(self.f1.weight.to(
+            device=orig_device, dtype=orig_type))
+        self.f2.weight = nn.Parameter(self.f2.weight.to(
+            device=orig_device, dtype=orig_type))
+
         avg_out = self.f2(self.relu(self.f1(self.avg_pool(x))))
         max_out = self.f2(self.relu(self.f1(self.max_pool(x))))
         out = self.sigmoid(avg_out + max_out)

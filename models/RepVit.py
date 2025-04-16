@@ -93,7 +93,7 @@ class RepVGGDW(torch.nn.Module):
     def __init__(self, ed) -> None:
         super().__init__()
         self.conv = Conv2d_BN(ed, ed, 3, 1, 1, groups=ed)
-        self.conv1 = torch.nn.Conv2d(ed, ed, 1, 1, 0, groups=ed)
+        self.conv1 = torch.nn.Conv2d(ed, ed, 1, 1, 0, groups=min(ed, 16))
         self.dim = ed
         self.bn = torch.nn.BatchNorm2d(ed)
 
