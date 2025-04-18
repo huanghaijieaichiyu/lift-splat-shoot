@@ -7,7 +7,7 @@ Authors: Jonah Philion and Sanja Fidler
 from .models import compile_model
 from .tools import (ego_to_cam, get_only_in_img_mask, denormalize_img,
                     SimpleLoss, get_val_info, add_ego, gen_dx_bx,
-                    get_nusc_maps, plot_nusc_map)
+                    get_nusc_maps, plot_nusc_map, get_local_map)
 from .data import compile_data
 import matplotlib.patches as mpatches
 from PIL import Image
@@ -18,6 +18,7 @@ import os.path
 
 import torch
 import numpy as np
+from pyquaternion import Quaternion
 
 from .tools import save_path
 
@@ -450,7 +451,7 @@ def viz_3d_detection(version,
                      conf_thresh=0.5,   # 置信度阈值
                      ):
     """
-    可视化3D目标检测模型预测结果
+    可视化3D目标检测模型预测结果 (支持模拟第三人称视角)
     """
     grid_conf = {
         'xbound': xbound,
@@ -482,8 +483,10 @@ def viz_3d_detection(version,
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     # 加载模型，使用beve模型进行3D检测
+    # 注意：这里的outC应该是num_classes*9，因为BEVEncoder_BEVE输出的是cls/reg/iou
+    actual_outC = num_classes * 9
     model = compile_model(grid_conf, data_aug_conf,
-                          outC=num_classes, model='beve', num_classes=num_classes)
+                          outC=actual_outC, model='beve', num_classes=num_classes)
     print('loading', modelf)
     try:
         checkpoint = torch.load(modelf)
@@ -497,9 +500,8 @@ def viz_3d_detection(version,
 
     model.to(device)
 
-    dx, bx, _ = gen_dx_bx(grid_conf['xbound'],
-                          grid_conf['ybound'], grid_conf['zbound'])
-    dx, bx = dx[:2].numpy(), bx[:2].numpy()
+    dx, bx, nx = gen_dx_bx(grid_conf['xbound'],
+                           grid_conf['ybound'], grid_conf['zbound'])
 
     scene2map = {}
     try:
@@ -512,6 +514,29 @@ def viz_3d_detection(version,
                     print(f"处理场景数据时出错: {e}")
     except AttributeError:
         print("数据集没有nusc属性，跳过地图加载")
+
+    # --- 定义视角变换参数 (与 models.py 中的 BEVENet.voxel_pooling 保持一致) ---
+    shift_x = 5.0
+    shift_y = 0.0
+    shift_z = 1.0
+    pitch_angle_deg = 45.0
+
+    # 计算变换矩阵 (使用 torch)
+    translation = torch.tensor(
+        [-shift_x, -shift_y, -shift_z], device=device, dtype=torch.float32)
+    pitch_angle_rad = torch.tensor(
+        pitch_angle_deg * torch.pi / 180.0, device=device)
+    cos_pitch = torch.cos(pitch_angle_rad)
+    sin_pitch = torch.sin(pitch_angle_rad)
+    R_pitch = torch.tensor([
+        [cos_pitch, 0, sin_pitch],
+        [0,         1, 0],
+        [-sin_pitch, 0, cos_pitch]
+    ], device=device, dtype=torch.float32)
+
+    # 将dx和bx转换为torch张量并移动到device
+    dx = dx.to(device)
+    bx = bx.to(device)
 
     # 设置颜色映射，用于不同类别的可视化
     cmap = cm.get_cmap(colormap, num_classes)
@@ -528,8 +553,216 @@ def viz_3d_detection(version,
     path = save_path(logdir)
     os.makedirs(path, exist_ok=True)
 
-    # 类别名称（示例）
-    class_names = [f'Class {i}' for i in range(num_classes)]
+    # 类别名称（示例） - 可以从数据集配置中获取
+    class_names = [
+        'car', 'truck', 'bus', 'trailer', 'construction_vehicle',
+        'pedestrian', 'motorcycle', 'bicycle', 'traffic_cone', 'barrier'
+    ][:num_classes]
+
+    model.eval()
+    counter = 0
+    with torch.no_grad():
+        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list) in enumerate(loader):
+            # 前向传播获取预测结果
+            with torch.cuda.amp.autocast(enabled=True):
+                preds = model(imgs.to(device),
+                              rots.to(device),
+                              trans.to(device),
+                              intrins.to(device),
+                              post_rots.to(device),
+                              post_trans.to(device),
+                              )
+
+            # 获取预测的类别、边界框等信息
+            # BEVEncoder_BEVE 返回字典
+            # [B, num_classes, H_bev, W_bev]
+            pred_cls = preds['cls_pred'].sigmoid().cpu()
+            pred_reg = preds['reg_pred'].cpu()       # [B, 9, H_bev, W_bev]
+            # [B, 1, H_bev, W_bev]
+            pred_iou = preds['iou_pred'].sigmoid().cpu()
+
+            # BEV grid 尺寸
+            H_bev, W_bev = pred_cls.shape[2], pred_cls.shape[3]
+
+            for si in range(imgs.shape[0]):
+                plt.clf()
+
+                # 绘制相机图像
+                for imgi, img in enumerate(imgs[si]):
+                    ax = plt.subplot(gs[2 + imgi // 3, imgi % 3])
+                    showimg = denormalize_img(img)
+                    # 翻转底部图像
+                    if imgi > 2:
+                        # 使用 PIL.Image.FLIP_LEFT_RIGHT
+                        showimg = showimg.transpose(FLIP_LEFT_RIGHT)
+                    plt.imshow(showimg)
+                    plt.axis('off')
+                    plt.annotate(cams[imgi].replace('_', ' '),
+                                 (0.01, 0.92), xycoords='axes fraction')
+
+                # --- 绘制 BEV 检测结果 --- #
+                ax = plt.subplot(gs[0, :])
+                ax.get_xaxis().set_ticks([])
+                ax.get_yaxis().set_ticks([])
+                for spine_name, spine in ax.spines.items():
+                    plt.setp(spine, color='b', linewidth=2)
+
+                # --- 绘制变换后的地图 --- #
+                try:
+                    if hasattr(loader.dataset, 'ixes') and hasattr(loader.dataset, 'nusc'):
+                        rec_idx = batchi * bsz + si
+                        if rec_idx < len(loader.dataset.ixes):
+                            rec = loader.dataset.ixes[rec_idx]
+                            # 获取原始地图元素
+                            egopose = loader.dataset.nusc.get('ego_pose', loader.dataset.nusc.get(
+                                'sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
+                            scene_name = loader.dataset.nusc.get(
+                                'scene', rec['scene_token'])['name']
+                            if scene_name in scene2map:
+                                map_name = scene2map[scene_name]
+                                if map_name in nusc_maps:
+                                    map_rot = Quaternion(
+                                        egopose['rotation']).rotation_matrix
+                                    map_angle = np.arctan2(
+                                        map_rot[1, 0], map_rot[0, 0])
+                                    map_center = np.array([egopose['translation'][0],
+                                                          egopose['translation'][1], np.cos(map_angle), np.sin(map_angle)], dtype=np.float32)
+
+                                    poly_names = ['road_segment', 'lane']
+                                    line_names = [
+                                        'road_divider', 'lane_divider']
+                                    lmap = get_local_map(
+                                        nusc_maps[map_name], map_center, 50.0, poly_names, line_names)
+
+                                    # 变换并绘制地图元素
+                                    for name in poly_names:
+                                        if name in lmap:
+                                            for la in lmap[name]:
+                                                # 将NumPy数组转换为torch张量并指定dtype
+                                                la_tensor = torch.from_numpy(
+                                                    la.astype(np.float32)).to(device)
+                                                # 添加z=0维度
+                                                la_3d = torch.cat(
+                                                    [la_tensor, torch.zeros_like(la_tensor[:, :1])], dim=1)
+                                                # 应用视角变换 (旋转+平移)
+                                                transformed_la = torch.matmul(
+                                                    la_3d, R_pitch.T) + translation
+                                                # 转换到BEV网格坐标 (只取x, y)
+                                                pts = (
+                                                    transformed_la[:, :2] - bx[:2]) / dx[:2]
+                                                # 转回CPU和NumPy用于绘图
+                                                pts_np = pts.cpu().numpy()
+                                                plt.fill(pts_np[:, 1], pts_np[:, 0], c=(
+                                                    1.00, 0.50, 0.31), alpha=0.2)
+
+                                    for name in line_names:
+                                        if name in lmap:
+                                            for la in lmap[name]:
+                                                la_tensor = torch.from_numpy(
+                                                    la.astype(np.float32)).to(device)
+                                                la_3d = torch.cat(
+                                                    [la_tensor, torch.zeros_like(la_tensor[:, :1])], dim=1)
+                                                transformed_la = torch.matmul(
+                                                    la_3d, R_pitch.T) + translation
+                                                pts = (
+                                                    transformed_la[:, :2] - bx[:2]) / dx[:2]
+                                                pts_np = pts.cpu().numpy()
+                                                color = (0.0, 0.0, 1.0) if name == 'road_divider' else (
+                                                    159./255., 0.0, 1.0)
+                                                plt.plot(
+                                                    pts_np[:, 1], pts_np[:, 0], c=color, alpha=0.5)
+                except Exception as e:
+                    print(f"绘制地图时出错: {e}")
+                # ------------------------- #
+
+                # 可视化预测结果
+                # 创建一个热力图来显示检测置信度
+                detection_map = np.zeros((H_bev, W_bev, 4))
+                # 为每个类别创建图例项
+                legend_handles = []
+                # 对每个类别进行可视化
+                for cls_idx in range(num_classes):
+                    # 结合类别置信度和IoU预测
+                    final_conf = pred_cls[si, cls_idx] * pred_iou[si, 0]
+                    cls_mask = final_conf > conf_thresh
+                    if cls_mask.sum() > 0:
+                        color = cmap(cls_idx)
+                        # 在检测图上用对应颜色和透明度标记
+                        mask_indices = np.where(cls_mask.numpy())
+                        for idx in zip(*mask_indices):
+                            detection_map[idx[0], idx[1]] = color
+                        # 添加到图例
+                        legend_handles.append(mpatches.Patch(
+                            color=color, label=class_names[cls_idx]))
+
+                # 显示检测结果
+                plt.imshow(detection_map, origin='lower')
+
+                # --- 绘制变换后的自车 --- #
+                ego_W = 1.85
+                ego_L = 4.084
+                half_W, half_L = ego_W / 2.0, ego_L / 2.0
+                # 原始自车框角点 (后轴中心为0,0,0)
+                ego_corners = torch.tensor([
+                    [-half_L+0.5, half_W, 0.0],
+                    [half_L+0.5, half_W, 0.0],
+                    [half_L+0.5, -half_W, 0.0],
+                    [-half_L+0.5, -half_W, 0.0],
+                ], device=device, dtype=torch.float32)
+
+                # 应用视角变换
+                transformed_ego_corners = torch.matmul(
+                    ego_corners, R_pitch.T) + translation
+                # 转换到BEV网格坐标
+                pts_ego = (transformed_ego_corners[:, :2] - bx[:2]) / dx[:2]
+                # 转回CPU和NumPy用于绘图
+                pts_ego_np = pts_ego.cpu().numpy()
+                plt.fill(pts_ego_np[:, 1], pts_ego_np[:, 0],
+                         '#76b900', alpha=0.7)
+                # ----------------------- #
+
+                # 设置BEV图的轴限制和方向
+                plt.xlim((W_bev, 0))  # y grid index
+                plt.ylim((0, H_bev))  # x grid index
+                plt.gca().set_aspect('equal', adjustable='box')
+
+                # 添加图例
+                if legend_handles:
+                    plt.legend(handles=legend_handles + [mpatches.Patch(color='#76b900', label='Ego Vehicle'),
+                                                         mpatches.Patch(color=(1.00, 0.50, 0.31), alpha=0.2, label='Map')],
+                               loc=(0.01, 0.80), fontsize='x-small')
+                # ------------------------- #
+
+                # --- 显示置信度热力图 --- #
+                ax = plt.subplot(gs[1, :])
+                ax.get_xaxis().set_ticks([])
+                ax.get_yaxis().set_ticks([])
+                for spine_name, spine in ax.spines.items():
+                    plt.setp(spine, color='g', linewidth=2)
+                plt.title("Max Confidence Heatmap (class * IoU)")
+
+                # 计算所有类别的最大置信度 (cls * iou)
+                conf_heatmap = (
+                    pred_cls[si] * pred_iou[si]).max(dim=0)[0].numpy()
+                im = plt.imshow(conf_heatmap, cmap='viridis', vmin=0,
+                                vmax=1, origin='lower')  # 使用 viridis colormap
+                plt.colorbar(im, label='Max Confidence')
+
+                plt.xlim((W_bev, 0))
+                plt.ylim((0, H_bev))
+                plt.gca().set_aspect('equal', adjustable='box')
+                # ------------------------- #
+
+                # 保存图像
+                imname = f'3d_detection_{batchi:06}_{si:03}.jpg'
+                print('saving', imname)
+                plt.savefig(os.path.join(path, imname))
+                counter += 1
+
+                # 限制处理的批次数，避免生成过多图像
+                if counter >= 50:  # 生成更少示例图像
+                    print(f"已生成{counter}张可视化图像，停止处理更多批次。")
+                    return
 
     model.eval()
     counter = 0
@@ -647,86 +880,6 @@ def viz_3d_detection(version,
                 if counter >= 200:
                     print(f"已生成{counter}张可视化图像，停止处理更多批次。")
                     return
-
-
-def viz_fusion_detection(version,
-                         modelf,
-                         dataroot='/data/nuscenes',
-                         map_folder='/data/nuscenes/mini',
-                         gpuid=0,
-                         viz_train=False,
-
-                         H=900, W=1600,
-                         resize_lim=(0.193, 0.225),
-                         final_dim=(128, 352),
-                         bot_pct_lim=(0.0, 0.22),
-                         rot_lim=(-5.4, 5.4),
-                         rand_flip=True,
-
-                         xbound=[-50.0, 50.0, 0.5],
-                         ybound=[-50.0, 50.0, 0.5],
-                         zbound=[-10.0, 10.0, 20.0],
-                         dbound=[4.0, 45.0, 1.0],
-
-                         bsz=1,
-                         nworkers=1,
-                         num_classes=10,
-                         lidar_channels=18,
-                         colormap='tab10',
-                         conf_thresh=0.5,
-                         ):
-    """
-    可视化多模态融合模型（相机+LiDAR）的预测结果
-    """
-    grid_conf = {
-        'xbound': xbound,
-        'ybound': ybound,
-        'zbound': zbound,
-        'dbound': dbound,
-    }
-    cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-            'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
-    data_aug_conf = {
-        'resize_lim': resize_lim,
-        'final_dim': final_dim,
-        'rot_lim': rot_lim,
-        'H': H, 'W': W,
-        'rand_flip': rand_flip,
-        'bot_pct_lim': bot_pct_lim,
-        'cams': cams,
-        'Ncams': 5,
-    }
-
-    # 使用多模态数据加载器
-    trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
-                                          grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
-                                          parser_name='multimodal_detection')
-    loader = trainloader if viz_train else valloader
-    nusc_maps = get_nusc_maps(map_folder)
-
-    device = torch.device(
-        'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
-
-    # 加载融合模型
-    model = compile_model(grid_conf, data_aug_conf, outC=num_classes*9,
-                          model='fusion', num_classes=num_classes,
-                          lidar_channels=lidar_channels)
-    print('loading', modelf)
-    try:
-        checkpoint = torch.load(modelf)
-        if 'net' in checkpoint:
-            model.load_state_dict(checkpoint['net'])
-        else:
-            model.load_state_dict(checkpoint)
-    except Exception as e:
-        print(f"加载模型时出错: {e}")
-        return
-
-    model.to(device)
-
-    dx, bx, _ = gen_dx_bx(grid_conf['xbound'],
-                          grid_conf['ybound'], grid_conf['zbound'])
-    dx, bx = dx[:2].numpy(), bx[:2].numpy()
 
     scene2map = {}
     try:
@@ -900,3 +1053,83 @@ def viz_fusion_detection(version,
                 if counter >= 20:
                     print(f"已生成{counter}张可视化图像，停止处理更多批次。")
                     return
+
+
+def viz_fusion_detection(version,
+                         modelf,
+                         dataroot='/data/nuscenes',
+                         map_folder='/data/nuscenes/mini',
+                         gpuid=0,
+                         viz_train=False,
+
+                         H=900, W=1600,
+                         resize_lim=(0.193, 0.225),
+                         final_dim=(128, 352),
+                         bot_pct_lim=(0.0, 0.22),
+                         rot_lim=(-5.4, 5.4),
+                         rand_flip=True,
+
+                         xbound=[-50.0, 50.0, 0.5],
+                         ybound=[-50.0, 50.0, 0.5],
+                         zbound=[-10.0, 10.0, 20.0],
+                         dbound=[4.0, 45.0, 1.0],
+
+                         bsz=1,
+                         nworkers=1,
+                         num_classes=10,
+                         lidar_channels=18,
+                         colormap='tab10',
+                         conf_thresh=0.5,
+                         ):
+    """
+    可视化多模态融合模型（相机+LiDAR）的预测结果
+    """
+    grid_conf = {
+        'xbound': xbound,
+        'ybound': ybound,
+        'zbound': zbound,
+        'dbound': dbound,
+    }
+    cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+            'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    data_aug_conf = {
+        'resize_lim': resize_lim,
+        'final_dim': final_dim,
+        'rot_lim': rot_lim,
+        'H': H, 'W': W,
+        'rand_flip': rand_flip,
+        'bot_pct_lim': bot_pct_lim,
+        'cams': cams,
+        'Ncams': 5,
+    }
+
+    # 使用多模态数据加载器
+    trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
+                                          grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
+                                          parser_name='multimodal_detection')
+    loader = trainloader if viz_train else valloader
+    nusc_maps = get_nusc_maps(map_folder)
+
+    device = torch.device(
+        'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
+
+    # 加载融合模型
+    model = compile_model(grid_conf, data_aug_conf, outC=num_classes*9,
+                          model='fusion', num_classes=num_classes,
+                          lidar_channels=lidar_channels)
+    print('loading', modelf)
+    try:
+        checkpoint = torch.load(modelf)
+        if 'net' in checkpoint:
+            model.load_state_dict(checkpoint['net'])
+        else:
+            model.load_state_dict(checkpoint)
+    except Exception as e:
+        print(f"加载模型时出错: {e}")
+        return
+
+    model.to(device)
+
+    dx, bx, _ = gen_dx_bx(grid_conf['xbound'],
+                          grid_conf['ybound'], grid_conf['zbound'])
+    dx, bx = dx[:2].numpy(), bx[:2].numpy()

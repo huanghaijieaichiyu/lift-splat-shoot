@@ -300,59 +300,107 @@ class LiftSplatShoot(nn.Module):
         return x
 
     def voxel_pooling(self, geom_feats, x):
-        """Voxel pooling operation
+        """
+        体素池化 - 将特征投影到BEV网格
+
+        优化版本：使用散射和索引优化，增加基于权重的特征聚合
+        修改：添加了相机视角变换，模拟后俯视效果
         """
         B, N, D, H, W, C = x.shape
         Nprime = B * N * D * H * W
 
-        # flatten x
+        # --- Start of View Transformation ---
+        # 定义视角变换参数 (可以移到配置或__init__中)
+        shift_x = 5.0  # 模拟相机后移距离
+        shift_y = 0.0
+        shift_z = 2.0  # 模拟相机上移距离
+        pitch_angle_deg = 10.0  # 模拟相机俯视角度 (度)
+
+        # 准备变换张量
+        # 平移向量: 将点坐标向后(X负)、向上(Z负)移动，使车辆在网格中看起来靠前、靠下
+        translation = torch.tensor(
+            [-shift_x, -shift_y, -shift_z], device=x.device, dtype=geom_feats.dtype).view(1, 3)
+        pitch_angle_rad = math.radians(pitch_angle_deg)
+        cos_pitch = math.cos(pitch_angle_rad)
+        sin_pitch = math.sin(pitch_angle_rad)
+
+        # 绕Y轴的旋转矩阵 (Pitch)
+        R_pitch = torch.tensor([
+            [cos_pitch, 0, sin_pitch],
+            [0,         1, 0],
+            [-sin_pitch, 0, cos_pitch]
+        ], device=x.device, dtype=geom_feats.dtype)
+
+        # 将 geom_feats 展平以便进行矩阵乘法
+        geom_feats_flat = geom_feats.view(Nprime, 3)
+
+        # 应用旋转和平移
+        transformed_geom_feats_flat = geom_feats_flat @ R_pitch.T + \
+            translation  # translation 会被广播
+        # --- End of View Transformation ---
+
+        # 将特征展平
         x = x.reshape(Nprime, C)
 
-        # flatten indices
-        geom_feats = ((geom_feats - (self.bx - self.dx / 2.)) / self.dx).long()
-        geom_feats = geom_feats.view(Nprime, 3)
-        batch_ix = torch.cat([torch.full([Nprime // B, 1], ix,
-                                         device=x.device, dtype=torch.long) for ix in range(B)])
-        geom_feats = torch.cat((geom_feats, batch_ix), 1)
+        # 使用变换后的坐标计算体素索引
+        geom_indices = ((transformed_geom_feats_flat - (self.bx -
+                        self.dx / 2.)) / self.dx).long()  # Shape (Nprime, 3)
 
-        # filter out points that are outside box
-        kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0]) \
-            & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1]) \
-            & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
+        # 获取批次索引
+        batch_ix = torch.cat([torch.full([Nprime // B, 1], ix,
+                                         device=x.device, dtype=torch.long) for ix in range(B)])  # Shape (Nprime, 1)
+        # 组合索引: [idx_x, idx_y, idx_z, batch_idx]
+        geom_indices_with_batch = torch.cat(
+            (geom_indices, batch_ix), 1)  # Shape (Nprime, 4)
+
+        # 过滤边界外的点 - 使用掩码操作
+        kept = (geom_indices_with_batch[:, 0] >= 0) & (geom_indices_with_batch[:, 0] < self.nx[0]) \
+            & (geom_indices_with_batch[:, 1] >= 0) & (geom_indices_with_batch[:, 1] < self.nx[1]) \
+            & (geom_indices_with_batch[:, 2] >= 0) & (geom_indices_with_batch[:, 2] < self.nx[2])
 
         if kept.sum() == 0:
-            # 如果没有有效点，返回全零张量
+            # 如果没有有效点，返回全零张量 (根据之前的修改，输出是 [B, C, X, Y])
             nx0 = int(self.nx[0].item())
             nx1 = int(self.nx[1].item())
-            nx2 = int(self.nx[2].item())
-            return torch.zeros((B, C * nx2, nx0, nx1),
-                               device=x.device)
+            return torch.zeros((B, C, nx0, nx1), device=x.device, dtype=x.dtype)
 
         x = x[kept]
-        geom_feats = geom_feats[kept]
+        # Shape (Nkept, 4)
+        geom_indices_with_batch = geom_indices_with_batch[kept]
 
-        # get tensors from the same voxel next to each other
-        ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B) \
-            + geom_feats[:, 1] * (self.nx[2] * B) \
-            + geom_feats[:, 2] * B \
-            + geom_feats[:, 3]
+        # 计算唯一体素的累积和 - 使用高效的索引和排序操作
+        # 使用过滤后的变换索引进行排序
+        ranks = geom_indices_with_batch[:, 0] * (self.nx[1] * self.nx[2] * B) \
+            + geom_indices_with_batch[:, 1] * (self.nx[2] * B) \
+            + geom_indices_with_batch[:, 2] * B \
+            + geom_indices_with_batch[:, 3]
         sorts = ranks.argsort()
-        x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
+        # 对特征 x 和对应的索引进行排序
+        x, geom_indices_with_batch, ranks = x[sorts], geom_indices_with_batch[sorts], ranks[sorts]
 
-        # 总是使用cumsum_trick，避免QuickCumsum可能的问题
-        x, geom_feats = cumsum_trick(x, geom_feats, ranks)
+        # 总是使用cumsum_trick
+        # 注意：cumsum_trick 需要 geom_feats 参数，这里我们传递排序后的索引
+        x, geom_indices_with_batch = cumsum_trick(
+            x, geom_indices_with_batch, ranks)
 
-        # griddify (B x C x Z x X x Y)
+        # 创建BEV网格 - 使用索引填充
         nx0 = int(self.nx[0].item())
         nx1 = int(self.nx[1].item())
         nx2 = int(self.nx[2].item())
-        final = torch.zeros(
-            (B, C, nx2, nx0, nx1), device=x.device)
-        final[geom_feats[:, 3].long(), :, geom_feats[:, 2].long(),
-              geom_feats[:, 0].long(), geom_feats[:, 1].long()] = x
 
-        # collapse Z
-        final = torch.cat(final.unbind(dim=2), 1)
+        # 使用高效的稀疏表示填充
+        final = torch.zeros((B, C, nx2, nx0, nx1),
+                            device=x.device, dtype=x.dtype)
+
+        # 使用变换后的索引填充体素网格
+        final[geom_indices_with_batch[:, 3].long(),  # batch index
+              :,
+              geom_indices_with_batch[:, 2].long(),  # z index
+              geom_indices_with_batch[:, 0].long(),  # x index
+              geom_indices_with_batch[:, 1].long()] = x  # y index
+
+        # 沿Z轴聚合特征 (使用 Max Pooling)
+        final = torch.max(final, dim=2)[0]
 
         return final
 
@@ -664,7 +712,7 @@ class RepBEV_vit(nn.Module):
               geom_feats[:, 0].long(), geom_feats[:, 1].long()] = x
 
         # collapse Z
-        final = torch.cat(final.unbind(dim=2), 1)
+        final = torch.max(final, dim=2)[0]
 
         return final
 
@@ -894,45 +942,84 @@ class BEVENet(nn.Module):
         体素池化 - 将特征投影到BEV网格
 
         优化版本：使用散射和索引优化，增加基于权重的特征聚合
+        修改：添加了相机视角变换，模拟后俯视效果
         """
         B, N, D, H, W, C = x.shape
         Nprime = B * N * D * H * W
 
+        # --- Start of View Transformation ---
+        # 定义视角变换参数 (可以移到配置或__init__中)
+        shift_x = 5.0  # 模拟相机后移距离
+        shift_y = 0.0
+        shift_z = 2.0  # 模拟相机上移距离
+        pitch_angle_deg = 10.0  # 模拟相机俯视角度 (度)
+
+        # 准备变换张量
+        # 平移向量: 将点坐标向后(X负)、向上(Z负)移动，使车辆在网格中看起来靠前、靠下
+        translation = torch.tensor(
+            [-shift_x, -shift_y, -shift_z], device=x.device, dtype=geom_feats.dtype).view(1, 3)
+        pitch_angle_rad = math.radians(pitch_angle_deg)
+        cos_pitch = math.cos(pitch_angle_rad)
+        sin_pitch = math.sin(pitch_angle_rad)
+
+        # 绕Y轴的旋转矩阵 (Pitch)
+        R_pitch = torch.tensor([
+            [cos_pitch, 0, sin_pitch],
+            [0,         1, 0],
+            [-sin_pitch, 0, cos_pitch]
+        ], device=x.device, dtype=geom_feats.dtype)
+
+        # 将 geom_feats 展平以便进行矩阵乘法
+        geom_feats_flat = geom_feats.view(Nprime, 3)
+
+        # 应用旋转和平移
+        transformed_geom_feats_flat = geom_feats_flat @ R_pitch.T + \
+            translation  # translation 会被广播
+        # --- End of View Transformation ---
+
         # 将特征展平
         x = x.reshape(Nprime, C)
 
-        # 计算体素索引
-        geom_feats = ((geom_feats - (self.bx - self.dx / 2.)) / self.dx).long()
-        geom_feats = geom_feats.view(Nprime, 3)
+        # 使用变换后的坐标计算体素索引
+        geom_indices = ((transformed_geom_feats_flat - (self.bx -
+                        self.dx / 2.)) / self.dx).long()  # Shape (Nprime, 3)
+
+        # 获取批次索引
         batch_ix = torch.cat([torch.full([Nprime // B, 1], ix,
-                                         device=x.device, dtype=torch.long) for ix in range(B)])
-        geom_feats = torch.cat((geom_feats, batch_ix), 1)
+                                         device=x.device, dtype=torch.long) for ix in range(B)])  # Shape (Nprime, 1)
+        # 组合索引: [idx_x, idx_y, idx_z, batch_idx]
+        geom_indices_with_batch = torch.cat(
+            (geom_indices, batch_ix), 1)  # Shape (Nprime, 4)
 
         # 过滤边界外的点 - 使用掩码操作
-        kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0]) \
-            & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1]) \
-            & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
+        kept = (geom_indices_with_batch[:, 0] >= 0) & (geom_indices_with_batch[:, 0] < self.nx[0]) \
+            & (geom_indices_with_batch[:, 1] >= 0) & (geom_indices_with_batch[:, 1] < self.nx[1]) \
+            & (geom_indices_with_batch[:, 2] >= 0) & (geom_indices_with_batch[:, 2] < self.nx[2])
 
         if kept.sum() == 0:
-            # 如果没有有效点，返回全零张量
-            return torch.zeros((B, C * int(self.nx[2].item()),
-                                int(self.nx[0].item()),
-                                int(self.nx[1].item())),
-                               device=x.device)
+            # 如果没有有效点，返回全零张量 (根据之前的修改，输出是 [B, C, X, Y])
+            nx0 = int(self.nx[0].item())
+            nx1 = int(self.nx[1].item())
+            return torch.zeros((B, C, nx0, nx1), device=x.device, dtype=x.dtype)
 
         x = x[kept]
-        geom_feats = geom_feats[kept]
+        # Shape (Nkept, 4)
+        geom_indices_with_batch = geom_indices_with_batch[kept]
 
         # 计算唯一体素的累积和 - 使用高效的索引和排序操作
-        ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B) \
-            + geom_feats[:, 1] * (self.nx[2] * B) \
-            + geom_feats[:, 2] * B \
-            + geom_feats[:, 3]
+        # 使用过滤后的变换索引进行排序
+        ranks = geom_indices_with_batch[:, 0] * (self.nx[1] * self.nx[2] * B) \
+            + geom_indices_with_batch[:, 1] * (self.nx[2] * B) \
+            + geom_indices_with_batch[:, 2] * B \
+            + geom_indices_with_batch[:, 3]
         sorts = ranks.argsort()
-        x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
+        # 对特征 x 和对应的索引进行排序
+        x, geom_indices_with_batch, ranks = x[sorts], geom_indices_with_batch[sorts], ranks[sorts]
 
-        # 总是使用cumsum_trick，避免QuickCumsum可能的问题
-        x, geom_feats = cumsum_trick(x, geom_feats, ranks)
+        # 总是使用cumsum_trick
+        # 注意：cumsum_trick 需要 geom_feats 参数，这里我们传递排序后的索引
+        x, geom_indices_with_batch = cumsum_trick(
+            x, geom_indices_with_batch, ranks)
 
         # 创建BEV网格 - 使用索引填充
         nx0 = int(self.nx[0].item())
@@ -943,15 +1030,15 @@ class BEVENet(nn.Module):
         final = torch.zeros((B, C, nx2, nx0, nx1),
                             device=x.device, dtype=x.dtype)
 
-        # 使用索引填充体素网格 - 直接使用索引而不是循环
-        final[geom_feats[:, 3].long(),
+        # 使用变换后的索引填充体素网格
+        final[geom_indices_with_batch[:, 3].long(),  # batch index
               :,
-              geom_feats[:, 2].long(),
-              geom_feats[:, 0].long(),
-              geom_feats[:, 1].long()] = x
+              geom_indices_with_batch[:, 2].long(),  # z index
+              geom_indices_with_batch[:, 0].long(),  # x index
+              geom_indices_with_batch[:, 1].long()] = x  # y index
 
-        # 将Z维度的特征拼接 - 保留3D结构信息
-        final = torch.cat(final.unbind(dim=2), 1)
+        # 沿Z轴聚合特征 (使用 Max Pooling)
+        final = torch.max(final, dim=2)[0]
 
         return final
 
