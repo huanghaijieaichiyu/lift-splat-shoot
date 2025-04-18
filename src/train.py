@@ -18,6 +18,45 @@ from .data import compile_data
 from .tools import save_path
 from .tools import SimpleLoss, get_batch_iou, get_val_info
 from contextlib import nullcontext  # 导入nullcontext
+from .nuscenes_info import load_nuscenes_infos  # 导入数据集缓存加载函数
+
+
+def check_and_ensure_cache(dataroot, version):
+    """
+    检查并确保数据集缓存存在
+
+    Args:
+        dataroot: 数据集根目录
+        version: 数据集版本，如'mini'、'trainval'
+    """
+    # 设置NuScenes数据集版本
+    version_str = f'v1.0-{version}'
+    max_sweeps = 10  # 设置最大扫描帧数
+
+    try:
+        print(f"训练前检查NuScenes缓存信息...")
+        from .nuscenes_info import load_nuscenes_infos
+
+        # 这里将直接触发缓存的创建（如果不存在）
+        nusc_infos = load_nuscenes_infos(
+            dataroot, version=version_str, max_sweeps=max_sweeps)
+
+        # 检查缓存是否包含必要信息
+        if nusc_infos and 'infos' in nusc_infos and 'train' in nusc_infos['infos'] and 'val' in nusc_infos['infos']:
+            print(
+                f"缓存验证成功！包含{len(nusc_infos['infos']['train'])}个训练样本和{len(nusc_infos['infos']['val'])}个验证样本")
+            return True
+        else:
+            print("缓存数据结构不完整，训练过程可能无法使用缓存")
+            return False
+    except FileNotFoundError as e:
+        print(f"找不到缓存文件或相关目录: {e}")
+        print("请确保数据集路径正确，并且有写入权限以创建缓存")
+        return False
+    except Exception as e:
+        print(f"训练前准备缓存信息失败：{e}")
+        print("训练过程将自动创建缓存，但可能会减慢初始加载速度")
+        return False
 
 
 def train(version,
@@ -49,6 +88,9 @@ def train(version,
           lr=1e-3,
           weight_decay=1e-7,
           ):
+    # 训练前验证并确保数据集缓存存在
+    check_and_ensure_cache(dataroot, version)
+
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,
@@ -215,6 +257,9 @@ def train_3d(version,
     训练用于3D目标检测的BEVENet模型
     增加多尺度特征训练支持和增强的BEV投影
     """
+    # 训练前验证并确保数据集缓存存在
+    check_and_ensure_cache(dataroot, version)
+
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,
@@ -650,6 +695,9 @@ def train_fusion(version,
     训练用于3D目标检测的多模态融合模型
     结合相机和LiDAR特征进行训练
     """
+    # 训练前验证并确保数据集缓存存在
+    check_and_ensure_cache(dataroot, version)
+
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,

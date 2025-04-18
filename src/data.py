@@ -25,8 +25,36 @@ class NuscData(torch.utils.data.Dataset):
         self.data_aug_conf = data_aug_conf
         self.grid_conf = grid_conf
 
-        self.scenes = self.get_scenes()
-        self.ixes = self.prepro()
+        # 检查是否有预先缓存的信息
+        has_cache = False
+        try:
+            if hasattr(nusc, 'cached_infos') and nusc.__dict__['cached_infos'] is not None:
+                has_cache = True
+        except (AttributeError, KeyError):
+            pass
+
+        if has_cache:
+            print(f"使用预缓存的数据集信息（{'train' if is_train else 'val'}集）")
+            # 直接使用缓存的场景列表
+            self.scenes = self.get_scenes()
+            # 从缓存中获取样本索引
+            split = 'train' if is_train else 'val'
+            cached_infos = nusc.__dict__['cached_infos']['infos'][split]
+
+            # 根据缓存信息重建索引
+            self.ixes = []
+            for info in cached_infos:
+                # 获取对应sample的token
+                token = info['token']
+                # 获取sample对象
+                sample = [s for s in nusc.sample if s['token'] == token][0]
+                self.ixes.append(sample)
+
+            print(f"从缓存加载了{len(self.ixes)}个样本")
+        else:
+            print("未找到缓存信息，从原始数据构建索引")
+            self.scenes = self.get_scenes()
+            self.ixes = self.prepro()
 
         dx, bx, nx = gen_dx_bx(
             grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'])
@@ -548,9 +576,42 @@ def worker_rnd_init(x):
 
 def compile_data(version, dataroot, data_aug_conf, grid_conf, bsz,
                  nworkers, parser_name):
-    nusc = NuScenes(version='v1.0-{}'.format(version),
-                    dataroot=dataroot,
-                    verbose=True)
+    """
+    编译数据集，先检查是否有缓存文件，有则直接使用，无则重新加载并创建
+    """
+    # 导入info加载功能
+    from .nuscenes_info import load_nuscenes_infos
+
+    # 设置NuScenes数据集版本
+    version_str = f'v1.0-{version}'
+    max_sweeps = 10  # 设置最大扫描帧数
+
+    # 加载或创建缓存信息
+    try:
+        print(f"加载NuScenes缓存信息...")
+        nusc_infos = load_nuscenes_infos(
+            dataroot, version=version_str, max_sweeps=max_sweeps)
+        print(
+            f"成功加载缓存信息! 包含{len(nusc_infos['infos']['train'])}个训练样本和{len(nusc_infos['infos']['val'])}个验证样本")
+
+        # 使用包含缓存数据的NuScenes对象
+        nusc = NuScenes(version=version_str,
+                        dataroot=dataroot,
+                        verbose=True)
+
+        # 将缓存信息添加到数据集实例中
+        # 使用__dict__直接添加属性，避免linter错误
+        nusc.__dict__['cached_infos'] = nusc_infos
+        print("已将缓存信息附加到NuScenes对象")
+    except Exception as e:
+        print(f"处理缓存信息时出错：{e}")
+        print("无法使用缓存，这可能会导致数据加载速度变慢")
+        nusc = NuScenes(version=version_str,
+                        dataroot=dataroot,
+                        verbose=True)
+        # 确保cached_infos属性存在但为None
+        nusc.__dict__['cached_infos'] = None
+
     parser = {
         'vizdata': VizData,
         'segmentationdata': SegmentationData,

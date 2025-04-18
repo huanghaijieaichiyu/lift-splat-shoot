@@ -138,3 +138,5 @@ imagenet_pretrained/
 .idea
 models/__pycache__
 runs_*
+.cursor
+.idea

@@ -9,6 +9,7 @@ from .tools import (ego_to_cam, get_only_in_img_mask, denormalize_img,
                     SimpleLoss, get_val_info, add_ego, gen_dx_bx,
                     get_nusc_maps, plot_nusc_map, get_local_map)
 from .data import compile_data
+from .nuscenes_info import load_nuscenes_infos  # 导入数据集缓存加载函数
 import matplotlib.patches as mpatches
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -26,6 +27,51 @@ from .tools import save_path
 FLIP_LEFT_RIGHT = 0  # PIL标准值
 
 plt.switch_backend('Agg')
+
+
+def check_and_load_cache(dataroot, version):
+    """
+    检查并加载数据集缓存
+
+    Args:
+        dataroot: 数据集根目录
+        version: 数据集版本，例如'mini'
+
+    Returns:
+        loaded: 是否成功加载缓存
+        info: 缓存信息（如果加载成功）或None
+    """
+    # 配置NuScenes版本
+    version_str = f'v1.0-{version}'
+    max_sweeps = 10  # 设置最大扫描帧数
+
+    try:
+        from .nuscenes_info import load_nuscenes_infos
+        print(f"检查NuScenes缓存信息...")
+
+        # 这里会自动创建缓存（如果不存在）
+        nusc_infos = load_nuscenes_infos(
+            dataroot, version=version_str, max_sweeps=max_sweeps)
+
+        # 验证缓存数据的完整性
+        if 'infos' in nusc_infos and 'train' in nusc_infos['infos'] and 'val' in nusc_infos['infos']:
+            train_samples = len(nusc_infos['infos']['train'])
+            val_samples = len(nusc_infos['infos']['val'])
+            print(f"✓ 缓存加载成功！包含{train_samples}个训练样本和{val_samples}个验证样本")
+            return True, nusc_infos
+        else:
+            print("✗ 缓存数据结构不完整")
+            return False, None
+
+    except FileNotFoundError as e:
+        print(f"✗ 缓存文件不存在或无法访问: {e}")
+        print("  请确保数据集路径正确，并且有写入权限")
+        return False, None
+
+    except Exception as e:
+        print(f"✗ 缓存处理出错: {e}")
+        print("  将尝试从原始数据加载")
+        return False, None
 
 
 def lidar_check(version,
@@ -49,6 +95,9 @@ def lidar_check(version,
                 bsz=1,
                 nworkers=10,
                 ):
+    # 首先检查是否有缓存数据
+    cache_loaded, nusc_infos = check_and_load_cache(dataroot, version)
+
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,
@@ -305,6 +354,9 @@ def viz_model_preds(version,
                     bsz=1,
                     nworkers=1,
                     ):
+    # 首先检查是否有缓存数据
+    cache_loaded, nusc_infos = check_and_load_cache(dataroot, version)
+
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,
@@ -453,6 +505,9 @@ def viz_3d_detection(version,
     """
     可视化3D目标检测模型预测结果 (支持模拟第三人称视角)
     """
+    # 首先检查是否有缓存数据
+    cache_loaded, nusc_infos = check_and_load_cache(dataroot, version)
+
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,
@@ -1084,6 +1139,9 @@ def viz_fusion_detection(version,
     """
     可视化多模态融合模型（相机+LiDAR）的预测结果
     """
+    # 首先检查是否有缓存数据
+    cache_loaded, nusc_infos = check_and_load_cache(dataroot, version)
+
     grid_conf = {
         'xbound': xbound,
         'ybound': ybound,
