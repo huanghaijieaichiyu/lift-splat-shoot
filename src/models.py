@@ -955,7 +955,6 @@ class DepthNet(nn.Module):
         # 拼接结果
         # Shape: [BN, D+C, H, W]
         output = torch.cat([depth_digit, context], dim=1)
-        print(f"Debug: DepthNet output shape = {output.shape}")  # 添加输出形状检查
         return output
 
 

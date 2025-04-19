@@ -918,27 +918,6 @@ def train_fusion(version,
                     'iou_targets': iou_map
                 }
 
-                # Debugging targets before loss calculation
-                print("--- Debugging Targets ---")
-                if 'cls_targets' in targets:
-                    cls_targets = targets['cls_targets']
-                    print(f"cls_targets shape: {cls_targets.shape}")
-                    print(f"cls_targets dtype: {cls_targets.dtype}")
-                    # Ensure tensor is on CPU for unique/min/max if error occurs
-                    try:
-                        cls_targets_cpu = cls_targets.cpu()
-                        unique_targets = torch.unique(cls_targets_cpu)
-                        print(f"Unique cls_targets values: {unique_targets}")
-                        print(f"Min cls_target: {torch.min(cls_targets_cpu)}")
-                        print(f"Max cls_target: {torch.max(cls_targets_cpu)}")
-                    except Exception as e:
-                        print(f"Error inspecting cls_targets: {e}")
-                else:
-                    print("cls_targets not found in targets")
-                # 确认 num_classes
-                print(f"Number of classes (from cfg): {actual_num_classes}")
-                print("--- End Debugging Targets ---")
-
                 # Calculate loss
                 losses = loss_fn(preds, targets)
 
