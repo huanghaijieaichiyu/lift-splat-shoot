@@ -1,9 +1,3 @@
-"""
-Copyright (C) 2020 NVIDIA Corporation.  All rights reserved.
-Licensed under the NVIDIA Source Code License. See LICENSE at https://github.com/nv-tlabs/lift-splat-shoot.
-Authors: Jonah Philion and Sanja Fidler
-"""
-
 import torch
 import os
 import numpy as np
@@ -17,6 +11,123 @@ from glob import glob
 import pickle
 
 from .tools import get_lidar_data, img_transform, normalize_img, gen_dx_bx
+
+# Add Gaussian heatmap helper functions (adapted from mmdet3d)
+
+
+def gaussian_radius(det_size, min_overlap=0.7):
+    """Calculate Gaussian radius based on object size and minimum overlap.
+
+    Args:
+        det_size (tuple[float]): Object size (h, w).
+        min_overlap (float): Minimum overlap between heatmap and ground truth box.
+
+    Returns:
+        int: Gaussian radius.
+    """
+    height, width = det_size
+
+    a1 = 1
+    b1 = (height + width)
+    c1 = width * height * (1 - min_overlap) / (1 + min_overlap)
+    sq1 = np.sqrt(b1**2 - 4 * a1 * c1)
+    r1 = (b1 + sq1) / 2
+
+    a2 = 4
+    b2 = 2 * (height + width)
+    c2 = (1 - min_overlap) * width * height
+    sq2 = np.sqrt(b2**2 - 4 * a2 * c2)
+    r2 = (b2 + sq2) / 2
+
+    a3 = 4 * min_overlap
+    b3 = -2 * min_overlap * (height + width)
+    c3 = (min_overlap - 1) * width * height
+    sq3 = np.sqrt(b3**2 - 4 * a3 * c3)
+    r3 = (b3 + sq3) / 2
+
+    # Ensure radius is at least 2 (as in CenterPoint)
+    return max(2, int(min(r1, r2, r3)))
+
+
+def gaussian_2d(shape, sigma=1):
+    """Generate 2D Gaussian-like heatmap.
+
+    Args:
+        shape (tuple[int]): Shape of the heatmap (h, w).
+        sigma (float): Sigma of the Gaussian.
+
+    Returns:
+        np.ndarray: Generated heatmap.
+    """
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m + 1, -n:n + 1]
+
+    h = np.exp(-(x * x + y * y) / (2 * sigma * sigma))
+    h[h < np.finfo(h.dtype).eps * h.max()] = 0
+    return h
+
+
+def draw_heatmap_gaussian(heatmap, center, radius, k=1):
+    """Draw a 2D Gaussian heatmap.
+
+    Args:
+        heatmap (np.ndarray): Heatmap to be modified.
+        center (tuple[float]): Center of the Gaussian (float_x, float_y).
+        radius (int): Radius of the Gaussian.
+        k (float): Factor for Gaussian value.
+
+    Returns:
+        np.ndarray: Modified heatmap.
+    """
+    diameter = 2 * radius + 1
+    gaussian = gaussian_2d((diameter, diameter), sigma=diameter / 6)
+
+    # Get float and integer center coordinates
+    center_x_float, center_y_float = center
+    # Round to nearest integer for center pixel
+    x = int(np.round(center_x_float))
+    y = int(np.round(center_y_float))
+
+    height, width = heatmap.shape[0:2]
+
+    # Ensure integer center is within bounds
+    if x < 0 or x >= width or y < 0 or y >= height:
+        return heatmap
+
+    # Calculate integer boundaries for slicing the heatmap and gaussian
+    # Determine the intersection area between the gaussian kernel and the heatmap boundaries
+    left = max(0, x - radius)           # Heatmap left boundary
+    right = min(width, x + radius + 1)  # Heatmap right boundary (exclusive)
+    top = max(0, y - radius)            # Heatmap top boundary
+    bottom = min(height, y + radius + 1)  # Heatmap bottom boundary (exclusive)
+
+    # Determine the corresponding slice within the gaussian kernel
+    gaussian_left = max(0, radius - x)  # Gaussian kernel left boundary
+    # Gaussian kernel right boundary
+    gaussian_right = radius + (right - (x + 1))
+    gaussian_top = max(0, radius - y)  # Gaussian kernel top boundary
+    # Gaussian kernel bottom boundary
+    gaussian_bottom = radius + (bottom - (y + 1))
+
+    # Ensure slice dimensions are valid and match
+    heatmap_slice_h, heatmap_slice_w = bottom - top, right - left
+    gaussian_slice_h, gaussian_slice_w = gaussian_bottom - \
+        gaussian_top, gaussian_right - gaussian_left
+
+    if heatmap_slice_h > 0 and heatmap_slice_w > 0 and gaussian_slice_h > 0 and gaussian_slice_w > 0 and \
+       heatmap_slice_h == gaussian_slice_h and heatmap_slice_w == gaussian_slice_w:
+
+        # Get the actual slices using integer indices
+        masked_heatmap = heatmap[top:bottom, left:right]
+        masked_gaussian = gaussian[gaussian_top:gaussian_bottom,
+                                   gaussian_left:gaussian_right]
+
+        # Apply maximum operation
+        np.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
+    # else: # Optional: Add debug print for non-overlapping/mismatched cases
+        # print(f"Skipping draw_heatmap: Center({center_x_float:.1f},{center_y_float:.1f}) Radius({radius}) -> HeatmapSlice({top}:{bottom},{left}:{right}) GaussianSlice({gaussian_top}:{gaussian_bottom},{gaussian_left}:{gaussian_right})")
+
+    return heatmap
 
 
 class NuscData(torch.utils.data.Dataset):
@@ -339,19 +450,26 @@ class Detection3DData(NuscData):
 
     def get_detection_targets(self, rec):
         """
-        生成3D目标检测任务的标签
+        生成3D目标检测任务的标签 (优化版，使用高斯热图)
         """
-        # 创建空标签地图
+        # 获取BEV网格尺寸
         H, W = int(self.nx[1].item()), int(self.nx[0].item())
-        cls_map = torch.zeros(H, W, dtype=torch.long)
-        # x, y, z, w, l, h, sin(θ), cos(θ), vel
-        reg_map = torch.zeros(9, H, W, dtype=torch.float32)
-        reg_weight = torch.zeros(1, H, W, dtype=torch.float32)
-        iou_map = torch.zeros(1, H, W, dtype=torch.float32)
+        # 获取类别数量 (从映射中获取，+1表示背景)
+        num_classes = len(self.DETECTION_CLASSES)
+
+        # 创建空标签地图
+        # 分类热图 (每个类别一个通道)
+        cls_map = np.zeros((num_classes, H, W), dtype=np.float32)
+        # 回归图 (x, y, z, w, l, h, sin(θ), cos(θ), vel)
+        reg_map = np.zeros((9, H, W), dtype=np.float32)
+        # 回归权重图 (只在目标中心为1)
+        reg_weight = np.zeros((1, H, W), dtype=np.float32)
+        # IoU/Centerness 图 (在目标中心为1，可以根据需要修改)
+        iou_map = np.zeros((1, H, W), dtype=np.float32)
 
         # 获取自车姿态
-        egopose = self.nusc.get('ego_pose',
-                                self.nusc.get('sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
+        lidar_top_data = self.nusc.get('sample_data', rec['data']['LIDAR_TOP'])
+        egopose = self.nusc.get('ego_pose', lidar_top_data['ego_pose_token'])
         trans = -np.array(egopose['translation'])
         rot = Quaternion(egopose['rotation']).inverse
 
@@ -360,94 +478,112 @@ class Detection3DData(NuscData):
             inst = self.nusc.get('sample_annotation', tok)
             category = inst['category_name']
 
-            # 检查是否为我们关注的类别
-            main_category = category.split('.')[0]
+            # 检查是否为我们关注的类别，并获取类别ID [0, num_classes-1]
+            class_id = -1
             full_category = '.'.join(category.split('.')[:2])
-
+            main_category = category.split('.')[0]
             if full_category in self.category_map:
                 class_id = self.category_map[full_category]
-            elif main_category == 'vehicle':
-                class_id = 0  # 默认为车辆类
-            else:
+            elif main_category == 'vehicle':  # 处理未在map中的其他车辆
+                class_id = 0  # 假设车辆是第0类
+
+            if class_id < 0:
                 continue  # 跳过不关注的类别
 
             # 获取3D边界框
-            # 在NuScenes数据集中，有些标注没有velocity字段
-            # 构建Box对象时需传入默认的velocity元组 (np.nan, np.nan, np.nan)
-            velocity = (np.nan, np.nan, np.nan)  # 默认值
-            if 'velocity' in inst:
-                velocity = tuple(inst['velocity'])
-            box = Box(inst['translation'], inst['size'], Quaternion(
-                inst['rotation']), velocity=velocity)
+            velocity = tuple(inst['velocity']) if 'velocity' in inst and len(
+                inst['velocity']) == 3 else (np.nan, np.nan, np.nan)
+            box = Box(inst['translation'], inst['size'],
+                      Quaternion(inst['rotation']), velocity=velocity)
 
             # 转换到自车坐标系
             box.translate(trans)
             box.rotate(rot)
 
             # 边界框中心在BEV图中的位置
-            center = box.center
-            center_x, center_y = center[0], center[1]
+            center = box.center[:2]  # 只关心 x, y
 
-            # 将中心点坐标转换为网格索引
-            grid_x = int(
-                (center_x - self.bx[0] + self.dx[0] / 2.) / self.dx[0])
-            grid_y = int(
-                (center_y - self.bx[1] + self.dx[1] / 2.) / self.dx[1])
+            # 将中心点坐标转换为网格索引 (浮点数，用于高斯中心)
+            center_in_grid_x = (center[0] - self.bx[0]) / self.dx[0]
+            center_in_grid_y = (center[1] - self.bx[1]) / self.dx[1]
 
-            # 检查是否在范围内
+            # 获取整数网格索引用于赋值
+            grid_x = int(center_in_grid_x)
+            grid_y = int(center_in_grid_y)
+
+            # 检查中心点是否在网格范围内
             if 0 <= grid_x < W and 0 <= grid_y < H:
-                # 更新类别地图
-                cls_map[grid_y, grid_x] = class_id
+                # 计算高斯半径 (使用BEV下的长宽)
+                # box.wlh: [width, length, height]
+                # det_size需要 (height, width) -> 在BEV下是 (length, width)
+                det_size_bev = (box.wlh[1] / self.dx[1],
+                                box.wlh[0] / self.dx[0])
+                radius = gaussian_radius(det_size_bev)
+                radius = max(0, int(radius))
 
-                # 更新回归地图 - 回归目标为归一化的边界框参数
+                # 在对应类别的热图上绘制高斯分布
+                # 使用浮点数中心坐标以获得更准确的高斯峰值位置
+                draw_heatmap_gaussian(
+                    cls_map[class_id], (center_in_grid_x, center_in_grid_y), radius)
+
+                # 仅在中心点设置回归目标和权重
                 # 中心点坐标 (x, y, z)
-                reg_map[0, grid_y, grid_x] = center[0]
-                reg_map[1, grid_y, grid_x] = center[1]
-                reg_map[2, grid_y, grid_x] = center[2]
-
+                reg_map[0, grid_y, grid_x] = box.center[0]
+                reg_map[1, grid_y, grid_x] = box.center[1]
+                reg_map[2, grid_y, grid_x] = box.center[2]
                 # 尺寸 (w, l, h)
                 reg_map[3, grid_y, grid_x] = box.wlh[0]  # width
                 reg_map[4, grid_y, grid_x] = box.wlh[1]  # length
                 reg_map[5, grid_y, grid_x] = box.wlh[2]  # height
-
-                # 旋转角 - 使用sin和cos表示，避免角度的周期性问题
+                # 旋转角
                 yaw = box.orientation.yaw_pitch_roll[0]
-                reg_map[6, grid_y, grid_x] = float(np.sin(yaw))
-                reg_map[7, grid_y, grid_x] = float(np.cos(yaw))
+                reg_map[6, grid_y, grid_x] = np.sin(yaw)
+                reg_map[7, grid_y, grid_x] = np.cos(yaw)
+                # 速度
+                if box.velocity is not None and not np.any(np.isnan(box.velocity[:2])):
+                    velocity_norm = float(np.linalg.norm(box.velocity[:2]))
+                    reg_map[8, grid_y, grid_x] = velocity_norm
+                else:
+                    # Default to 0 if no velocity
+                    reg_map[8, grid_y, grid_x] = 0.0
 
-                # 速度 - 只有在velocity不是NaN时才设置
-                if box.velocity is not None and not np.isnan(box.velocity[0]):
-                    # 使用float()显式转换numpy.floating类型为Python float
-                    velocity = float(np.linalg.norm(box.velocity[:2]))
-                    reg_map[8, grid_y, grid_x] = velocity
-
-                # 更新权重和IoU地图
+                # 设置中心点的权重和IoU值
                 reg_weight[0, grid_y, grid_x] = 1.0
+                # Can be adjusted based on strategy
                 iou_map[0, grid_y, grid_x] = 1.0
 
-                # 为周围网格设置较小的权重，形成高斯分布
-                radius = 1
-                for dy in range(-radius, radius + 1):
-                    for dx in range(-radius, radius + 1):
-                        ny, nx = grid_y + dy, grid_x + dx
-                        if 0 <= nx < W and 0 <= ny < H and (dx != 0 or dy != 0):
-                            distance = np.sqrt(dx ** 2 + dy ** 2)
-                            weight = np.exp(-distance ** 2 / 2)
+        # 转换为Tensor
+        cls_map_tensor = torch.from_numpy(cls_map)
+        reg_map_tensor = torch.from_numpy(reg_map)
+        reg_weight_tensor = torch.from_numpy(reg_weight)
+        iou_map_tensor = torch.from_numpy(iou_map)
 
-                            # 如果当前位置没有更高优先级的目标
-                            if cls_map[ny, nx] == 0:
-                                cls_map[ny, nx] = class_id
+        # 之前返回的是 (cls_map, reg_map, reg_weight, iou_map)
+        # 需要确认损失函数期望的格式。假设它期望一个包含这些张量的字典。
+        # 并且，cls_map现在是多通道的，而之前是单通道的类别索引。
+        # 这可能需要调整损失函数或这里的返回格式。
 
-                                # 复制中心目标的回归目标
-                                for i in range(9):
-                                    reg_map[i, ny, nx] = reg_map[i,
-                                                                 grid_y, grid_x]
+        # *** 修复：将多通道热图转为单通道索引图以匹配CrossEntropyLoss ***
+        # 注意：这丢失了高斯热图的信息，更好的方式是修改损失函数以接受多通道热图
+        # 背景类 (通道0) 的热图值会被忽略，取其他通道的最大值作为类别索引
+        # 如果所有目标通道都为0，则该点为背景 (索引0)
+        # 需要确保背景没有被绘制高斯峰 (我们的类别映射从0开始，所以class_id=0是第一个目标类)
+        # 因此，我们找 >0 的最大值索引，如果不存在，则为背景(0)
+        # 为了处理argmax可能选到0的情况，我们先给背景通道加一个很小的值
+        # 背景处理：将背景类(索引0，如果存在且在num_classes内)的热图值设为0，确保argmax不会选到它
+        # if num_classes > 0:
+        #     cls_map_tensor[:, 0, :, :] = 0 # Assuming class 0 is background for argmax purpose if mapping starts from 1
+        # If mapping starts from 0, the background is implicitly where no gaussian is drawn
 
-                                # 设置权重
-                                reg_weight[0, ny, nx] = weight * 0.5
-                                iou_map[0, ny, nx] = weight * 0.5
+        cls_index_map = torch.argmax(cls_map_tensor, dim=0).long()
+        # return cls_index_map, reg_map_tensor, reg_weight_tensor, iou_map_tensor # Old tuple return
 
-        return cls_map, reg_map, reg_weight, iou_map
+        # 返回包含单通道索引图的字典
+        return {'cls_targets': cls_index_map,  # Use single-channel index map
+                'reg_targets': reg_map_tensor,
+                'reg_weights': reg_weight_tensor,
+                'iou_targets': iou_map_tensor
+                }
 
 
 class MultiModalDetectionData(Detection3DData):

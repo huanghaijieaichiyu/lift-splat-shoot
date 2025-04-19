@@ -403,21 +403,17 @@ def train_3d(version,
                               post_trans.to(device),
                               )
 
-                # Unpack the list and create the target dictionary
-                cls_map = targets_list[0].to(device)        # 类别地图
-                reg_map = targets_list[1].to(device)        # 回归地图
-                reg_weight = targets_list[2].to(device)     # 回归权重
-                iou_map = targets_list[3].to(device)        # IoU地图
+                # Ensure targets is a dictionary and move to device
+                targets_dict = {}
+                # targets_list is the dictionary yielded by the DataLoader
+                for key, val in targets_list.items():
+                    if isinstance(val, torch.Tensor):
+                        targets_dict[key] = val.to(device)
+                    else:
+                        targets_dict[key] = val
 
-                targets = {
-                    'cls_targets': cls_map,
-                    'reg_targets': reg_map,
-                    'reg_weights': reg_weight,
-                    'iou_targets': iou_map
-                }
-
-                # Calculate loss
-                losses = loss_fn(preds, targets)
+                # Calculate loss using the correctly processed dictionary
+                losses = loss_fn(preds, targets_dict)
 
                 total_loss = losses['total_loss']
                 cls_loss = losses['cls_loss']
@@ -526,20 +522,16 @@ def train_3d(version,
                                       post_trans.to(device),
                                       )
 
-                        # Unpack the list and create the target dictionary
-                        cls_map = targets_list[0].to(device)        # 类别地图
-                        reg_map = targets_list[1].to(device)        # 回归地图
-                        reg_weight = targets_list[2].to(device)     # 回归权重
-                        iou_map = targets_list[3].to(device)        # IoU地图
+                        # Ensure targets is a dictionary and move to device
+                        targets_dict = {}
+                        # targets_list is the dictionary yielded by the DataLoader
+                        for key, val in targets_list.items():
+                            if isinstance(val, torch.Tensor):
+                                targets_dict[key] = val.to(device)
+                            else:
+                                targets_dict[key] = val
 
-                        targets = {
-                            'cls_targets': cls_map,
-                            'reg_targets': reg_map,
-                            'reg_weights': reg_weight,
-                            'iou_targets': iou_map
-                        }
-
-                        losses = loss_fn(preds, targets)
+                        losses = loss_fn(preds, targets_dict)
 
                         val_loss += losses['total_loss'].item()
                         val_cls_loss += losses['cls_loss'].item()
@@ -905,21 +897,17 @@ def train_fusion(version,
                               lidar_bev.to(device)
                               )
 
-                # Unpack the list and create the target dictionary
-                cls_map = targets_list[0].to(device)        # 类别地图
-                reg_map = targets_list[1].to(device)        # 回归地图
-                reg_weight = targets_list[2].to(device)     # 回归权重
-                iou_map = targets_list[3].to(device)        # IoU地图
+                # Ensure targets is a dictionary and move to device
+                targets_dict = {}
+                # targets_list is the dictionary yielded by the DataLoader
+                for key, val in targets_list.items():
+                    if isinstance(val, torch.Tensor):
+                        targets_dict[key] = val.to(device)
+                    else:
+                        targets_dict[key] = val
 
-                targets = {
-                    'cls_targets': cls_map,
-                    'reg_targets': reg_map,
-                    'reg_weights': reg_weight,
-                    'iou_targets': iou_map
-                }
-
-                # Calculate loss
-                losses = loss_fn(preds, targets)
+                # Calculate loss using the correctly processed dictionary
+                losses = loss_fn(preds, targets_dict)
 
                 total_loss = losses['total_loss']
                 cls_loss = losses['cls_loss']
@@ -1033,20 +1021,16 @@ def train_fusion(version,
                                       post_trans.to(device),
                                       lidar_bev.to(device))
 
-                        # Unpack the list and create the target dictionary
-                        cls_map = targets_list[0].to(device)        # 类别地图
-                        reg_map = targets_list[1].to(device)        # 回归地图
-                        reg_weight = targets_list[2].to(device)     # 回归权重
-                        iou_map = targets_list[3].to(device)        # IoU地图
+                        # Ensure targets is a dictionary and move to device
+                        targets_dict = {}
+                        # targets_list is the dictionary yielded by the DataLoader
+                        for key, val in targets_list.items():
+                            if isinstance(val, torch.Tensor):
+                                targets_dict[key] = val.to(device)
+                            else:
+                                targets_dict[key] = val
 
-                        targets = {
-                            'cls_targets': cls_map,
-                            'reg_targets': reg_map,
-                            'reg_weights': reg_weight,
-                            'iou_targets': iou_map
-                        }
-
-                        losses = loss_fn(preds, targets)
+                        losses = loss_fn(preds, targets_dict)
 
                         val_loss += losses['total_loss'].item()
                         val_cls_loss += losses['cls_loss'].item()
