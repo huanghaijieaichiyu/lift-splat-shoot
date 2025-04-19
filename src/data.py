@@ -14,6 +14,7 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
 from nuscenes.utils.data_classes import Box
 from glob import glob
+import pickle
 
 from .tools import get_lidar_data, img_transform, normalize_img, gen_dx_bx
 
@@ -299,16 +300,16 @@ class Detection3DData(NuscData):
                                   'traffic_cone', 'barrier']
         # 添加类别映射
         self.category_map = {
-            'vehicle.car': 1,
-            'vehicle.truck': 2,
-            'vehicle.bus': 3,
-            'vehicle.trailer': 4,
-            'vehicle.construction': 5,
-            'human.pedestrian': 6,
-            'vehicle.motorcycle': 7,
-            'vehicle.bicycle': 8,
-            'movable_object.traffic_cone': 9,
-            'movable_object.barrier': 10
+            'vehicle.car': 0,            # 1 -> 0
+            'vehicle.truck': 1,          # 2 -> 1
+            'vehicle.bus': 2,            # 3 -> 2
+            'vehicle.trailer': 3,         # 4 -> 3
+            'vehicle.construction': 4,   # 5 -> 4
+            'human.pedestrian': 5,       # 6 -> 5
+            'vehicle.motorcycle': 6,     # 7 -> 6
+            'vehicle.bicycle': 7,        # 8 -> 7
+            'movable_object.traffic_cone': 8,  # 9 -> 8
+            'movable_object.barrier': 9      # 10 -> 9
         }
         self.cls_mean_size = {
             'car': np.array([4.63, 1.97, 1.74]),
@@ -325,16 +326,16 @@ class Detection3DData(NuscData):
 
     def __getitem__(self, index):
         rec = self.ixes[index]
+        # 获取样本token
+        sample_token = rec['token']
 
-        # 获取图像数据
         cams = self.choose_cams()
         imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(
             rec, cams)
+        target_maps = self.get_detection_targets(rec)
 
-        # 获取检测目标
-        targets = self.get_detection_targets(rec)
-
-        return imgs, rots, trans, intrins, post_rots, post_trans, targets
+        # 返回包含sample_token的元组
+        return imgs, rots, trans, intrins, post_rots, post_trans, target_maps, sample_token
 
     def get_detection_targets(self, rec):
         """
@@ -366,7 +367,7 @@ class Detection3DData(NuscData):
             if full_category in self.category_map:
                 class_id = self.category_map[full_category]
             elif main_category == 'vehicle':
-                class_id = 1  # 默认为车辆类
+                class_id = 0  # 默认为车辆类
             else:
                 continue  # 跳过不关注的类别
 
@@ -587,6 +588,7 @@ def compile_data(version, dataroot, data_aug_conf, grid_conf, bsz,
     max_sweeps = 10  # 设置最大扫描帧数
 
     # 加载或创建缓存信息
+    nusc_infos = None  # Initialize nusc_infos
     try:
         print(f"加载NuScenes缓存信息...")
         nusc_infos = load_nuscenes_infos(
@@ -612,17 +614,31 @@ def compile_data(version, dataroot, data_aug_conf, grid_conf, bsz,
         # 确保cached_infos属性存在但为None
         nusc.__dict__['cached_infos'] = None
 
-    parser = {
-        'vizdata': VizData,
-        'segmentationdata': SegmentationData,
-        'detection3d': Detection3DData,
-        'multimodal_detection': MultiModalDetectionData
-    }[parser_name]
-    traindata = parser(nusc, is_train=True, data_aug_conf=data_aug_conf,
-                       grid_conf=grid_conf)
-    valdata = parser(nusc, is_train=False, data_aug_conf=data_aug_conf,
-                     grid_conf=grid_conf)
+    # Define the mapping from parser_name to Dataset class and its specific kwargs
+    parser_map = {
+        'vizdata': (VizData, {}),
+        'segmentationdata': (SegmentationData, {}),
+        'detection3d': (Detection3DData, {}),
+        'multimodal_detection': (MultiModalDetectionData, {}),
+        # Ensure this uses the correct class
+        'nuScenes': (Detection3DData, {}),
+    }
 
+    # Lookup the class and kwargs based on parser_name
+    if parser_name not in parser_map:
+        raise KeyError(
+            f"Invalid parser_name: '{parser_name}'. Available options: {list(parser_map.keys())}")
+    dataset_class, dataset_kwargs = parser_map[parser_name]
+
+    # Instantiate the datasets using the retrieved class and kwargs
+    traindata = dataset_class(nusc=nusc, is_train=True,
+                              data_aug_conf=data_aug_conf,
+                              grid_conf=grid_conf, **dataset_kwargs)
+    valdata = dataset_class(nusc=nusc, is_train=False,
+                            data_aug_conf=data_aug_conf,
+                            grid_conf=grid_conf, **dataset_kwargs)
+
+    # Create DataLoaders
     trainloader = torch.utils.data.DataLoader(traindata, batch_size=bsz,
                                               shuffle=True,
                                               num_workers=nworkers,

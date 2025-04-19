@@ -140,3 +140,6 @@ models/__pycache__
 runs_*
 .cursor
 .idea
+eval_output
+/BEVDepth
+/.gitignore

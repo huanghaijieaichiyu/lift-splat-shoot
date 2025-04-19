@@ -5,655 +5,784 @@ Authors: Jonah Philion and Sanja Fidler
 """
 
 import torch
+import os
 import numpy as np
 from tqdm import tqdm
+# 导入nuscenes相关库
+from nuscenes import NuScenes
+from nuscenes.eval.detection.config import config_factory
+from nuscenes.eval.detection.evaluate import NuScenesEval
+# EvalBoxes is used for predictions, DetectionBox for ground truth loading (if needed directly)
+from nuscenes.eval.common.data_classes import EvalBoxes
+# 导入DetectionBox用于评估
+from nuscenes.eval.detection.data_classes import DetectionBox
+from nuscenes.utils.data_classes import Box
+from pyquaternion import Quaternion
+import tempfile
+import json
+import pickle
+from typing import Dict, List, Any  # Import Any for flexible dictionary typing
+# Import torch.amp explicitly
+import torch.amp as amp
+# Import torch.cuda.amp explicitly for autocast
+from torch.cuda.amp import autocast
+
+# --- Constants for nuScenes Mapping ---
+
+# Mapping from your model's output class IDs to official nuScenes detection names
+# IMPORTANT: Verify this mapping matches your model's training and dataset setup.
+# Background class (ID 0) should not be included here.
+MODEL_ID_TO_NUSCENES_NAME = {
+    1: 'car',
+    2: 'truck',
+    3: 'bus',
+    4: 'trailer',
+    5: 'construction_vehicle',
+    6: 'pedestrian',
+    7: 'motorcycle',
+    8: 'bicycle',
+    9: 'traffic_cone',
+    # 10: 'barrier' # Uncomment if your model predicts barriers
+}
+
+# Mapping from nuScenes detection names to contiguous IDs (0-9 for 10 classes)
+# Used internally by nuScenes evaluation if needed, but primarily we use names.
+NUSCENES_NAME_TO_DETECTION_ID = {
+    v: k-1 for k, v in MODEL_ID_TO_NUSCENES_NAME.items()}  # 0-indexed
+
+# --- Helper Function for nuScenes Box Conversion (Vectorized) ---
 
 
-def compute_map(model, valloader, device, amp=True):
+def convert_pred_to_nuscenes_box(
+    predictions_dict: Dict[str, Any],
+    all_sample_tokens: List[str] | None
+) -> EvalBoxes:
     """
-    计算模型在验证集上的mAP
+    Converts a dictionary of concatenated predictions to the nuScenes EvalBoxes format.
+    Ensures all sample tokens from the evaluation split are present in the output.
+
     Args:
-        model: 模型
-        valloader: 验证数据加载器
-        device: 设备
-        amp: 是否使用混合精度
-    Returns:
-        float: mAP值
-    """
-    model.eval()
-    all_predictions = []
-    all_targets = []
+        predictions_dict: Dictionary containing concatenated prediction arrays for
+                          detections *above* the score threshold.
+        all_sample_tokens: A list of all sample_token strings that were processed
+                           in the evaluation split.
 
-    with torch.no_grad():
-        for imgs, rots, trans, intrins, post_rots, post_trans, targets in tqdm(valloader, desc="Evaluating mAP"):
-            # 使用上下文管理器进行混合精度计算
-            if amp and device.type == 'cuda':
-                with torch.cuda.amp.autocast():
-                    preds = model(imgs.to(device),
-                                  rots.to(device),
-                                  trans.to(device),
-                                  intrins.to(device),
-                                  post_rots.to(device),
-                                  post_trans.to(device),
-                                  )
+    Returns:
+        EvalBoxes: A container holding nuScenes DetectionBox dictionaries grouped by sample_token.
+                   Includes entries with empty lists for samples with no detections.
+    """
+    nuscenes_boxes = EvalBoxes()
+
+    # Handle case where predictions_dict might be empty if *no* detections passed the threshold
+    # across the entire dataset, but we still need to return EvalBoxes with empty lists for all tokens.
+    has_valid_detections = (predictions_dict and
+                            'sample_tokens' in predictions_dict and
+                            predictions_dict['sample_tokens'])
+
+    if has_valid_detections:
+        # Extract data for valid detections
+        scores = predictions_dict['box_scores']
+        # Fix Linter Error: Convert cls_ids to numpy *before* astype
+        cls_ids = np.array(predictions_dict['box_cls']).astype(int)
+        xyz = predictions_dict['box_xyz']
+        wlh = predictions_dict['box_wlh']
+        rot_sincos = predictions_dict['box_rot_sincos']
+        vel = predictions_dict['box_vel']
+        # List of tokens corresponding ONLY to the valid detections
+        valid_detection_sample_tokens = predictions_dict['sample_tokens']
+        num_dets = len(scores)
+
+        if num_dets > 0:
+            print(f"Vectorizing conversion for {num_dets} valid detections...")
+
+            # Vectorized calculations
+            yaws = np.arctan2(rot_sincos[:, 0], rot_sincos[:, 1])
+            detection_names = np.array(
+                [MODEL_ID_TO_NUSCENES_NAME.get(c, None) for c in cls_ids])
+            valid_mask = detection_names != None
+
+            if np.any(valid_mask):
+                # Apply mask to filter detections with unknown class IDs
+                scores = scores[valid_mask]
+                xyz = xyz[valid_mask]
+                wlh = wlh[valid_mask]
+                yaws = yaws[valid_mask]
+                vel = vel[valid_mask]
+                detection_names = detection_names[valid_mask]
+                # Filter the list of sample tokens for valid detections
+                valid_tokens_np = np.array(valid_detection_sample_tokens)
+                # Back to list after filtering
+                sample_tokens_for_boxes = valid_tokens_np[valid_mask].tolist()
+                num_valid_dets = len(scores)
+
+                print(
+                    f"Processing {num_valid_dets} actual boxes after class mapping...")
+
+                # Create DetectionBox objects for valid detections and group by token
+                for i in tqdm(range(num_valid_dets), desc="Creating nuScenes boxes", leave=False):
+                    token = sample_tokens_for_boxes[i]
+                    quat = Quaternion(axis=[0, 0, 1], angle=yaws[i])
+                    detection_box = DetectionBox(
+                        sample_token=token,
+                        translation=xyz[i].tolist(),
+                        size=wlh[i].tolist(),
+                        rotation=quat.elements.tolist(),
+                        velocity=vel[i].tolist()[:2],
+                        detection_name=detection_names[i],
+                        detection_score=float(scores[i]),
+                        attribute_name=''
+                    )
+                    if token not in nuscenes_boxes.boxes:
+                        nuscenes_boxes.boxes[token] = []
+                    nuscenes_boxes.boxes[token].append(detection_box)
             else:
-                preds = model(imgs.to(device),
-                              rots.to(device),
-                              trans.to(device),
-                              intrins.to(device),
-                              post_rots.to(device),
-                              post_trans.to(device),
-                              )
+                print("Warning: No valid detections remained after class mapping.")
+        else:
+            print("Warning: predictions_dict contained zero detections.")
 
-            # 收集预测和目标
-            batch_dets = decode_predictions(preds, device)
-            batch_gts = decode_targets(targets, device)
+    # Ensure all sample tokens from the split are present in the final EvalBoxes object
+    if all_sample_tokens:
+        print(
+            f"Ensuring all {len(all_sample_tokens)} sample tokens are present in the results...")
+        # Use set for efficient lookup
+        original_tokens_set = set(all_sample_tokens)
+        tokens_with_boxes = set(nuscenes_boxes.boxes.keys())
 
-            all_predictions.extend(batch_dets)
-            all_targets.extend(batch_gts)
+        missing_tokens = original_tokens_set - tokens_with_boxes
+        if missing_tokens:
+            print(
+                f"Adding {len(missing_tokens)} sample tokens with empty prediction lists.")
+            for token in missing_tokens:
+                nuscenes_boxes.boxes[token] = []  # Add token with empty list
 
-    # 计算mAP
-    mean_ap = calculate_map(all_predictions, all_targets)
-    return mean_ap
+        # Verify final count matches expected number of samples
+        final_token_count = len(nuscenes_boxes.boxes.keys())
+        if final_token_count != len(original_tokens_set):
+            print(
+                f"Warning: Final token count ({final_token_count}) doesn't match expected ({len(original_tokens_set)})! Check for duplicates or other issues.")
+        else:
+            print(
+                f"Final results confirmed to contain {final_token_count} sample tokens.")
+
+    else:
+        print("Warning: `all_sample_tokens` list was not provided to `convert_pred_to_nuscenes_box`. Cannot guarantee all samples are included.")
+
+    return nuscenes_boxes
 
 
-def decode_predictions(preds, device):
+# --- Main Evaluation Function using nuScenes Devkit (Updated Signature) ---
+
+def evaluate_with_nuscenes(
+    # Accepts the dict of numpy arrays
+    predictions_dict: Dict[str, np.ndarray | List[str]],
+    nuscenes_version: str,
+    nuscenes_dataroot: str,
+    eval_set: str,  # e.g., 'val', 'mini_val', 'test'
+    output_dir: str,
+    verbose: bool = True,
+    # Fix type hint for optional list
+    all_sample_tokens: List[str] | None = None
+) -> Dict[str, Any]:
     """
-    解码模型预测结果为3D检测框
+    Performs 3D object detection evaluation using the official nuScenes devkit.
+    Accepts predictions as a dictionary of concatenated NumPy arrays.
+
     Args:
-        preds: 模型预测
-        device: 设备
+        predictions_dict: Dictionary containing concatenated prediction arrays and sample tokens
+                          for detections *above* the score threshold.
+        nuscenes_version: nuScenes dataset version (e.g., 'v1.0-mini', 'v1.0-trainval').
+        nuscenes_dataroot: Path to the nuScenes dataset root directory.
+        eval_set: The split to evaluate on (e.g., 'val', 'mini_val').
+        output_dir: Directory to save evaluation results and temporary files.
+        verbose: Whether to print detailed evaluation progress and results.
+        all_sample_tokens: A list of all sample_token strings that were processed
+                           in the evaluation split. Needed to ensure results JSON is complete.
+
     Returns:
-        list: 包含预测结果的列表
+        Dict[str, Any]: A dictionary containing the official nuScenes evaluation metrics.
+    """
+
+    # 1. Convert predictions dictionary to nuScenes format (vectorized)
+    print("Converting predictions to nuScenes format...")
+    # Pass the complete token list to ensure all samples are included
+    nusc_boxes = convert_pred_to_nuscenes_box(
+        predictions_dict, all_sample_tokens)
+    print(
+        f"Conversion complete. Results generated for {len(nusc_boxes.boxes)} samples.")
+
+    # Check if any boxes were actually generated across all samples
+    total_boxes = sum(len(boxes) for boxes in nusc_boxes.boxes.values())
+    if total_boxes == 0:
+        print("Error: No valid prediction boxes were generated after conversion. Check model output and conversion logic.")
+        # Return default/empty metrics
+        return {
+            'mAP': 0.0, 'NDS': 0.0, 'mATE': float('inf'), 'mASE': float('inf'),
+            'mAOE': float('inf'), 'mAVE': float('inf'), 'mAAE': float('inf'),
+            'per_class_AP': {name: 0.0 for name in MODEL_ID_TO_NUSCENES_NAME.values()},
+            'per_class_TP_Errors': {err: {name: 0.0 for name in MODEL_ID_TO_NUSCENES_NAME.values()}
+                                    for err in ['trans_err', 'scale_err', 'orient_err', 'vel_err', 'attr_err']}
+        }
+
+    # 2. Prepare nuScenes evaluation configuration
+    # Use the standard config for nuScenes detection challenge (CVPR 2019)
+    cfg = config_factory('detection_cvpr_2019')
+    # Adjust config parameters if needed, e.g., distance thresholds
+    # cfg.dist_ths = [0.5, 1.0, 2.0, 4.0] # Example
+
+    # 3. Initialize NuScenes object to access ground truth
+    print(
+        f"Initializing NuScenes (version: {nuscenes_version}, dataroot: {nuscenes_dataroot})...")
+    try:
+        nusc = NuScenes(version=nuscenes_version,
+                        dataroot=nuscenes_dataroot, verbose=verbose)
+    except AssertionError as e:
+        print(f"Error initializing NuScenes: {e}")
+        print(
+            "Please ensure the dataroot path is correct and the specified version exists.")
+        raise
+
+    # 4. Prepare output directory and save predictions JSON
+    eval_output_dir = os.path.join(output_dir, 'nuscenes_eval_results')
+    os.makedirs(eval_output_dir, exist_ok=True)
+
+    # nuScenes evaluation requires predictions saved as a JSON file
+    res_path = os.path.join(eval_output_dir, 'results_nuscenes.json')
+    meta = {
+        "use_camera": True,   # Indicates camera-based detection
+        "use_lidar": False,  # Set based on your model's input modalities
+        "use_radar": False,
+        "use_map": False,
+        "use_external": False,
+    }
+    results_json = {'meta': meta, 'results': nusc_boxes.serialize()}
+
+    print(f"Saving predictions to {res_path}...")
+    try:
+        with open(res_path, 'w') as f:
+            json.dump(results_json, f, indent=4)  # Use indent for readability
+        print("Predictions saved successfully.")
+    except Exception as e:
+        print(f"Error saving predictions JSON: {e}")
+        raise
+
+    # 5. Run nuScenes Evaluation
+    if verbose:
+        print(f"Running nuScenes detection evaluation for set: {eval_set}...")
+        print(f"Using configuration: detection_cvpr_2019")
+        print(f"Output will be stored in: {eval_output_dir}")
+
+    # Instantiate NuScenesEval
+    # Make sure the eval_set matches the split used in your valloader
+    # Common sets: 'train', 'val', 'test', 'mini_train', 'mini_val'
+    try:
+        nusc_eval = NuScenesEval(
+            nusc,
+            config=cfg,
+            result_path=res_path,
+            eval_set=eval_set,
+            output_dir=eval_output_dir,
+            verbose=verbose
+        )
+    except Exception as e:
+        print(f"Error initializing NuScenesEval: {e}")
+        print(
+            f"Check if eval_set '{eval_set}' is valid for version '{nuscenes_version}'.")
+        raise
+
+    # Run evaluation - this computes mAP, NDS, and other metrics
+    # render_curves=True generates PR curve plots
+    print("Starting NuScenesEval.main()...")
+    metrics_summary = nusc_eval.main(render_curves=False)
+    print("NuScenesEval.main() finished.")
+
+    # 6. Parse and return metrics
+    # nuScenes eval returns metrics in a specific structure. We extract key ones.
+    metrics_dict = {
+        'mAP': metrics_summary['mean_ap'],
+        'mATE': metrics_summary['mean_trans_err'],
+        'mASE': metrics_summary['mean_scale_err'],
+        'mAOE': metrics_summary['mean_orient_err'],
+        'mAVE': metrics_summary['mean_vel_err'],
+        'mAAE': metrics_summary['mean_attr_err'],
+        'NDS': metrics_summary['nd_score'],
+        'per_class_AP': metrics_summary['mean_dist_aps'],  # AP per class
+        # TP errors per class
+        'per_class_TP_Errors': metrics_summary['tp_errors'],
+    }
+
+    if verbose:
+        print("===== Official nuScenes Evaluation Results =====")
+        print(f"mAP: {metrics_dict['mAP']:.4f}")
+        print(f"NDS: {metrics_dict['NDS']:.4f}")
+        print(f"mATE (Translation): {metrics_dict['mATE']:.4f} (meters)")
+        print(f"mASE (Scale): {metrics_dict['mASE']:.4f} (1-IoU)")
+        print(f"mAOE (Orientation): {metrics_dict['mAOE']:.4f} (radians)")
+        print(f"mAVE (Velocity): {metrics_dict['mAVE']:.4f} (m/s)")
+        print(f"mAAE (Attribute): {metrics_dict['mAAE']:.4f} (1-acc)")
+        print("----- Per-class AP -----")
+        for class_name, ap in metrics_dict['per_class_AP'].items():
+            print(f"{class_name}: {ap:.4f}")
+        # Optionally print TP errors per class if needed
+        # print("----- Per-class TP Errors -----")
+        # for tp_name, class_errors in metrics_dict['per_class_TP_Errors'].items():
+        #     print(f"--- {tp_name} ---")
+        #     for class_name, error in class_errors.items():
+        #         print(f"{class_name}: {error:.4f}")
+
+    return metrics_dict
+
+
+# --- Modified decode functions ---
+
+def decode_predictions(preds: Dict[str, torch.Tensor], device: torch.device, score_thresh: float, grid_conf: Dict[str, Any]):
+    """
+    Decodes model predictions into bounding boxes, scores, and classes.
+    Transforms relative grid cell offsets to global coordinates.
+    Args:
+        preds: Dictionary of prediction tensors from the model.
+        device: The torch device.
+        score_thresh: Minimum score threshold to keep a detection.
+        grid_conf: Dictionary containing BEV grid configuration (xbound, ybound).
     """
     batch_size = preds['cls_pred'].shape[0]
     predictions = []
 
+    # Extract grid parameters needed for coordinate transformation
+    xbound = grid_conf['xbound']
+    ybound = grid_conf['ybound']
+    min_x, max_x, res_x = xbound
+    min_y, max_y, res_y = ybound
+
     for b in range(batch_size):
-        # 获取当前批次的预测
         cls_pred = preds['cls_pred'][b]  # [C, H, W]
-        reg_pred = preds['reg_pred'][b]  # [9, H, W]
+        # [9, H, W] (x,y,z, w,l,h, sin,cos, vel_xy)
+        reg_pred = preds['reg_pred'][b]
         iou_pred = preds['iou_pred'][b]  # [1, H, W]
 
-        # 获取分类分数
-        cls_scores, cls_ids = torch.max(torch.softmax(
-            cls_pred, dim=0), dim=0)  # [H, W], [H, W]
-
-        # 获取IoU分数
+        cls_scores, cls_ids = torch.max(
+            torch.softmax(cls_pred, dim=0), dim=0)  # [H, W]
         iou_scores = torch.sigmoid(iou_pred.squeeze(0))  # [H, W]
+        scores = cls_scores * iou_scores  # Combined score [H, W]
 
-        # 合并分数 = 分类分数 * IoU分数
-        scores = cls_scores * iou_scores  # [H, W]
+        # Filter based on class ID > 0 and score threshold
+        # mask = cls_ids > 0  # Filter out background class (ID 0)
+        final_mask = (cls_ids > 0) & (scores > score_thresh)
 
-        # 过滤掉背景 (类别ID=0)
-        mask = cls_ids > 0  # [H, W]
+        # if mask.sum() > 0:
+        if final_mask.sum() > 0:
+            # filtered_cls_ids = cls_ids[mask]    # [N]
+            # filtered_scores = scores[mask]      # [N]
+            filtered_cls_ids = cls_ids[final_mask]    # [N]
+            filtered_scores = scores[final_mask]      # [N]
 
-        if mask.sum() > 0:
-            # 获取非背景的预测
-            filtered_cls_ids = cls_ids[mask]  # [N]
-            filtered_scores = scores[mask]  # [N]
-
-            # 获取回归预测值
-            h, w = mask.shape
-            # 修复meshgrid警告，添加indexing参数
+            h, w = final_mask.shape  # Use final_mask shape
+            # Fix meshgrid warning for PyTorch >= 1.10
             ys, xs = torch.meshgrid(torch.arange(
                 h, device=device), torch.arange(w, device=device), indexing='ij')
-            xs, ys = xs[mask], ys[mask]  # [N], [N]
+            # [N], [N] - Coordinates in feature map
+            # xs, ys = xs[mask], ys[mask]
+            xs, ys = xs[final_mask], ys[final_mask]
 
-            reg_pred = reg_pred.permute(1, 2, 0)  # [H, W, 9]
-            filtered_reg = reg_pred[mask]  # [N, 9]
+            reg_pred_permuted = reg_pred.permute(1, 2, 0)  # [H, W, 9]
+            # filtered_reg = reg_pred_permuted[mask]       # [N, 9]
+            filtered_reg = reg_pred_permuted[final_mask]       # [N, 9]
 
-            # 解析回归值: x, y, z, w, l, h, sin(θ), cos(θ), 速度
+            # Assuming offsets are relative to grid cell *centers*
+            # Calculate grid cell center coordinates in global frame
+            grid_cell_center_x = min_x + (xs.float() + 0.5) * res_x
+            grid_cell_center_y = min_y + (ys.float() + 0.5) * res_y
+
+            # Transform offsets to global coordinates
+            pred_x = grid_cell_center_x + filtered_reg[:, 0]  # Add X offset
+            pred_y = grid_cell_center_y + filtered_reg[:, 1]  # Add Y offset
+            pred_z = filtered_reg[:, 2]  # Assume Z is predicted directly
+
+            # Combine into [N, 3]
+            pred_xyz = torch.stack([pred_x, pred_y, pred_z], dim=1)
+
+            # [N, 3] (w, l, h) - Check order! nuScenes expects w, l, h
+            pred_wlh = filtered_reg[:, 3:6]
+            # [N, 2] (sin(yaw), cos(yaw))
+            pred_rot_sincos = filtered_reg[:, 6:8]
+            # [N, 1] or [N, 2]? Assuming [N, 2] for (vx, vy)
+            pred_vel = filtered_reg[:, 8:]
+            # Ensure velocity has 2 components, pad with 0 if needed
+            if pred_vel.shape[1] == 1:
+                pred_vel = torch.cat(
+                    [pred_vel, torch.zeros_like(pred_vel)], dim=1)
+
             dets = {
-                'box_cls': filtered_cls_ids,               # [N] 类别ID
-                'box_scores': filtered_scores,             # [N] 分数
-                'box_reg': filtered_reg,                   # [N, 9] 回归值
-                'box_xyz': filtered_reg[:, :3],            # [N, 3] 中心点坐标
-                'box_wlh': filtered_reg[:, 3:6],           # [N, 3] 尺寸
-                # [N, 1] 旋转角
-                'box_rot': torch.atan2(filtered_reg[:, 6], filtered_reg[:, 7]).unsqueeze(1),
-                'box_vel': filtered_reg[:, 8].unsqueeze(1)  # [N, 1] 速度
+                'box_cls': filtered_cls_ids,
+                'box_scores': filtered_scores,
+                'box_reg': filtered_reg,  # Keep raw regression output if needed elsewhere
+                'box_xyz': pred_xyz,
+                'box_wlh': pred_wlh,
+                'box_rot_sincos': pred_rot_sincos,
+                # Ensure only 2 velocity components (vx, vy)
+                'box_vel': pred_vel[:, :2]
             }
-
             predictions.append(dets)
         else:
-            # 没有有效检测
+            # No detections for this sample
             empty_dets = {
                 'box_cls': torch.zeros(0, dtype=torch.long, device=device),
                 'box_scores': torch.zeros(0, device=device),
                 'box_reg': torch.zeros(0, 9, device=device),
                 'box_xyz': torch.zeros(0, 3, device=device),
                 'box_wlh': torch.zeros(0, 3, device=device),
-                'box_rot': torch.zeros(0, 1, device=device),
-                'box_vel': torch.zeros(0, 1, device=device)
+                'box_rot_sincos': torch.zeros(0, 2, device=device),
+                'box_vel': torch.zeros(0, 2, device=device)
             }
             predictions.append(empty_dets)
 
     return predictions
 
 
-def decode_targets(targets_list, device):
+def decode_targets(targets_list: List[torch.Tensor], device: torch.device):
     """
-    解码目标数据为3D检测框
+    Decodes target maps into bounding boxes, classes, etc. for one batch.
     Args:
-        targets_list: 目标数据列表，包含 [cls_map, reg_map, reg_weight, iou_map]
-        device: 设备
+        targets_list: List containing target maps [cls_map, reg_map, ...].
+                      Assumes reg_map contains (x,y,z, w,l,h, sin,cos, vx, vy).
+        device: PyTorch device.
     Returns:
-        list: 包含目标数据的列表
+        List of dictionaries, one per sample in the batch, containing decoded GT boxes.
     """
-    # 解包目标列表
-    cls_map = targets_list[0].to(device)        # 类别地图
-    reg_map = targets_list[1].to(device)        # 回归地图
-    reg_weight = targets_list[2].to(device)     # 回归权重
-    iou_map = targets_list[3].to(device)        # IoU地图
+    # Assuming targets_list = [cls_map, reg_map, reg_weight, iou_map] based on original code
+    if len(targets_list) < 2:
+        raise ValueError(
+            "targets_list must contain at least class map and regression map.")
+
+    # [B, H, W] or [B, 1, H, W]? Assume [B, H, W]
+    cls_map = targets_list[0].to(device)
+    # [B, 9, H, W] (x,y,z, w,l,h, sin,cos, vel_xy)
+    reg_map = targets_list[1].to(device)
 
     batch_size = cls_map.shape[0]
     gt_list = []
 
     for b in range(batch_size):
-        # 获取当前批次的目标
         cls_targets = cls_map[b]  # [H, W]
         reg_targets = reg_map[b]  # [9, H, W]
 
-        # 过滤掉背景 (类别ID=0)
-        mask = cls_targets > 0  # [H, W]
+        mask = cls_targets > 0  # Find locations with ground truth objects
 
         if mask.sum() > 0:
-            # 获取非背景的目标
             filtered_cls_ids = cls_targets[mask]  # [N]
 
-            # 获取回归目标值
-            reg_targets = reg_targets.permute(1, 2, 0)  # [H, W, 9]
-            filtered_reg = reg_targets[mask]  # [N, 9]
+            # Get corresponding regression targets
+            reg_targets_permuted = reg_targets.permute(1, 2, 0)  # [H, W, 9]
+            filtered_reg = reg_targets_permuted[mask]  # [N, 9]
 
-            # 解析回归值: x, y, z, w, l, h, sin(θ), cos(θ), 速度
+            # --- Extract target components ---
+            gt_xyz = filtered_reg[:, :3]
+            gt_wlh = filtered_reg[:, 3:6]  # Assuming order is w, l, h
+            gt_rot_sincos = filtered_reg[:, 6:8]
+            # Ensure velocity has 2 components
+            gt_vel = filtered_reg[:, 8:]
+            if gt_vel.shape[1] == 1:
+                gt_vel = torch.cat([gt_vel, torch.zeros_like(gt_vel)], dim=1)
+
             gt = {
-                'box_cls': filtered_cls_ids,               # [N] 类别ID
-                'box_reg': filtered_reg,                   # [N, 9] 回归值
-                'box_xyz': filtered_reg[:, :3],            # [N, 3] 中心点坐标
-                'box_wlh': filtered_reg[:, 3:6],           # [N, 3] 尺寸
-                # [N, 1] 旋转角
-                'box_rot': torch.atan2(filtered_reg[:, 6], filtered_reg[:, 7]).unsqueeze(1),
-                'box_vel': filtered_reg[:, 8].unsqueeze(1)  # [N, 1] 速度
+                'box_cls': filtered_cls_ids,
+                'box_reg': filtered_reg,  # Raw regression targets
+                'box_xyz': gt_xyz,
+                'box_wlh': gt_wlh,
+                'box_rot_sincos': gt_rot_sincos,
+                'box_vel': gt_vel[:, :2]  # Ensure only vx, vy
             }
-
             gt_list.append(gt)
         else:
-            # 没有有效目标
+            # No ground truth objects for this sample
             empty_gt = {
                 'box_cls': torch.zeros(0, dtype=torch.long, device=device),
                 'box_reg': torch.zeros(0, 9, device=device),
                 'box_xyz': torch.zeros(0, 3, device=device),
                 'box_wlh': torch.zeros(0, 3, device=device),
-                'box_rot': torch.zeros(0, 1, device=device),
-                'box_vel': torch.zeros(0, 1, device=device)
+                'box_rot_sincos': torch.zeros(0, 2, device=device),
+                'box_vel': torch.zeros(0, 2, device=device)
             }
             gt_list.append(empty_gt)
 
     return gt_list
 
 
-def calculate_map(predictions, targets, iou_thresholds=[0.5, 0.7], num_classes=10, consider_rotation=True):
-    """
-    计算平均精度 (mAP)，支持多个IoU阈值
-    Args:
-        predictions: 预测结果列表
-        targets: 目标数据列表
-        iou_thresholds: IoU阈值列表
-        num_classes: 类别数量
-        consider_rotation: 是否考虑旋转
-    Returns:
-        dict: 包含mAP和每个类别AP的字典
-    """
-    results = {f'mAP@{iou_thresh:.1f}': 0.0 for iou_thresh in iou_thresholds}
-    class_aps = {f'AP@{iou_thresh:.1f}': {} for iou_thresh in iou_thresholds}
+# --- Deprecated/Removed Functions ---
 
-    # 按类别计算AP
-    for cls_id in range(1, num_classes):  # 忽略背景类(0)
-        all_preds = []
-        all_gts = []
-
-        # 收集所有预测和目标
-        for pred, gt in zip(predictions, targets):
-            # 过滤当前类别的预测
-            pred_mask = pred['box_cls'] == cls_id
-            pred_boxes = {
-                'box_xyz': pred['box_xyz'][pred_mask],
-                'box_wlh': pred['box_wlh'][pred_mask],
-                'box_rot': pred['box_rot'][pred_mask],
-                'box_scores': pred['box_scores'][pred_mask]
-            }
-            all_preds.append(pred_boxes)
-
-            # 过滤当前类别的目标
-            gt_mask = gt['box_cls'] == cls_id
-            gt_boxes = {
-                'box_xyz': gt['box_xyz'][gt_mask],
-                'box_wlh': gt['box_wlh'][gt_mask],
-                'box_rot': gt['box_rot'][gt_mask]
-            }
-            all_gts.append(gt_boxes)
-
-        # 如果没有该类别的目标，则跳过
-        if sum(len(gt['box_xyz']) for gt in all_gts) == 0:
-            continue
-
-        # 计算不同IoU阈值下的AP
-        for iou_thresh in iou_thresholds:
-            ap = calculate_ap_for_class(
-                all_preds, all_gts, iou_thresh, consider_rotation)
-            class_aps[f'AP@{iou_thresh:.1f}'][cls_id] = ap
-
-    # 计算每个IoU阈值下的mAP
-    for iou_thresh in iou_thresholds:
-        ap_values = list(class_aps[f'AP@{iou_thresh:.1f}'].values())
-        if len(ap_values) > 0:
-            results[f'mAP@{iou_thresh:.1f}'] = sum(ap_values) / len(ap_values)
-
-    # 添加类别信息
-    results['class_aps'] = class_aps
-    results['class_names'] = {
-        cls_id: f"Class {cls_id}" for cls_id in range(1, num_classes)
-    }
-
-    return results
+# def compute_map(...) - Replaced by evaluate_with_nuscenes
+# def calculate_map(...) - Replaced by evaluate_with_nuscenes
+# def calculate_ap_for_class(...) - Replaced by evaluate_with_nuscenes
+# def compute_3d_iou(...) - Replaced by nuScenes official IoU calculation within NuScenesEval
 
 
-def calculate_ap_for_class(predictions, targets, iou_thresh=0.5, consider_rotation=True):
-    """
-    计算单个类别的AP
-    Args:
-        predictions: 该类别的预测结果
-        targets: 该类别的目标数据
-        iou_thresh: IoU阈值
-        consider_rotation: 是否考虑旋转信息
-    Returns:
-        float: AP值
-    """
-    # 收集所有预测结果
-    all_scores = []
-    all_matches = []
-
-    # 遍历每个样本
-    for pred, gt in zip(predictions, targets):
-        scores = pred['box_scores']
-        pred_boxes = torch.cat([
-            pred['box_xyz'],
-            pred['box_wlh'],
-            pred['box_rot']
-        ], dim=1)  # [N, 7] - x, y, z, w, l, h, θ
-
-        gt_boxes = torch.cat([
-            gt['box_xyz'],
-            gt['box_wlh'],
-            gt['box_rot']
-        ], dim=1) if len(gt['box_xyz']) > 0 else None  # [M, 7] - x, y, z, w, l, h, θ
-
-        # 如果没有预测或没有目标
-        if len(scores) == 0 or gt_boxes is None or len(gt_boxes) == 0:
-            if len(scores) > 0:
-                all_scores.extend(scores.cpu().numpy())
-                all_matches.extend([0] * len(scores))
-            continue
-
-        # 计算IoU
-        ious = compute_3d_iou(pred_boxes[:, :3], gt_boxes[:, :3],
-                              pred_boxes[:, 3:6], gt_boxes[:, 3:6],
-                              pred_boxes[:, 6], gt_boxes[:, 6],
-                              consider_rotation=consider_rotation)  # [N, M]
-
-        # 对每个预测找到最大IoU的目标
-        max_ious, max_idx = ious.max(dim=1)
-
-        # 确定匹配
-        is_match = max_ious >= iou_thresh
-
-        # 处理重复匹配
-        gt_matched = torch.zeros(
-            len(gt_boxes), dtype=torch.bool, device=pred_boxes.device)
-        for i in range(len(pred_boxes)):
-            if is_match[i]:
-                gt_idx = max_idx[i]
-                if not gt_matched[gt_idx]:
-                    gt_matched[gt_idx] = True
-                else:
-                    is_match[i] = False
-
-        # 收集结果
-        all_scores.extend(scores.cpu().numpy())
-        all_matches.extend(is_match.cpu().numpy())
-
-    # 如果没有预测
-    if len(all_scores) == 0:
-        return 0.0
-
-    # 按分数降序排列
-    indices = np.argsort(-np.array(all_scores))
-    all_matches = np.array(all_matches)[indices]
-
-    # 计算精度和召回率
-    cum_tp = np.cumsum(all_matches)
-    cum_fp = np.cumsum(1 - all_matches)
-    precision = cum_tp / (cum_tp + cum_fp)
-
-    total_gt = sum(len(gt['box_xyz']) for gt in targets)
-    recall = cum_tp / total_gt if total_gt > 0 else np.zeros_like(cum_tp)
-
-    # 计算平均精度 (使用VOC方法的11点插值AP)
-    ap = 0
-    for t in np.arange(0, 1.1, 0.1):
-        if np.sum(recall >= t) == 0:
-            p = 0
-        else:
-            p = np.max(precision[recall >= t])
-        ap += p / 11
-
-    return ap
-
-
-def compute_3d_iou(centers1, centers2, sizes1, sizes2, angles1=None, angles2=None, consider_rotation=False):
-    """
-    计算两组3D边界框之间的IoU
-
-    Args:
-        centers1: 第一组框的中心点坐标 [N, 3]
-        centers2: 第二组框的中心点坐标 [M, 3]
-        sizes1: 第一组框的尺寸 [N, 3]
-        sizes2: 第二组框的尺寸 [M, 3]
-        angles1: 第一组框的旋转角度 [N] (如果考虑旋转)
-        angles2: 第二组框的旋转角度 [M] (如果考虑旋转)
-        consider_rotation: 是否考虑旋转
-
-    Returns:
-        IoU矩阵 [N, M]
-    """
-    # 确保所有输入都是float32类型，防止类型不匹配错误
-    centers1 = centers1.float()
-    centers2 = centers2.float()
-    sizes1 = sizes1.float()
-    sizes2 = sizes2.float()
-
-    if consider_rotation and angles1 is not None and angles2 is not None:
-        angles1 = angles1.float()
-        angles2 = angles2.float()
-
-    if not consider_rotation:
-        # 简化计算，不考虑旋转，只计算轴对齐的3D IoU
-        def get_box_min_max(centers, dimensions):
-            # 计算边界框的最小/最大坐标
-            half_dimensions = dimensions / 2
-            mins = centers - half_dimensions
-            maxs = centers + half_dimensions
-            return mins, maxs
-
-        # 获取两组边界框的最小/最大坐标
-        mins1, maxs1 = get_box_min_max(centers1, sizes1)  # [N, 3], [N, 3]
-        mins2, maxs2 = get_box_min_max(centers2, sizes2)  # [M, 3], [M, 3]
-
-        # 计算交集边界框的最小/最大坐标
-        mins1 = mins1.unsqueeze(1)  # [N, 1, 3]
-        maxs1 = maxs1.unsqueeze(1)  # [N, 1, 3]
-        mins2 = mins2.unsqueeze(0)  # [1, M, 3]
-        maxs2 = maxs2.unsqueeze(0)  # [1, M, 3]
-
-        intersect_mins = torch.max(mins1, mins2)  # [N, M, 3]
-        intersect_maxs = torch.min(maxs1, maxs2)  # [N, M, 3]
-
-        # 计算交集体积
-        intersect_dimensions = torch.clamp(
-            intersect_maxs - intersect_mins, min=0)  # [N, M, 3]
-        intersect_volumes = intersect_dimensions.prod(dim=2)  # [N, M]
-
-        # 计算两组边界框的体积
-        volumes1 = sizes1.prod(dim=1).unsqueeze(1)  # [N, 1]
-        volumes2 = sizes2.prod(dim=1).unsqueeze(0)  # [1, M]
-
-        # 计算并集体积
-        union_volumes = volumes1 + volumes2 - intersect_volumes  # [N, M]
-
-        # 计算IoU
-        iou = intersect_volumes / (union_volumes + 1e-7)  # [N, M]
-    else:
-        # 考虑旋转的3D IoU计算 - 使用近似方法
-        # 计算中心点距离
-        center_dist = torch.cdist(centers1, centers2)  # [N, M]
-
-        # 计算角度差异的影响因子
-        if angles1 is not None and angles2 is not None:
-            rot1 = angles1.squeeze(-1).unsqueeze(1).expand(-1,
-                                                           centers2.size(0))  # [N, M]
-            # [N, M]
-            rot2 = angles2.squeeze(-1).unsqueeze(0).expand(centers1.size(0), -1)
-            angle_diff = torch.abs(rot1 - rot2)  # [N, M]
-            # 将角度差异限制在[0, π/2]范围内
-            angle_diff = torch.min(angle_diff, torch.abs(
-                angle_diff - torch.tensor(3.14159, device=angle_diff.device)))
-            angle_factor = torch.cos(angle_diff)  # [N, M] 角度差异影响因子
-        else:
-            # 如果没有提供角度信息，则假设所有框都是同向的
-            angle_factor = torch.ones((centers1.size(0), centers2.size(0)),
-                                      device=centers1.device)
-
-        # 计算两组边界框的体积
-        volumes1 = sizes1.prod(dim=1).unsqueeze(1)  # [N, 1]
-        volumes2 = sizes2.prod(dim=1).unsqueeze(0)  # [1, M]
-
-        # 计算近似的交集体积
-        # 1. 判断中心点距离是否小于两个框大小之和的一半
-        size_sum = (sizes1.norm(dim=1).unsqueeze(1) +
-                    sizes2.norm(dim=1).unsqueeze(0)) / 2  # [N, M]
-
-        # 2. 如果中心距离过大，则IoU为0
-        mask = (center_dist < size_sum)  # [N, M]
-
-        # 3. 根据尺寸重叠程度和角度差异估计交集体积
-        dim1 = sizes1.unsqueeze(1)  # [N, 1, 3]
-        dim2 = sizes2.unsqueeze(0)  # [1, M, 3]
-
-        # 计算轴对齐的交集体积（不考虑旋转）
-        min_dims = torch.min(dim1, dim2)  # [N, M, 3]
-        max_dims = torch.max(dim1, dim2)  # [N, M, 3]
-
-        # 体积交集比估计 (0-1之间)
-        vol_ratio = min_dims.prod(
-            dim=2) / max_dims.prod(dim=2).clamp(min=1e-7)  # [N, M]
-
-        # 综合考虑角度差异和体积交集
-        intersect_ratio = vol_ratio * (0.5 + 0.5 * angle_factor)  # [N, M]
-
-        # 估计交集体积
-        mean_volumes = (volumes1 + volumes2) / 2  # [N, M]
-        intersect_volumes = intersect_ratio * mean_volumes  # [N, M]
-
-        # 应用遮罩：如果中心距离过大，则交集为0
-        intersect_volumes = intersect_volumes * mask.float()
-
-        # 计算并集体积
-        union_volumes = volumes1 + volumes2 - intersect_volumes  # [N, M]
-
-        # 计算IoU
-        iou = intersect_volumes / (union_volumes + 1e-7)  # [N, M]
-
-    return iou
-
+# --- Main Evaluation Entry Point ---
 
 def evaluate_3d_detection(
-    checkpoint_path,
-    version='v1.0-mini',
-    dataroot='/data/nuscenes',
-    gpuid=0,
-    H=900, W=1600,
-    resize_lim=(0.193, 0.225),
-    final_dim=(128, 352),
-    bot_pct_lim=(0.0, 0.22),
-    rot_lim=(-5.4, 5.4),
-    rand_flip=False,
-    ncams=5,
-    xbound=[-50.0, 50.0, 0.5],
-    ybound=[-50.0, 50.0, 0.5],
-    zbound=[-10.0, 10.0, 20.0],
-    dbound=[4.0, 45.0, 1.0],
-    bsz=4,
-    nworkers=0,
-    num_classes=10,
-    amp=True,
-    consider_rotation=True,
-    iou_thresholds=[0.5, 0.7],
-    class_names=None,
-    verbose=True,
+    modelf: str,
+    version: str = 'v1.0-mini',
+    dataroot: str = '/data/nuscenes',  # IMPORTANT: Set correct path
+    gpuid: int = 0,
+    # Image dimensions (used for data loading config)
+    H: int = 900, W: int = 1600,
+    # Data Augmentation settings (match training)
+    resize_lim: tuple = (0.193, 0.225),
+    final_dim: tuple = (128, 352),
+    bot_pct_lim: tuple = (0.0, 0.22),
+    rot_lim: tuple = (-5.4, 5.4),
+    rand_flip: bool = False,
+    ncams: int = 6,  # Default nuScenes setup uses 6 cameras
+    # Grid configuration (match training)
+    xbound: list = [-50.0, 50.0, 0.5],  # [min, max, resolution]
+    ybound: list = [-50.0, 50.0, 0.5],
+    zbound: list = [-10.0, 10.0, 20.0],  # Usually large Z range for BEV
+    dbound: list = [4.0, 45.0, 1.0],    # Depth bins [min, max, step]
+    # Dataloader settings
+    bsz: int = 4,
+    nworkers: int = 4,  # Adjust based on your system
+    # Model settings
+    # Number of classes model predicts (excluding background)
+    num_classes: int = 10,
+    # Type of model architecture ('lss', 'beve', 'fusion', ...)
+    model_type: str = 'beve',
+    # Evaluation settings
+    amp: bool = True,  # Use Automatic Mixed Precision
+    output_dir: str = './eval_output',  # Directory for saving results
+    verbose: bool = True,
+    score_thresh: float = 0.2,  # Add score threshold parameter
 ):
     """
-    使用保存的模型检查点评估3D检测性能
+    Evaluates a 3D object detection model using a saved checkpoint and the
+    official nuScenes evaluation protocol.
+
     Args:
-        checkpoint_path: 模型检查点路径
-        version: 数据集版本
-        dataroot: 数据集根目录
-        gpuid: GPU ID
-        H, W: 原始图像高度和宽度
-        resize_lim: 调整大小的限制
-        final_dim: 最终图像尺寸
-        bot_pct_lim: 底部百分比限制
-        rot_lim: 旋转限制
-        rand_flip: 是否随机翻转
-        ncams: 相机数量
-        xbound, ybound, zbound, dbound: 边界设置
-        bsz: 批次大小
-        nworkers: 数据加载器的工作线程数
-        num_classes: 类别数量
-        amp: 是否使用混合精度
-        consider_rotation: 是否在IoU计算中考虑旋转
-        iou_thresholds: IoU阈值列表
-        class_names: 类别名称字典，格式为 {class_id: class_name}
-        verbose: 是否打印详细信息
+        checkpoint_path: Path to the model checkpoint (.pth) file.
+        version: nuScenes dataset version (e.g., 'v1.0-mini', 'v1.0-trainval').
+        dataroot: Root directory of the nuScenes dataset.
+        gpuid: GPU ID to use for evaluation (-1 for CPU).
+        H, W: Original image height and width.
+        resize_lim, final_dim, bot_pct_lim, rot_lim, rand_flip: Data augmentation parameters
+                                                               (should match training).
+        ncams: Number of cameras used per sample.
+        xbound, ybound, zbound, dbound: BEV grid configuration.
+        bsz: Batch size for the validation dataloader.
+        nworkers: Number of worker processes for the dataloader.
+        num_classes: Number of object classes the model predicts (excluding background).
+        model_type: The architecture type of the model being loaded.
+        amp: Whether to use Automatic Mixed Precision during inference.
+        output_dir: Directory where evaluation results (JSON, logs) will be saved.
+        verbose: If True, prints detailed progress and results.
+        score_thresh: Minimum score threshold to keep a detection.
+
     Returns:
-        dict: 包含各项评估指标的字典
+        Dict[str, Any]: A dictionary containing the official nuScenes metrics (mAP, NDS, etc.).
     """
-    from nuscenes.utils.data_classes import Box
     from .models import compile_model
-    from .data import compile_data
+    from .data import compile_data  # Ensure this returns sample_tokens
 
-    # 设置默认类别名称
-    if class_names is None:
-        class_names = {
-            1: 'Car',
-            2: 'Truck',
-            3: 'Bus',
-            4: 'Trailer',
-            5: 'Construction',
-            6: 'Pedestrian',
-            7: 'Motorcycle',
-            8: 'Bicycle',
-            9: 'Traffic Cone'
-        }
-
-    grid_conf = {
-        'xbound': xbound,
-        'ybound': ybound,
-        'zbound': zbound,
-        'dbound': dbound,
-    }
-    data_aug_conf = {
-        'resize_lim': resize_lim,
-        'final_dim': final_dim,
-        'rot_lim': rot_lim,
-        'H': H, 'W': W,
-        'rand_flip': rand_flip,
-        'bot_pct_lim': bot_pct_lim,
-        'cams': ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
-        'Ncams': ncams,
-    }
-
-    # 加载验证数据
-    _, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
-                                grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
-                                parser_name='detection3d')
-
+    # --- Setup ---
+    os.makedirs(output_dir, exist_ok=True)
     device = torch.device(
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
-    # 加载模型
-    if verbose:
-        print(f"Loading model from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    grid_conf = {
+        'xbound': xbound, 'ybound': ybound, 'zbound': zbound, 'dbound': dbound,
+    }
+    data_aug_conf = {
+        'resize_lim': resize_lim, 'final_dim': final_dim, 'rot_lim': rot_lim,
+        'H': H, 'W': W, 'rand_flip': rand_flip, 'bot_pct_lim': bot_pct_lim,
+        'cams': ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'][:ncams],  # Select correct cameras
+        'Ncams': ncams,
+    }
 
-    # 使用正确的参数初始化模型
-    # 对于3D检测任务，outC应该是num_classes*9
+    # Determine evaluation set name based on version string
+    eval_set = 'val' if 'mini' not in version else 'mini_val'
+    print(
+        f"Evaluating on nuScenes dataset version: {version}, split: {eval_set}")
+
+    # --- Data Loading ---
+    print("Loading validation data...")
+    # IMPORTANT: Ensure your compile_data function and the specified parser
+    # return the sample_token for each sample in the batch.
+    # The parser name 'nuScenes' is assumed here. Modify if yours is different.
+    try:
+        # Ensure compile_data does not return trainloader if only valloader is needed
+        # Assuming compile_data can return just valloader based on flags or arguments
+        # Modify this call if compile_data always returns both
+        _, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
+                                    grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
+                                    parser_name='nuScenes',  # Ensure this parser yields sample_token
+                                    # shuffle_train=False # Fix Linter Error: Remove unknown argument
+                                    )
+        print("Validation data loaded.")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        print("Please ensure 'compile_data' with parser_name='nuScenes' is correctly implemented")
+        print(
+            "and returns (trainloader, valloader) where valloader yields batches containing")
+        print(
+            "(imgs, rots, trans, intrins, post_rots, post_trans, target_maps, sample_tokens)")
+        raise
+
+    # --- Model Loading ---
+    print(f"Loading model checkpoint from: {modelf}")
+    try:
+        checkpoint = torch.load(
+            modelf, map_location='cpu')  # Load to CPU first
+        print("Checkpoint loaded.")
+    except FileNotFoundError:
+        print(f"Error: Checkpoint file not found at {modelf}")
+        raise
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        raise
+
+    # Compile model architecture - outC is handled internally by BEVENet based on num_classes
+    # Pass the correct model_type specified by the user
+    print(
+        f"Compiling model architecture: {model_type} with {num_classes} classes...")
     model = compile_model(grid_conf, data_aug_conf,
-                          outC=num_classes*9, model='beve', num_classes=num_classes)
+                          outC=num_classes * 9,  # Pass expected outC, model will adapt
+                          model=model_type,
+                          num_classes=num_classes)
 
     if model is None:
-        raise ValueError("模型初始化失败，请检查compile_model函数")
+        raise ValueError(
+            f"Model compilation failed for type '{model_type}'. Check 'compile_model'.")
+    print("Model compiled.")
 
-    # 加载权重
+    # Load model state dictionary
+    print("Loading model weights...")
     if 'state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['state_dict'])
+        state_dict = checkpoint['state_dict']
     elif 'net' in checkpoint:
-        model.load_state_dict(checkpoint['net'])
+        state_dict = checkpoint['net']
     else:
-        model.load_state_dict(checkpoint)
+        state_dict = checkpoint  # Assume checkpoint is the state_dict itself
+
+    # Handle potential DataParallel/DistributedDataParallel prefixes
+    cleaned_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            cleaned_state_dict[k[7:]] = v  # remove 'module.' prefix
+        else:
+            cleaned_state_dict[k] = v
+
+    try:
+        model.load_state_dict(cleaned_state_dict)
+        print("Model weights loaded successfully.")
+    except RuntimeError as e:
+        print(f"Error loading state_dict: {e}")
+        print("This might be due to architecture mismatch or incorrect checkpoint format.")
+        # Optionally print model keys and checkpoint keys for comparison
+        # print("Model Keys:", list(model.state_dict().keys()))
+        # print("Checkpoint Keys:", list(cleaned_state_dict.keys()))
+        raise
 
     model.to(device)
-    model.eval()
+    model.eval()  # Set model to evaluation mode
 
-    # 收集预测和目标
-    all_predictions = []
-    all_targets = []
+    # --- Run Inference and Collect Predictions (Modified for Batch Processing) ---
+    print("Starting inference on validation set...")
+    all_pred_scores = []
+    all_pred_cls = []
+    all_pred_xyz = []
+    all_pred_wlh = []
+    all_pred_rot_sincos = []
+    all_pred_vel = []
+    all_pred_sample_tokens = []
+    all_tokens_processed = []  # New list to store *all* sample tokens processed
 
     with torch.no_grad():
-        for imgs, rots, trans, intrins, post_rots, post_trans, targets in tqdm(valloader, desc="Evaluating", disable=not verbose):
-            # 使用上下文管理器进行混合精度计算
+        for i, data_batch in enumerate(tqdm(valloader, desc="Evaluating", disable=not verbose)):
+            # Ensure the batch structure matches expectations (including sample_token)
+            try:
+                # Adjust unpacking based on what valloader yields
+                imgs, rots, trans, intrins, post_rots, post_trans, target_maps, sample_tokens = data_batch
+            except ValueError as e:
+                print(
+                    f"Error unpacking data batch {i}. Expected 8 items, got {len(data_batch)}.")
+                print(f"Original error: {e}")
+                print("Make sure your dataloader yields: ")
+                print(
+                    "(imgs, rots, trans, intrins, post_rots, post_trans, target_maps, sample_tokens)")
+                raise ValueError("Dataloader batch format mismatch.") from e
+
+            # Add all sample tokens from this batch to the master list
+            all_tokens_processed.extend(sample_tokens)
+
+            # Move data to device
+            imgs = imgs.to(device)
+            rots = rots.to(device)
+            trans = trans.to(device)
+            intrins = intrins.to(device)
+            post_rots = post_rots.to(device)
+            post_trans = post_trans.to(device)
+            # Targets are not used for inference
+
+            # Perform inference with AMP if enabled
             if amp and device.type == 'cuda':
-                with torch.cuda.amp.autocast():
-                    preds = model(imgs.to(device),
-                                  rots.to(device),
-                                  trans.to(device),
-                                  intrins.to(device),
-                                  post_rots.to(device),
-                                  post_trans.to(device),
-                                  )
+                # Fix Linter Error: Correct autocast usage with explicit import
+                # Removed device_type as it's inferred for cuda
+                with autocast(dtype=torch.float16):
+                    preds_dict = model(imgs, rots, trans,
+                                       intrins, post_rots, post_trans)
             else:
-                preds = model(imgs.to(device),
-                              rots.to(device),
-                              trans.to(device),
-                              intrins.to(device),
-                              post_rots.to(device),
-                              post_trans.to(device),
-                              )
+                preds_dict = model(imgs, rots, trans,
+                                   intrins, post_rots, post_trans)
 
-            # 收集预测和目标
-            batch_dets = decode_predictions(preds, device)
-            batch_gts = decode_targets(targets, device)
+            # Call decode_predictions with the grid configuration
+            batch_dets_list = decode_predictions(
+                preds_dict, device, score_thresh, grid_conf
+            )
 
-            all_predictions.extend(batch_dets)
-            all_targets.extend(batch_gts)
+            # Collect tensors and map detections to sample tokens
+            for sample_idx, dets_dict in enumerate(batch_dets_list):
+                num_dets_in_sample = dets_dict['box_scores'].shape[0]
+                if num_dets_in_sample > 0:
+                    all_pred_scores.append(dets_dict['box_scores'])
+                    all_pred_cls.append(dets_dict['box_cls'])
+                    all_pred_xyz.append(dets_dict['box_xyz'])
+                    all_pred_wlh.append(dets_dict['box_wlh'])
+                    all_pred_rot_sincos.append(dets_dict['box_rot_sincos'])
+                    all_pred_vel.append(dets_dict['box_vel'])
+                    # Repeat the sample token for each detection in this sample
+                    all_pred_sample_tokens.extend(
+                        [sample_tokens[sample_idx]] * num_dets_in_sample)
 
-    # 计算各项评估指标
-    results = calculate_map(all_predictions, all_targets,
-                            iou_thresholds=iou_thresholds,
-                            num_classes=num_classes,
-                            consider_rotation=consider_rotation)
+    # Concatenate all collected tensors into a dictionary
+    if not all_pred_scores:
+        print("Warning: No detections found across the entire validation set.")
+        all_predictions_dict = {}  # Use the new name - dict will be empty
+    else:
+        # Store as numpy arrays directly after concatenation and moving to CPU
+        all_predictions_dict = {
+            'box_scores': torch.cat(all_pred_scores).cpu().numpy(),
+            'box_cls': torch.cat(all_pred_cls).cpu().numpy(),
+            'box_xyz': torch.cat(all_pred_xyz).cpu().numpy(),
+            'box_wlh': torch.cat(all_pred_wlh).cpu().numpy(),
+            'box_rot_sincos': torch.cat(all_pred_rot_sincos).cpu().numpy(),
+            'box_vel': torch.cat(all_pred_vel).cpu().numpy(),
+            'sample_tokens': all_pred_sample_tokens  # Keep as list
+        }
+        print(
+            f"Inference complete. Collected {len(all_predictions_dict['sample_tokens'])} total detections across samples.")
 
-    # 替换类别ID为类别名称
-    for iou_thresh in iou_thresholds:
-        renamed_aps = {}
-        for cls_id, ap in results['class_aps'][f'AP@{iou_thresh:.1f}'].items():
-            cls_name = class_names.get(cls_id, f"Class {cls_id}")
-            renamed_aps[cls_name] = ap
-        results['class_aps'][f'AP@{iou_thresh:.1f}'] = renamed_aps
+    # --- Run Official nuScenes Evaluation ---
+    print("Starting official nuScenes evaluation...")
+    # Construct the full version string required by NuScenes class
+    full_version = f'v1.0-{version}'
+    # Updated call to evaluate_with_nuscenes
+    results_dict = evaluate_with_nuscenes(
+        predictions_dict=all_predictions_dict,
+        nuscenes_version=full_version,  # Pass the constructed full version string
+        nuscenes_dataroot=dataroot,
+        eval_set=eval_set,
+        output_dir=output_dir,
+        verbose=verbose,
+        all_sample_tokens=all_tokens_processed  # Pass the complete list of tokens
+    )
+    print("Evaluation finished.")
 
-    # 添加类别名称
-    results['class_names'] = class_names
-
-    # 打印评估结果
-    if verbose:
-        print("\n===== 3D Detection Evaluation Results =====")
-        for key, value in results.items():
-            if key.startswith('mAP'):
-                print(f"{key}: {value:.4f}")
-
-        print("\n----- Per-class AP@0.5 -----")
-        for cls_name, ap in results['class_aps']['AP@0.5'].items():
-            print(f"{cls_name}: {ap:.4f}")
-
-    return results
+    return results_dict
+# --- End of File ---

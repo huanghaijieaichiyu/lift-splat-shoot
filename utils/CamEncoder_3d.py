@@ -1,7 +1,7 @@
 import torch.nn as nn
 
-from models.RepVit import RepViTBlock
-from .common import Conv, SPPF, C2f
+from utils.RepVit import RepViTBlock
+from utils.common import Conv, SPPF, C2f
 
 
 class CamEncoder_3d(nn.Module):
