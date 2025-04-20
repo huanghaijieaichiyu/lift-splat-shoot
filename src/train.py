@@ -1,9 +1,3 @@
-"""
-Copyright (C) 2020 NVIDIA Corporation.  All rights reserved.
-Licensed under the NVIDIA Source Code License. See LICENSE at https://github.com/nv-tlabs/lift-splat-shoot.
-Authors: Jonah Philion and Sanja Fidler
-"""
-
 import torch
 import torch.nn as nn
 import time  # 直接导入time模块
@@ -154,6 +148,7 @@ def train(version,
     while epoch < nepochs:
         np.random.seed()
         Iou = [0.0]  # 初始化为浮点数
+        t0, t1 = 0.0, 0.0  # Initialize time variables
         pbar = tqdm(enumerate(trainloader), total=len(
             trainloader), colour='#8762A5')
 
@@ -224,7 +219,7 @@ def train(version,
 
 def train_3d(version,
              dataroot='/data/nuscenes',
-             nepochs=10000,
+             nepochs=100,
              gpuid=0,
              cuDNN=False,
              resume='',
@@ -236,19 +231,19 @@ def train_3d(version,
              bot_pct_lim=(0.0, 0.22),
              rot_lim=(-5.4, 5.4),
              rand_flip=True,
-             ncams=5,
+             ncams=6,
              max_grad_norm=5.0,
              logdir='./runs_3d',
 
              xbound=[-50.0, 50.0, 0.5],
              ybound=[-50.0, 50.0, 0.5],
-             zbound=[-10.0, 10.0, 20.0],
+             zbound=[-5.0, 3.0, 0.5],
              dbound=[4.0, 45.0, 1.0],
 
              bsz=4,
-             nworkers=0,
+             nworkers=4,
              lr=1e-3,
-             weight_decay=1e-7,
+             weight_decay=5e-5,
              num_classes=10,
              enable_multiscale=True,  # 支持多尺度特征训练
              use_enhanced_bev=True,   # 使用增强的BEV投影
@@ -330,12 +325,11 @@ def train_3d(version,
     # 检查如果启用了多尺度训练，打印一条警告信息但不影响程序运行
 
     # 损失函数
-    from .tools import Detection3DLoss
+    from .tools import DetectionBEVLoss
     # 初始化损失函数，只使用支持的参数
-    loss_fn = Detection3DLoss(num_classes=num_classes,
-                              cls_weight=1.0,
-                              reg_weight=1.0,
-                              iou_weight=1.0).to(device)
+    loss_fn = DetectionBEVLoss(num_classes=num_classes,
+                               cls_weight=1.0,
+                               iou_weight=1.0).to(device)
 
     if resume != '':
         path = os.path.dirname(resume)
@@ -377,8 +371,12 @@ def train_3d(version,
         model.train()
         epoch_loss = 0
         epoch_cls_loss = 0
-        epoch_reg_loss = 0
         epoch_iou_loss = 0
+        # Add accumulators for new regression loss components
+        epoch_bev_diou_loss = 0.0
+        epoch_z_loss = 0.0
+        epoch_h_loss = 0.0
+        epoch_vel_loss = 0.0
 
         # 多尺度训练相关指标
         if enable_multiscale:
@@ -417,8 +415,12 @@ def train_3d(version,
 
                 total_loss = losses['total_loss']
                 cls_loss = losses['cls_loss']
-                reg_loss = losses['reg_loss']
-                iou_loss = losses['iou_loss']
+                iou_loss = losses.get('iou_loss', torch.tensor(0.0))
+                # Get individual regression losses
+                bev_diou_loss = losses.get('bev_diou_loss', torch.tensor(0.0))
+                z_loss = losses.get('z_loss', torch.tensor(0.0))
+                h_loss = losses.get('h_loss', torch.tensor(0.0))
+                vel_loss = losses.get('vel_loss', torch.tensor(0.0))
 
                 # 多尺度损失
                 if enable_multiscale and 'scale_losses' in losses:
@@ -439,8 +441,12 @@ def train_3d(version,
 
             epoch_loss += total_loss.item()
             epoch_cls_loss += cls_loss.item()
-            epoch_reg_loss += reg_loss.item()
             epoch_iou_loss += iou_loss.item()
+            # Accumulate new regression losses
+            epoch_bev_diou_loss += bev_diou_loss.item()
+            epoch_z_loss += z_loss.item()
+            epoch_h_loss += h_loss.item()
+            epoch_vel_loss += vel_loss.item()
 
             # 多尺度训练相关指标
             if enable_multiscale and 'scale_losses' in losses:
@@ -451,9 +457,10 @@ def train_3d(version,
             t1 = time.time()  # 确保是浮点数
 
             # 构建进度条描述
-            desc = '||Epoch: [%d/%d]|Loss: %.4f|Cls: %.4f|Reg: %.4f|IoU: %.4f||' % (
+            desc = '||Epoch: [%d/%d]|Loss: %.4f|Cls: %.4f|BEV: %.4f|Z: %.4f|H: %.4f|Vel: %.4f|IoU: %.4f||' % (
                 epoch + 1, nepochs, total_loss.item(), cls_loss.item(),
-                reg_loss.item(), iou_loss.item()
+                bev_diou_loss.item(), z_loss.item(), h_loss.item(),
+                vel_loss.item(), iou_loss.item()
             )
 
             # 如果启用多尺度训练，添加多尺度损失信息
@@ -471,9 +478,16 @@ def train_3d(version,
                           len(trainloader), epoch + 1)
         writer.add_scalar('train/cls_loss', epoch_cls_loss /
                           len(trainloader), epoch + 1)
-        writer.add_scalar('train/reg_loss', epoch_reg_loss /
-                          len(trainloader), epoch + 1)
         writer.add_scalar('train/iou_loss', epoch_iou_loss /
+                          len(trainloader), epoch + 1)
+        # Log new regression losses
+        writer.add_scalar('train/bev_diou_loss',
+                          epoch_bev_diou_loss / len(trainloader), epoch + 1)
+        writer.add_scalar('train/z_loss', epoch_z_loss /
+                          len(trainloader), epoch + 1)
+        writer.add_scalar('train/h_loss', epoch_h_loss /
+                          len(trainloader), epoch + 1)
+        writer.add_scalar('train/vel_loss', epoch_vel_loss /
                           len(trainloader), epoch + 1)
 
         # 记录多尺度训练损失
@@ -503,8 +517,12 @@ def train_3d(version,
             model.eval()
             val_loss = 0
             val_cls_loss = 0
-            val_reg_loss = 0
             val_iou_loss = 0
+            # Add accumulators for validation losses
+            val_bev_diou_loss = 0.0
+            val_z_loss = 0.0
+            val_h_loss = 0.0
+            val_vel_loss = 0.0
 
             # 多尺度验证相关指标
             if enable_multiscale:
@@ -535,8 +553,17 @@ def train_3d(version,
 
                         val_loss += losses['total_loss'].item()
                         val_cls_loss += losses['cls_loss'].item()
-                        val_reg_loss += losses['reg_loss'].item()
-                        val_iou_loss += losses['iou_loss'].item()
+                        val_iou_loss += losses.get('iou_loss',
+                                                   torch.tensor(0.0)).item()
+                        # Accumulate new validation regression losses
+                        val_bev_diou_loss += losses.get(
+                            'bev_diou_loss', torch.tensor(0.0)).item()
+                        val_z_loss += losses.get('z_loss',
+                                                 torch.tensor(0.0)).item()
+                        val_h_loss += losses.get('h_loss',
+                                                 torch.tensor(0.0)).item()
+                        val_vel_loss += losses.get('vel_loss',
+                                                   torch.tensor(0.0)).item()
 
                         # 多尺度验证相关指标
                         if enable_multiscale and 'scale_losses' in losses:
@@ -546,14 +573,23 @@ def train_3d(version,
             # 计算平均损失
             val_loss /= len(valloader)
             val_cls_loss /= len(valloader)
-            val_reg_loss /= len(valloader)
             val_iou_loss /= len(valloader)
+            # Calculate average validation regression losses
+            val_bev_diou_loss /= len(valloader)
+            val_z_loss /= len(valloader)
+            val_h_loss /= len(valloader)
+            val_vel_loss /= len(valloader)
 
             # 记录验证损失
             writer.add_scalar('val/loss', val_loss, epoch + 1)
             writer.add_scalar('val/cls_loss', val_cls_loss, epoch + 1)
-            writer.add_scalar('val/reg_loss', val_reg_loss, epoch + 1)
             writer.add_scalar('val/iou_loss', val_iou_loss, epoch + 1)
+            # Log new validation regression losses
+            writer.add_scalar('val/bev_diou_loss',
+                              val_bev_diou_loss, epoch + 1)
+            writer.add_scalar('val/z_loss', val_z_loss, epoch + 1)
+            writer.add_scalar('val/h_loss', val_h_loss, epoch + 1)
+            writer.add_scalar('val/vel_loss', val_vel_loss, epoch + 1)
 
             # 记录多尺度验证损失
             if enable_multiscale:
@@ -561,6 +597,44 @@ def train_3d(version,
                     avg_loss = loss / len(valloader)
                     writer.add_scalar(
                         f'val/scale{i+3}_loss', avg_loss, epoch + 1)
+
+            # --- 添加可视化 ---
+            visualized_this_epoch = False  # Flag to visualize only once per epoch
+            with torch.no_grad():
+                # Iterate through val loader again or use the last batch?
+                # For simplicity, let's just use the *last* batch from the loop above
+                # Note: preds and imgs here are from the *last* val batch
+                if not visualized_this_epoch and imgs is not None and preds is not None:
+                    try:
+                        # 1. Visualize Input Image (Front Camera)
+                        # Assuming standard nuScenes camera order (CAM_FRONT is index 1)
+                        vis_idx = 0  # Visualize the first sample in the batch
+                        front_cam_idx = 1
+                        if imgs.shape[1] > front_cam_idx:
+                            input_img_sample = imgs[vis_idx,
+                                                    front_cam_idx].cpu()
+                            writer.add_image(
+                                'val/input_front_camera', input_img_sample, global_step=epoch + 1)
+
+                        # 2. Visualize BEV Prediction Heatmap
+                        # Shape [C, H_bev, W_bev]
+                        cls_pred_sample = preds['cls_pred'][vis_idx].cpu()
+                        # Get max probability across classes
+                        bev_heatmap = torch.max(torch.softmax(cls_pred_sample, dim=0), dim=0)[
+                            0]  # Shape [H_bev, W_bev]
+                        # Normalize 0-1
+                        bev_heatmap = (bev_heatmap - bev_heatmap.min()) / \
+                            (bev_heatmap.max() - bev_heatmap.min() + 1e-6)
+                        writer.add_image(
+                            'val/bev_prediction_heatmap', bev_heatmap.unsqueeze(0), global_step=epoch + 1)
+
+                        # 3. Visualize Depth Map (Optional - requires model modification or recalculation)
+                        # This part is omitted for now as it requires accessing intermediate model outputs.
+
+                        visualized_this_epoch = True  # Ensure visualization happens only once
+                    except Exception as e:
+                        print(f"Warning: Failed to add visualization: {e}")
+            # --- 可视化结束 ---
 
             # 评估mAP
             from .evaluate_3d import decode_predictions, decode_targets
@@ -823,11 +897,10 @@ def train_fusion(version,
     )
 
     # 损失函数
-    from .tools import Detection3DLoss
-    loss_fn = Detection3DLoss(num_classes=num_classes,
-                              cls_weight=1.0,
-                              reg_weight=1.0,
-                              iou_weight=1.0).to(device)
+    from .tools import DetectionBEVLoss
+    loss_fn = DetectionBEVLoss(num_classes=num_classes,
+                               cls_weight=1.0,
+                               iou_weight=1.0).to(device)
 
     if resume != '':
         path = os.path.dirname(resume)
@@ -869,8 +942,8 @@ def train_fusion(version,
         model.train()
         epoch_loss = 0
         epoch_cls_loss = 0
-        epoch_reg_loss = 0
         epoch_iou_loss = 0
+        # Add accumulators for new regression loss components
 
         # 多尺度训练相关指标
         if enable_multiscale:
@@ -1060,6 +1133,44 @@ def train_fusion(version,
                     avg_loss = loss / len(valloader)
                     writer.add_scalar(
                         f'val/scale{i+3}_loss', avg_loss, epoch + 1)
+
+            # --- 添加可视化 ---
+            visualized_this_epoch = False  # Flag to visualize only once per epoch
+            with torch.no_grad():
+                # Iterate through val loader again or use the last batch?
+                # For simplicity, let's just use the *last* batch from the loop above
+                # Note: preds and imgs here are from the *last* val batch
+                if not visualized_this_epoch and imgs is not None and preds is not None:
+                    try:
+                        # 1. Visualize Input Image (Front Camera)
+                        # Assuming standard nuScenes camera order (CAM_FRONT is index 1)
+                        vis_idx = 0  # Visualize the first sample in the batch
+                        front_cam_idx = 1
+                        if imgs.shape[1] > front_cam_idx:
+                            input_img_sample = imgs[vis_idx,
+                                                    front_cam_idx].cpu()
+                            writer.add_image(
+                                'val/input_front_camera', input_img_sample, global_step=epoch + 1)
+
+                        # 2. Visualize BEV Prediction Heatmap
+                        # Shape [C, H_bev, W_bev]
+                        cls_pred_sample = preds['cls_pred'][vis_idx].cpu()
+                        # Get max probability across classes
+                        bev_heatmap = torch.max(torch.softmax(cls_pred_sample, dim=0), dim=0)[
+                            0]  # Shape [H_bev, W_bev]
+                        # Normalize 0-1
+                        bev_heatmap = (bev_heatmap - bev_heatmap.min()) / \
+                            (bev_heatmap.max() - bev_heatmap.min() + 1e-6)
+                        writer.add_image(
+                            'val/bev_prediction_heatmap', bev_heatmap.unsqueeze(0), global_step=epoch + 1)
+
+                        # 3. Visualize Depth Map (Optional - requires model modification or recalculation)
+                        # This part is omitted for now as it requires accessing intermediate model outputs.
+
+                        visualized_this_epoch = True  # Ensure visualization happens only once
+                    except Exception as e:
+                        print(f"Warning: Failed to add visualization: {e}")
+            # --- 可视化结束 ---
 
             # 评估mAP
             from .evaluate_3d import decode_predictions, decode_targets

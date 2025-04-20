@@ -1,4 +1,3 @@
-
 from .tools import gen_dx_bx, cumsum_trick
 import math
 
@@ -156,7 +155,8 @@ class LiftSplatShoot(nn.Module):
 
         self.downsample = 16
         self.camC = 64
-        self.frustum = self.create_frustum()
+        self.frustum = self.create_frustum(
+            fH=self.data_aug_conf['final_dim'][0], fW=self.data_aug_conf['final_dim'][1])
         self.D, _, _, _ = self.frustum.shape
         self.camencode = CamEncode(self.D, self.camC, self.downsample)
         self.bevencode = BevEncode(inC=self.camC, outC=outC)
@@ -379,20 +379,22 @@ class LiftSplatShoot(nn.Module):
         B, N, _, imH, imW = x.shape
 
         # 1. 获取相机特征，确定实际 H, W
-        cam_feats_output = self.camencode(x.view(B * N, 3, imH, imW))
-        # Shape: [B*N, C, D, H_actual, W_actual]
-        _BN, _C_cam, _D_cam, H_actual, W_actual = cam_feats_output.shape
-        # ^ Note: Assuming D dimension from camencode matches self.D from grid_conf
+        # get_cam_feats 内部会调用 camencode 处理深度和特征
+        cam_feats_output = self.get_cam_feats(x)
+        # 获取 cam_feats_output 的形状以确定 H_actual, W_actual
+        # Shape: [B, N, C, D, H_actual, W_actual]
+        _B, _N, _C, _D, H_actual, W_actual = cam_feats_output.shape
 
-        # 2. 动态创建 Frustum
+        # 2. 动态创建 Frustum (使用实际的 H, W)
         frustum = self.create_frustum(H_actual, W_actual)  # Pass actual H, W
 
         # 3. 计算几何变换 (Pass the dynamically created frustum)
-        geom_feats = self.get_geometry(
+        geom = self.get_geometry(
             frustum, rots, trans, intrins, post_rots, post_trans)
-        # geom_feats 形状: [B, N, D, H_actual, W_actual, 3]
+        # geom 形状: [B, N, D, H_actual, W_actual, 3]
 
         # 4. 准备相机矩阵字典 (移到这里，因为它被 DepthNet 使用)
+        # (将原来的步骤4-9移到这里，因为它们依赖于 B, N, H_actual, W_actual)
         mats_dict = {
             'sensor2ego_mats': torch.eye(4, device=rots.device).view(1, 1, 4, 4).repeat(B, N, 1, 1),
             'intrin_mats': torch.eye(4, device=intrins.device).view(1, 1, 4, 4).repeat(B, N, 1, 1),
@@ -404,9 +406,11 @@ class LiftSplatShoot(nn.Module):
         mats_dict['ida_mats'][:, :, :3, :3] = post_rots
         mats_dict['ida_mats'][:, :, :3, 3] = post_trans
 
-        # 5. 提取2D特征用于深度预测
-        cam_feats_2d = cam_feats_output.mean(dim=2)
-        # Shape: [B*N, C, H_actual, W_actual]
+        # 5. 提取2D特征用于深度预测 (需要从 cam_feats_output 转换)
+        # cam_feats_output: [B, N, C, D, H_actual, W_actual]
+        # 需要 [B*N, C, H_actual, W_actual]
+        cam_feats_2d = cam_feats_output.permute(0, 1, 2, 4, 5, 3).reshape(
+            B * N, self.camC, H_actual, W_actual, _D).mean(dim=-1)  # 取 D 维度平均
 
         # 6. 使用深度网络获取深度和上下文特征
         depth_feature = self._forward_depth_net(
@@ -420,6 +424,8 @@ class LiftSplatShoot(nn.Module):
         # Expected Shape: [B*N, C, H_actual, W_actual]
 
         # 8. 使用深度概率对上下文特征加权
+        # context 需要 unsqueeze(2) -> [B*N, C, 1, H, W]
+        # depth 需要 unsqueeze(1) -> [B*N, 1, D, H, W]
         weighted_x = depth.unsqueeze(1) * context.unsqueeze(2)
         # Expected Shape: [B*N, C, D, H_actual, W_actual]
 
@@ -427,8 +433,9 @@ class LiftSplatShoot(nn.Module):
         weighted_x = weighted_x.view(
             B, N, self.camC, self.D, H_actual, W_actual)
 
-        # 10. 应用体素池化
-        bev_feat = self.voxel_pooling(geom_feats, weighted_x)
+        # 10. 应用体素池化 (使用动态计算的 geom)
+        # voxel_pooling 输入 geom: [B, N, D, H, W, 3], x: [B, N, C, D, H, W]
+        bev_feat = self.voxel_pooling(geom, weighted_x)
 
         return bev_feat
 
@@ -634,11 +641,26 @@ class RepBEV_vit(nn.Module):
         # toggle using QuickCumsum vs. autograd
         self.use_quickcumsum = True
 
-    def create_frustum(self, fH, fW):
-        """创建视锥体，使用动态确定的特征图尺寸"""
-        # 获取图像原始尺寸 (可能不需要了，但保留以防万一)
+    def create_frustum(self, fH=None, fW=None):
+        """创建视锥体，使用动态确定的特征图尺寸 (或默认值)
+
+        Args:
+            fH (int | None): Actual feature map height. If None, calculated from config.
+            fW (int | None): Actual feature map width. If None, calculated from config.
+        """
         ogfH, ogfW = self.data_aug_conf['final_dim']
-        # fH, fW = ogfH // self.downsample, ogfW // self.downsample # No longer use self.downsample
+
+        # If fH, fW are not provided (e.g., compatibility with old calls), calculate defaults
+        # Assume a default downsampling if needed for calculation, though ideally fH/fW are passed.
+        if fH is None or fW is None:
+            print(
+                "Warning: create_frustum called without fH/fW. Using default calculation based on final_dim.")
+            # Use final_dim directly if no downsampling context is available
+            # This might be inaccurate if the caller expected downsampling
+            fH = ogfH
+            fW = ogfW
+            # If a downsample factor *was* intended by the caller, this needs revisiting.
+            # For BEVENet.get_voxels, fH/fW are passed correctly.
 
         # 创建深度范围 (使用 self.D)
         d_coords = torch.arange(
@@ -1004,33 +1026,37 @@ class BEVENet(nn.Module):
         self.bevencode = BEVEncoder_BEVE(inC=self.camC, outC=outC)
 
         # 添加3D检测头
-        if detection_head:
-            self.detection_head = DetectionHead_BEVE(
-                outC, num_classes=self.num_classes)
-
         # 添加特征增强模块
         self.ema = EMA(self.camC)
         self.feat_attn = PSA(self.camC, self.camC)
         self.feat_enhancement = True
 
     def create_frustum(self, fH=None, fW=None):
-        """创建视锥体，使用动态确定的特征图尺寸 (或默认值)"""
+        """创建视锥体，使用动态确定的特征图尺寸 (或默认值)
+
+        Args:
+            fH (int | None): Actual feature map height. If None, calculated from config.
+            fW (int | None): Actual feature map width. If None, calculated from config.
+        """
         ogfH, ogfW = self.data_aug_conf['final_dim']
 
-        # If fH, fW are not provided (e.g., called by old classes), calculate defaults
-        # This calculation might be inconsistent if self.downsample isn't defined, so add it back temporarily
-        # We rely on get_voxels passing the correct H_actual, W_actual
-        temp_downsample = 16  # Assume 16 if not defined
-        if fH is None:
-            fH = ogfH // temp_downsample
-        if fW is None:
-            fW = ogfW // temp_downsample
+        # If fH, fW are not provided (e.g., compatibility with old calls), calculate defaults
+        # Assume a default downsampling if needed for calculation, though ideally fH/fW are passed.
+        if fH is None or fW is None:
+            print(
+                "Warning: create_frustum called without fH/fW. Using default calculation based on final_dim.")
+            # Use final_dim directly if no downsampling context is available
+            # This might be inaccurate if the caller expected downsampling
+            fH = ogfH
+            fW = ogfW
+            # If a downsample factor *was* intended by the caller, this needs revisiting.
+            # For BEVENet.get_voxels, fH/fW are passed correctly.
 
         # 创建深度范围 (使用 self.D)
         d_coords = torch.arange(
             *self.grid_conf['dbound'], dtype=torch.float).view(-1, 1, 1).expand(-1, fH, fW)
 
-        # 创建像素坐标 (使用 fH, fW)
+        # 创建像素坐标 (使用 fH, fW and target image size ogfH, ogfW)
         x_coords = torch.linspace(
             0, ogfW - 1, fW, dtype=torch.float).view(1, 1, fW).expand(self.D, fH, fW)
         y_coords = torch.linspace(
@@ -1226,20 +1252,22 @@ class BEVENet(nn.Module):
         B, N, _, imH, imW = x.shape
 
         # 1. 获取相机特征，确定实际 H, W
-        cam_feats_output = self.camencode(x.view(B * N, 3, imH, imW))
-        # Shape: [B*N, C, D, H_actual, W_actual]
-        _BN, _C_cam, _D_cam, H_actual, W_actual = cam_feats_output.shape
-        # ^ Note: Assuming D dimension from camencode matches self.D from grid_conf
+        # get_cam_feats 内部会调用 camencode 处理深度和特征
+        cam_feats_output = self.get_cam_feats(x)
+        # 获取 cam_feats_output 的形状以确定 H_actual, W_actual
+        # Shape: [B, N, C, D, H_actual, W_actual]
+        _B, _N, _C, _D, H_actual, W_actual = cam_feats_output.shape
 
-        # 2. 动态创建 Frustum
+        # 2. 动态创建 Frustum (使用实际的 H, W)
         frustum = self.create_frustum(H_actual, W_actual)  # Pass actual H, W
 
         # 3. 计算几何变换 (Pass the dynamically created frustum)
-        geom_feats = self.get_geometry(
+        geom = self.get_geometry(
             frustum, rots, trans, intrins, post_rots, post_trans)
-        # geom_feats 形状: [B, N, D, H_actual, W_actual, 3]
+        # geom 形状: [B, N, D, H_actual, W_actual, 3]
 
         # 4. 准备相机矩阵字典 (移到这里，因为它被 DepthNet 使用)
+        # (将原来的步骤4-9移到这里，因为它们依赖于 B, N, H_actual, W_actual)
         mats_dict = {
             'sensor2ego_mats': torch.eye(4, device=rots.device).view(1, 1, 4, 4).repeat(B, N, 1, 1),
             'intrin_mats': torch.eye(4, device=intrins.device).view(1, 1, 4, 4).repeat(B, N, 1, 1),
@@ -1251,9 +1279,11 @@ class BEVENet(nn.Module):
         mats_dict['ida_mats'][:, :, :3, :3] = post_rots
         mats_dict['ida_mats'][:, :, :3, 3] = post_trans
 
-        # 5. 提取2D特征用于深度预测
-        cam_feats_2d = cam_feats_output.mean(dim=2)
-        # Shape: [B*N, C, H_actual, W_actual]
+        # 5. 提取2D特征用于深度预测 (需要从 cam_feats_output 转换)
+        # cam_feats_output: [B, N, C, D, H_actual, W_actual]
+        # 需要 [B*N, C, H_actual, W_actual]
+        cam_feats_2d = cam_feats_output.permute(0, 1, 2, 4, 5, 3).reshape(
+            B * N, self.camC, H_actual, W_actual, _D).mean(dim=-1)  # 取 D 维度平均
 
         # 6. 使用深度网络获取深度和上下文特征
         depth_feature = self._forward_depth_net(
@@ -1267,6 +1297,8 @@ class BEVENet(nn.Module):
         # Expected Shape: [B*N, C, H_actual, W_actual]
 
         # 8. 使用深度概率对上下文特征加权
+        # context 需要 unsqueeze(2) -> [B*N, C, 1, H, W]
+        # depth 需要 unsqueeze(1) -> [B*N, 1, D, H, W]
         weighted_x = depth.unsqueeze(1) * context.unsqueeze(2)
         # Expected Shape: [B*N, C, D, H_actual, W_actual]
 
@@ -1274,8 +1306,9 @@ class BEVENet(nn.Module):
         weighted_x = weighted_x.view(
             B, N, self.camC, self.D, H_actual, W_actual)
 
-        # 10. 应用体素池化
-        bev_feat = self.voxel_pooling(geom_feats, weighted_x)
+        # 10. 应用体素池化 (使用动态计算的 geom)
+        # voxel_pooling 输入 geom: [B, N, D, H, W, 3], x: [B, N, C, D, H, W]
+        bev_feat = self.voxel_pooling(geom, weighted_x)
 
         return bev_feat
 
@@ -1406,14 +1439,42 @@ class BEVEncoder_BEVE(nn.Module):
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         )
 
-        # 分类头 - 预测每个位置的类别
-        self.cls_head = Conv(128, self.num_classes, k=1)
+        # --- Refactored Detection Head ---
+        head_inter_channels = 128  # Intermediate channel size for head layers
 
-        # 回归头 - 预测边界框参数 (x,y,z,w,l,h,sin,cos,vel)
-        self.reg_head = Conv(128, 9, k=1)
+        # Classification Head
+        self.cls_head = nn.Sequential(
+            # 3x3 Conv + BN + ReLU (assuming Conv includes this)
+            Conv(128, head_inter_channels, k=3, p=1),
+            # Final 1x1 Conv: Output logits, no activation/BN
+            Conv(head_inter_channels, self.num_classes, k=1, act=False, bn=False)
+        )
 
-        # IoU头 - 预测检测质量
-        self.iou_head = Conv(128, 1, k=1)
+        # Regression Head
+        self.reg_head = nn.Sequential(
+            Conv(128, head_inter_channels, k=3, p=1),
+            # Final 1x1 Conv: Output 9 regression values, no activation/BN
+            Conv(head_inter_channels, 9, k=1, act=False, bn=False)
+        )
+
+        # IoU Head
+        self.iou_head = nn.Sequential(
+            Conv(128, head_inter_channels, k=3, p=1),
+            # Final 1x1 Conv: Output 1 IoU logit, no activation/BN
+            Conv(head_inter_channels, 1, k=1, act=False, bn=False)
+        )
+        # --- End Refactored Head ---
+
+        # # --- Original Simple Head ---
+        # # 分类头 - 预测每个位置的类别
+        # self.cls_head = Conv(128, self.num_classes, k=1)
+        #
+        # # 回归头 - 预测边界框参数 (x,y,z,w,l,h,sin,cos,vel)
+        # self.reg_head = Conv(128, 9, k=1)
+        #
+        # # IoU头 - 预测检测质量
+        # self.iou_head = Conv(128, 1, k=1)
+        # # --- End Original Simple Head ---
 
     def forward(self, x):
         x = self.layer1(x)
@@ -1435,13 +1496,3 @@ class BEVEncoder_BEVE(nn.Module):
             'reg_pred': reg_pred,
             'iou_pred': iou_pred
         }
-
-
-class DetectionHead_BEVE(nn.Module):
-    def __init__(self, inC, num_classes):
-        super(DetectionHead_BEVE, self).__init__()
-        self.num_classes = max(1, num_classes)  # 确保类别数至少为1
-        self.fc = nn.Linear(inC, self.num_classes)
-
-    def forward(self, x):
-        return self.fc(x)
