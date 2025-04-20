@@ -462,26 +462,18 @@ def compile_model(grid_conf, data_aug_conf, outC, model='vit', num_classes=10, l
         if model == 'lss':
             return LiftSplatShoot(grid_conf, data_aug_conf, outC)
         elif model == 'beve':
-            # 确保类别数至少为1
-            actual_num_classes = max(1, num_classes)
-            # 适应检测头的要求
-            if 'detection' in str(model).lower() or outC == actual_num_classes*9:
-                # 如果outC已经设置为类别数*9
-                return BEVENet(grid_conf, data_aug_conf, outC, num_classes=actual_num_classes, model_type='beve')
-            else:
-                # 默认情况下，为检测模型设置outC=num_classes*9
-                return BEVENet(grid_conf, data_aug_conf, actual_num_classes*9, num_classes=actual_num_classes, model_type='beve')
+            # --- 修改：直接使用传入的 num_classes 和 outC ---
+            print(
+                f"Compiling BEVENet with num_classes={num_classes}, received outC={outC}")
+            actual_num_classes = max(1, num_classes)  # 确保至少为1
+            # 直接将接收到的 num_classes 和 outC 传递给 BEVENet
+            # BEVENet 内部会处理 num_classes，outC 主要用于兼容性或未来扩展
+            return BEVENet(grid_conf, data_aug_conf, outC, num_classes=actual_num_classes, model_type='beve')
+            # --- 修改结束 ---
         elif model == 'fusion':
             # 使用多模态融合模型
             actual_num_classes = max(1, num_classes)
-            try:
-                # 导入多模态融合模型
-                from utils.MultiModalBEVENet import create_multimodal_bevenet
-                return create_multimodal_bevenet(grid_conf, data_aug_conf, actual_num_classes*9, actual_num_classes, lidar_channels)
-            except ImportError as e:
-                print(f"无法导入多模态融合模型: {e}")
-                print("回退到使用标准BEVENet模型")
-                return BEVENet(grid_conf, data_aug_conf, actual_num_classes*9, num_classes=actual_num_classes, model_type='beve')
+            return BEVENet(grid_conf, data_aug_conf, actual_num_classes*9, num_classes=actual_num_classes, model_type='beve')
         else:
             print(f"警告: 未知的模型类型 '{model}'。回退到使用标准BEVENet模型")
             actual_num_classes = max(1, num_classes)
@@ -1023,7 +1015,10 @@ class BEVENet(nn.Module):
         )
 
         # 使用纯卷积的BEV编码器
-        self.bevencode = BEVEncoder_BEVE(inC=self.camC, outC=outC)
+        # --- 修改：传递 num_classes 给 BEVEncoder_BEVE ---
+        self.bevencode = BEVEncoder_BEVE(
+            inC=self.camC, outC=self.outC, num_classes=self.num_classes)
+        # --- 修改结束 ---
 
         # 添加3D检测头
         # 添加特征增强模块
@@ -1409,11 +1404,11 @@ class CamEncoder_BEVE(nn.Module):
 
 
 class BEVEncoder_BEVE(nn.Module):
-    def __init__(self, inC, outC):
+    # --- 修改：接收 num_classes 参数，并移除对 outC 的错误依赖 ---
+    def __init__(self, inC, outC, num_classes):
         super(BEVEncoder_BEVE, self).__init__()
-        # 确保输出通道数至少为1
-        self.outC = max(1, outC)
-        self.num_classes = self.outC // 9  # 假设outC是9*num_classes
+        self.num_classes = max(1, num_classes)  # 直接使用传递的 num_classes
+    # --- 修改结束 ---
 
         self.layer1 = nn.Sequential(
             RepViTBlock(inC, 16, 3, 2),

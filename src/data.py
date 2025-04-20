@@ -481,11 +481,8 @@ class Detection3DData(NuscData):
             # 检查是否为我们关注的类别，并获取类别ID [0, num_classes-1]
             class_id = -1
             full_category = '.'.join(category.split('.')[:2])
-            main_category = category.split('.')[0]
             if full_category in self.category_map:
                 class_id = self.category_map[full_category]
-            elif main_category == 'vehicle':  # 处理未在map中的其他车辆
-                class_id = 0  # 假设车辆是第0类
 
             if class_id < 0:
                 continue  # 跳过不关注的类别
