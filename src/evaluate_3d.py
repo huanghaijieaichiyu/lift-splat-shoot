@@ -367,13 +367,10 @@ def decode_predictions(preds: Dict[str, torch.Tensor], device: torch.device, sco
         scores = cls_scores * iou_scores  # Combined score [H, W]
 
         # Filter based on class ID > 0 and score threshold
-        # mask = cls_ids > 0  # Filter out background class (ID 0)
         final_mask = (cls_ids > 0) & (scores > score_thresh)
 
-        # if mask.sum() > 0:
         if final_mask.sum() > 0:
             # filtered_cls_ids = cls_ids[mask]    # [N]
-            # filtered_scores = scores[mask]      # [N]
             filtered_cls_ids = cls_ids[final_mask]    # [N]
             filtered_scores = scores[final_mask]      # [N]
 
@@ -382,11 +379,9 @@ def decode_predictions(preds: Dict[str, torch.Tensor], device: torch.device, sco
             ys, xs = torch.meshgrid(torch.arange(
                 h, device=device), torch.arange(w, device=device), indexing='ij')
             # [N], [N] - Coordinates in feature map
-            # xs, ys = xs[mask], ys[mask]
             xs, ys = xs[final_mask], ys[final_mask]
 
             reg_pred_permuted = reg_pred.permute(1, 2, 0)  # [H, W, 9]
-            # filtered_reg = reg_pred_permuted[mask]       # [N, 9]
             filtered_reg = reg_pred_permuted[final_mask]       # [N, 9]
 
             # --- Add Top-K Filtering (nuScenes limit is 500) ---
@@ -404,7 +399,6 @@ def decode_predictions(preds: Dict[str, torch.Tensor], device: torch.device, sco
                 xs = xs[topk_indices]
                 ys = ys[topk_indices]
                 filtered_reg = filtered_reg[topk_indices]
-            # --- End Top-K Filtering ---
 
             # Assuming offsets are relative to grid cell *centers*
             # Calculate grid cell center coordinates in global frame
@@ -445,26 +439,6 @@ def decode_predictions(preds: Dict[str, torch.Tensor], device: torch.device, sco
                 pred_vel = torch.cat(
                     [pred_vel, torch.zeros_like(pred_vel)], dim=1)
 
-            # --- Debug Print ---
-            if b == 0:  # Only print for the first sample in the batch
-                print("\n--- Debug Info: decode_predictions (Sample 0) ---")
-                print(f"Grid Conf: {grid_conf}")
-                print(
-                    f"Number of filtered dets (after top-k): {filtered_scores.shape[0]}")
-                if filtered_scores.shape[0] > 0:
-                    print(
-                        f"filtered_reg min/max: {filtered_reg.min().item():.4f} / {filtered_reg.max().item():.4f}")
-                    print(
-                        f"grid_cell_center_x min/max: {grid_cell_center_x.min().item():.4f} / {grid_cell_center_x.max().item():.4f}")
-                    print(
-                        f"grid_cell_center_y min/max: {grid_cell_center_y.min().item():.4f} / {grid_cell_center_y.max().item():.4f}")
-                    print("Top 5 pred_xyz:")
-                    print(pred_xyz[:5])
-                else:
-                    print("No detections after filtering.")
-                print("--- End Debug Info ---\n")
-            # --- End Debug Print ---
-
             dets = {
                 'box_cls': filtered_cls_ids,
                 'box_scores': filtered_scores,
@@ -477,6 +451,11 @@ def decode_predictions(preds: Dict[str, torch.Tensor], device: torch.device, sco
             }
             predictions.append(dets)
         else:
+            # --- Add Debug Print 4 ---
+            if b < 2:  # Only print for first 2 samples
+                print(
+                    f"  DEBUG[decode]: Sample {b} - No detections passed initial filtering.")
+            # --- End Debug Print 4 ---
             # No detections for this sample
             empty_dets = {
                 'box_cls': torch.zeros(0, dtype=torch.long, device=device),

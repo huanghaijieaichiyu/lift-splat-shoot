@@ -15,6 +15,79 @@ from contextlib import nullcontext  # 导入nullcontext
 from .nuscenes_info import load_nuscenes_infos  # 导入数据集缓存加载函数
 
 
+def distance_based_nms(boxes_xyz, scores, classes, dist_threshold, score_threshold):
+    """
+    执行基于中心点距离的简化NMS (同一类别内).
+
+    Args:
+        boxes_xyz (torch.Tensor): 检测框中心坐标 [N, 3] or [N, 2]. 使用BEV (x, y) 进行距离计算.
+        scores (torch.Tensor): 检测框置信度 [N].
+        classes (torch.Tensor): 检测框类别 [N].
+        dist_threshold (float): 同一类别内，移除框的中心点距离阈值 (BEV平面).
+        score_threshold (float): 低于此分数的框将被首先过滤掉.
+
+    Returns:
+        torch.Tensor: 保留的检测框的原始索引.
+    """
+    # 1. 按分数过滤
+    keep_indices_score = torch.where(scores >= score_threshold)[0]
+    if keep_indices_score.numel() == 0:
+        return torch.tensor([], dtype=torch.long, device=scores.device)
+
+    boxes_xyz_filtered = boxes_xyz[keep_indices_score]
+    scores_filtered = scores[keep_indices_score]
+    classes_filtered = classes[keep_indices_score]
+
+    if boxes_xyz_filtered.numel() == 0:
+        return torch.tensor([], dtype=torch.long, device=boxes_xyz.device)
+
+    # 2. 按分数排序 (在每个类别内独立排序，或者全局排序后处理也可以)
+    # 这里我们将在类别循环内排序
+
+    keep = []
+    unique_classes = torch.unique(classes_filtered)
+
+    # 3. 按类别进行NMS
+    for cls in unique_classes:
+        cls_mask = (classes_filtered == cls)
+        if not torch.any(cls_mask):
+            continue
+
+        cls_indices_in_filtered = torch.where(cls_mask)[0]
+        cls_boxes_xyz = boxes_xyz_filtered[cls_indices_in_filtered]
+        cls_scores = scores_filtered[cls_indices_in_filtered]
+        # 获取这些框在过滤前（应用分数阈值后）的原始索引
+        original_indices_for_class = keep_indices_score[cls_indices_in_filtered]
+
+        # 按分数降序排序当前类别的框
+        cls_order = torch.argsort(cls_scores, descending=True)
+        cls_active = torch.ones(
+            cls_boxes_xyz.shape[0], dtype=torch.bool, device=cls_boxes_xyz.device)
+
+        for i in range(cls_boxes_xyz.shape[0]):
+            idx_in_class_sorted = cls_order[i]  # 获取排序后的索引对应的在类别内的索引
+            if cls_active[idx_in_class_sorted]:
+                # 保留当前框 (使用它在过滤前列表中的原始索引)
+                keep.append(original_indices_for_class[idx_in_class_sorted])
+                # 获取当前框的 BEV 坐标
+                current_box_bev = cls_boxes_xyz[idx_in_class_sorted, :2].unsqueeze(
+                    0)
+                # 计算当前框与该类别中其他框的 BEV 距离
+                distances = torch.norm(
+                    cls_boxes_xyz[:, :2] - current_box_bev, p=2, dim=1)
+                # 找到需要抑制的框 (距离小于阈值，且不是自身，且还未被抑制)
+                # 注意：比较的是 cls_active 内的索引
+                suppress_mask = (distances < dist_threshold) & cls_active
+                suppress_mask[idx_in_class_sorted] = False  # 确保不会抑制自身
+                cls_active[suppress_mask] = False
+
+    if not keep:
+        return torch.tensor([], dtype=torch.long, device=boxes_xyz.device)
+
+    # 返回保留框的原始索引列表（相对于输入boxes_xyz的索引）
+    return torch.tensor(keep, dtype=torch.long, device=boxes_xyz.device)
+
+
 def check_and_ensure_cache(dataroot, version):
     """
     检查并确保数据集缓存存在
@@ -341,7 +414,7 @@ def train_3d(version,
     from .tools import DetectionBEVLoss
     # 初始化损失函数，只使用支持的参数
     loss_fn = DetectionBEVLoss(num_classes=num_classes,
-                               cls_weight=1.0,
+                               cls_weight=2.0,  # Increased weight from 1.0
                                iou_weight=1.0).to(device)
 
     if resume != '':
@@ -350,7 +423,7 @@ def train_3d(version,
         path = save_path(logdir)
 
     writer = SummaryWriter(logdir=path)
-    val_step = 10 if version == 'mini' else 30
+    val_step = 1 if version == 'mini' else 30
 
     model.train()
     counter = 0
@@ -631,12 +704,8 @@ def train_3d(version,
                     # 确保 evaluate_3d 或当前文件中有 decode_predictions
                     from .evaluate_3d import decode_predictions  # 仅导入 decode_predictions
                     # score_thresh 应该是一个超参数，这里暂时用0.2
-                    # --- 修改：降低 score_thresh 用于调试 ---
-                    debug_score_thresh = 0.01
-                    print(
-                        f"DEBUG: Using lowered score_thresh={debug_score_thresh} for decode_predictions")
                     batch_dets = decode_predictions(
-                        preds, device, score_thresh=debug_score_thresh, grid_conf=grid_conf)
+                        preds, device, score_thresh=0.2, grid_conf=grid_conf)
                     # --- 修改结束 ---
 
                     # --- Debug: Print keys of targets_dict (保留用于调试) ---
@@ -952,32 +1021,6 @@ def train_3d(version,
 
             # --- 简化评估结束 ---
 
-            # --- 新增 DEBUG 打印 ---
-            print(
-                f"\nDEBUG: === AP Calculation Inputs (Epoch {epoch + 1}) ===")
-            print(f"DEBUG: Num Predictions Collected: {len(all_predictions)}")
-            print(f"DEBUG: Num Targets Collected: {len(all_targets)}")
-            if all_predictions:
-                print(
-                    f"DEBUG: Example Prediction keys: {list(all_predictions[0].keys())}")
-                print(f"DEBUG: Example Prediction shapes/types: "
-                      f"cls={all_predictions[0]['box_cls'].shape}/{all_predictions[0]['box_cls'].dtype}, "
-                      f"scores={all_predictions[0]['box_scores'].shape}/{all_predictions[0]['box_scores'].dtype}, "
-                      f"xyz={all_predictions[0]['box_xyz'].shape}/{all_predictions[0]['box_xyz'].dtype}")
-            else:
-                print("DEBUG: all_predictions list is empty.")
-            if all_targets:
-                print(
-                    f"DEBUG: Example Target keys: {list(all_targets[0].keys())}")
-                print(f"DEBUG: Example Target shapes/types: "
-                      f"cls={all_targets[0]['box_cls'].shape}/{all_targets[0]['box_cls'].dtype}, "
-                      # f"scores={all_targets[0]['box_scores'].shape}/{all_targets[0]['box_scores'].dtype}, " # GT usually doesn't have scores
-                      f"xyz={all_targets[0]['box_xyz'].shape}/{all_targets[0]['box_xyz'].dtype}")
-            else:
-                print("DEBUG: all_targets list is empty.")
-            print("DEBUG: =========================================\n")
-            # --- DEBUG 打印结束 ---
-
         epoch += 1
         pbar.close()
 
@@ -1098,7 +1141,7 @@ def train_fusion(version,
     # 损失函数
     from .tools import DetectionBEVLoss
     loss_fn = DetectionBEVLoss(num_classes=num_classes,
-                               cls_weight=1.0,
+                               cls_weight=2.0,  # Increased weight from 1.0
                                iou_weight=1.0).to(device)
 
     if resume != '':
@@ -1362,9 +1405,7 @@ def train_fusion(version,
                     from .evaluate_3d import decode_predictions  # 仅导入 decode_predictions
                     # score_thresh 应该是一个超参数，这里暂时用0.2
                     # --- 修改：降低 score_thresh 用于调试 ---
-                    debug_score_thresh = 0.01
-                    print(
-                        f"DEBUG: Using lowered score_thresh={debug_score_thresh} for decode_predictions")
+                    debug_score_thresh = 0.2
                     batch_dets = decode_predictions(
                         preds, device, score_thresh=debug_score_thresh, grid_conf=grid_conf)
                     # --- 修改结束 ---
@@ -1428,8 +1469,48 @@ def train_fusion(version,
                         batch_gts.append(gts)
                     # --- GT 处理结束 ---
 
-                    all_predictions.extend(batch_dets)
-                    all_targets.extend(batch_gts)
+                    # === 新增：应用NMS ===
+                    batch_dets_nms = []
+                    nms_dist_threshold = 1.0  # 示例距离阈值 (单位：米)，需要调整
+                    # score_threshold 已在 decode_predictions 中使用或定义 (如 debug_score_thresh)
+
+                    # 遍历批次中的每个样本
+                    for dets in batch_dets:
+                        # 检查dets是否为空或无效
+                        if not dets or 'box_xyz' not in dets or dets['box_xyz'].numel() == 0:
+                            # 如果没有检测结果，添加一个空的字典结构以保持一致性
+                            empty_dets = {key: torch.empty((0,) + val.shape[1:], dtype=val.dtype, device=val.device)
+                                          for key, val in dets.items() if isinstance(val, torch.Tensor)}
+                            empty_dets.update({key: [] for key, val in dets.items(
+                            ) if not isinstance(val, torch.Tensor)})  # 处理非Tensor值
+                            batch_dets_nms.append(empty_dets)
+                            continue  # 跳到下一个样本
+
+                        # 提取所需张量
+                        boxes_xyz = dets['box_xyz']  # 假设是 [N, 3]
+                        scores = dets['box_scores']  # 假设是 [N]
+                        classes = dets['box_cls']   # 假设是 [N]
+
+                        # 执行基于距离的NMS
+                        keep_indices = distance_based_nms(
+                            boxes_xyz, scores, classes,
+                            dist_threshold=nms_dist_threshold,
+                            score_threshold=debug_score_thresh  # 复用解码时的分数阈值，或设置一个独立的NMS分数阈值
+                        )
+
+                        # 过滤检测结果
+                        dets_after_nms = {key: val[keep_indices] for key, val in dets.items(
+                        ) if isinstance(val, torch.Tensor)}
+                        # 如果有非Tensor的值也需要保留，可能需要额外处理
+                        # 例如: dets_after_nms['sample_token'] = dets.get('sample_token', None) # 如果有sample_token的话
+                        batch_dets_nms.append(dets_after_nms)
+                    # === NMS应用结束 ===
+
+                    # === 修改：使用NMS后的结果进行评估 ===
+                    # 原来的: all_predictions.extend(batch_dets)
+                    # 修改为:
+                    all_predictions.extend(batch_dets_nms)
+                    all_targets.extend(batch_gts)  # GT部分不变
                     # ---
 
                     # --- 可视化 (只在第一个验证批次进行一次) ---
