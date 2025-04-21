@@ -524,7 +524,7 @@ def viz_3d_detection(version,
         'rand_flip': rand_flip,
         'bot_pct_lim': bot_pct_lim,
         'cams': cams,
-        'Ncams': 5,
+        'Ncams': 6,
     }
 
     # 使用detection3d数据解析器
@@ -538,8 +538,8 @@ def viz_3d_detection(version,
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     # 加载模型，使用beve模型进行3D检测
-    # 注意：这里的outC应该是num_classes*9，因为BEVEncoder_BEVE输出的是cls/reg/iou
-    actual_outC = num_classes * 9
+    # 注意：这里的outC应该是num_classes*9，因为BEVEncoder_BEVE输出的是 cls/reg/iou/iou_cls/iou_reg
+    actual_outC = num_classes + 9 + 1
     model = compile_model(grid_conf, data_aug_conf,
                           outC=actual_outC, model='beve', num_classes=num_classes)
     print('loading', modelf)
@@ -571,10 +571,10 @@ def viz_3d_detection(version,
         print("数据集没有nusc属性，跳过地图加载")
 
     # --- 定义视角变换参数 (与 models.py 中的 BEVENet.voxel_pooling 保持一致) ---
-    shift_x = 5.0
+    shift_x = 0.0
     shift_y = 0.0
-    shift_z = 1.0
-    pitch_angle_deg = 45.0
+    shift_z = 0.0
+    pitch_angle_deg = 0
 
     # 计算变换矩阵 (使用 torch)
     translation = torch.tensor(

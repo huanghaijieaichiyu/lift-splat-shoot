@@ -14,17 +14,11 @@ from nuscenes.eval.detection.config import config_factory
 from nuscenes.eval.detection.evaluate import NuScenesEval
 # EvalBoxes is used for predictions, DetectionBox for ground truth loading (if needed directly)
 from nuscenes.eval.common.data_classes import EvalBoxes
-# 导入DetectionBox用于评估
 from nuscenes.eval.detection.data_classes import DetectionBox
 from nuscenes.utils.data_classes import Box
 from pyquaternion import Quaternion
-import tempfile
 import json
-import pickle
-from typing import Dict, List, Any, Tuple, Union
-# Import torch.amp explicitly
-import torch.amp as amp
-# Import torch.cuda.amp explicitly for autocast
+from typing import Dict, List, Any
 from torch.cuda.amp import autocast
 
 # --- Constants for nuScenes Mapping ---
@@ -33,16 +27,16 @@ from torch.cuda.amp import autocast
 # IMPORTANT: Verify this mapping matches your model's training and dataset setup.
 # Background class (ID 0) should not be included here.
 MODEL_ID_TO_NUSCENES_NAME = {
-    1: 'car',
-    2: 'truck',
-    3: 'bus',
-    4: 'trailer',
-    5: 'construction_vehicle',
-    6: 'pedestrian',
-    7: 'motorcycle',
-    8: 'bicycle',
-    9: 'traffic_cone',
-    # 10: 'barrier' # Uncomment if your model predicts barriers
+    0: 'car',
+    1: 'truck',
+    2: 'bus',
+    3: 'trailer',
+    4: 'construction_vehicle',
+    5: 'pedestrian',
+    6: 'motorcycle',
+    7: 'bicycle',
+    8: 'traffic_cone',
+    9: 'barrier'
 }
 
 # Mapping from nuScenes detection names to contiguous IDs (0-9 for 10 classes)
@@ -451,12 +445,6 @@ def decode_predictions(preds: Dict[str, torch.Tensor], device: torch.device, sco
             }
             predictions.append(dets)
         else:
-            # --- Add Debug Print 4 ---
-            if b < 2:  # Only print for first 2 samples
-                print(
-                    f"  DEBUG[decode]: Sample {b} - No detections passed initial filtering.")
-            # --- End Debug Print 4 ---
-            # No detections for this sample
             empty_dets = {
                 'box_cls': torch.zeros(0, dtype=torch.long, device=device),
                 'box_scores': torch.zeros(0, device=device),
@@ -618,33 +606,33 @@ def evaluate_3d_detection(
     amp: bool = True,  # Use Automatic Mixed Precision
     output_dir: str = './eval_output',  # Directory for saving results
     verbose: bool = True,
-    score_thresh: float = 0.2,  # Add score threshold parameter
+    score_thresh: float = 0.01,  # Add score threshold parameter
 ):
     """
-    Evaluates a 3D object detection model using a saved checkpoint and the
-    official nuScenes evaluation protocol.
+   评估使用已保存的检查点和官方 nuScenes 评估协议的 3D 对象检测模型。
 
     Args:
-        checkpoint_path: Path to the model checkpoint (.pth) file.
-        version: nuScenes dataset version (e.g., 'v1.0-mini', 'v1.0-trainval').
-        dataroot: Root directory of the nuScenes dataset.
-        gpuid: GPU ID to use for evaluation (-1 for CPU).
-        H, W: Original image height and width.
-        resize_lim, final_dim, bot_pct_lim, rot_lim, rand_flip: Data augmentation parameters
-                                                               (should match training).
-        ncams: Number of cameras used per sample.
-        xbound, ybound, zbound, dbound: BEV grid configuration.
-        bsz: Batch size for the validation dataloader.
-        nworkers: Number of worker processes for the dataloader.
-        num_classes: Number of object classes the model predicts (excluding background).
-        model_type: The architecture type of the model being loaded.
-        amp: Whether to use Automatic Mixed Precision during inference.
-        output_dir: Directory where evaluation results (JSON, logs) will be saved.
-        verbose: If True, prints detailed progress and results.
-        score_thresh: Minimum score threshold to keep a detection.
+        checkpoint_path: 模型检查点 (.pth) 文件的路径。
+        version: nuScenes 数据集版本（例如，“v1.0-mini”，“v1.0-trainval”）。
+        dataroot: nuScenes 数据集的根目录。
+        gpuid: 用于评估的 GPU ID（-1 表示 CPU）。
+        H, W: 原始图像的高度和宽度。
+        resize_lim, final_dim, bot_pct_lim, rot_lim, rand_flip: 数据增强参数
+                                                               (应与训练匹配)。
+        ncams: 每个样本使用的相机数量。
+        xbound, ybound, zbound, dbound: BEV 网格配置。
+        bsz: 验证数据加载器的批量大小。
+        nworkers: 数据加载器的工作进程数。
+        num_classes: 模型预测的对象类别数量（不包括背景）。
+        model_type: 要加载的模型的架构类型。
+        amp: 是否在推理期间使用自动混合精度。
+        output_dir: 将保存评估结果（JSON、日志）的目录。
+        verbose: 如果为 True，则打印详细的进度和结果。
+        score_thresh: 保持检测的最小分数阈值。
 
     Returns:
-        Dict[str, Any]: A dictionary containing the official nuScenes metrics (mAP, NDS, etc.).
+        Dict[str, Any]: 包含官方 nuScenes 指标（mAP、NDS 等）的字典。
+
     """
     from .models import compile_model
     from .data import compile_data  # Ensure this returns sample_tokens
@@ -712,7 +700,7 @@ def evaluate_3d_detection(
     print(
         f"Compiling model architecture: {model_type} with {num_classes} classes...")
     model = compile_model(grid_conf, data_aug_conf,
-                          outC=num_classes * 9,  # Pass expected outC, model will adapt
+                          outC=num_classes + 9 + 1,  # Pass expected outC, model will adapt
                           model=model_type,
                           num_classes=num_classes)
 

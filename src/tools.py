@@ -290,17 +290,6 @@ def save_path(path, model='train'):
     return file_path
 
 
-class SimpleLoss(torch.nn.Module):
-    def __init__(self, pos_weight):
-        super(SimpleLoss, self).__init__()
-        self.loss_fn = torch.nn.BCEWithLogitsLoss(
-            pos_weight=torch.Tensor([pos_weight]))
-
-    def forward(self, ypred, ytgt):
-        loss = self.loss_fn(ypred, ytgt)
-        return loss
-
-
 def get_batch_iou(preds, binimgs):
     """Assumes preds has NOT been sigmoided yet
     """
@@ -695,12 +684,12 @@ class DetectionBEVLoss(nn.Module):
     """
 
     def __init__(self, num_classes: int,
-                 cls_weight: float = 1.0,
+                 cls_weight: float = 3.0,
                  bev_loss_weight: float = 2.0,  # Weight for BEV DIoU loss
                  z_loss_weight: float = 1.0,
                  h_loss_weight: float = 1.0,
-                 vel_loss_weight: float = 1.0,
-                 iou_weight: float = 1.0,
+                 vel_loss_weight: float = 2.0,
+                 iou_weight: float = 2.0,
                  alpha: float = 0.25, gamma: float = 2.0, beta: float = 1.0,  # beta for SmoothL1
                  eps: float = 1e-7):
         """
@@ -733,10 +722,10 @@ class DetectionBEVLoss(nn.Module):
         self.eps = eps
 
         # Regression Loss for non-BEV components
-        self.smooth_l1_loss = nn.SmoothL1Loss(reduction='none', beta=self.beta)
+        self.smooth_l1_loss = nn.SmoothL1Loss(beta=self.beta)
 
         # IoU Prediction Loss (applied element-wise)
-        self.iou_loss_fn = nn.BCEWithLogitsLoss(reduction='none')
+        self.iou_loss_fn = nn.BCEWithLogitsLoss()
 
     def _focal_loss(self, pred_logits: torch.Tensor, target_labels: torch.Tensor) -> torch.Tensor:
         """

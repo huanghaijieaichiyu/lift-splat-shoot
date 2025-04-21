@@ -143,3 +143,4 @@ runs_*
 eval_output
 /BEVDepth
 /.gitignore
+/utils/tar_file.py

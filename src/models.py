@@ -393,49 +393,7 @@ class LiftSplatShoot(nn.Module):
             frustum, rots, trans, intrins, post_rots, post_trans)
         # geom 形状: [B, N, D, H_actual, W_actual, 3]
 
-        # 4. 准备相机矩阵字典 (移到这里，因为它被 DepthNet 使用)
-        # (将原来的步骤4-9移到这里，因为它们依赖于 B, N, H_actual, W_actual)
-        mats_dict = {
-            'sensor2ego_mats': torch.eye(4, device=rots.device).view(1, 1, 4, 4).repeat(B, N, 1, 1),
-            'intrin_mats': torch.eye(4, device=intrins.device).view(1, 1, 4, 4).repeat(B, N, 1, 1),
-            'ida_mats': torch.eye(4, device=post_rots.device).view(1, 1, 4, 4).repeat(B, N, 1, 1),
-        }
-        mats_dict['sensor2ego_mats'][:, :, :3, :3] = rots
-        mats_dict['sensor2ego_mats'][:, :, :3, 3] = trans
-        mats_dict['intrin_mats'][:, :, :3, :3] = intrins
-        mats_dict['ida_mats'][:, :, :3, :3] = post_rots
-        mats_dict['ida_mats'][:, :, :3, 3] = post_trans
-
-        # 5. 提取2D特征用于深度预测 (需要从 cam_feats_output 转换)
-        # cam_feats_output: [B, N, C, D, H_actual, W_actual]
-        # 需要 [B*N, C, H_actual, W_actual]
-        cam_feats_2d = cam_feats_output.permute(0, 1, 2, 4, 5, 3).reshape(
-            B * N, self.camC, H_actual, W_actual, _D).mean(dim=-1)  # 取 D 维度平均
-
-        # 6. 使用深度网络获取深度和上下文特征
-        depth_feature = self._forward_depth_net(
-            cam_feats_2d, mats_dict)
-        # Expected Shape: [B*N, D+C, H_actual, W_actual]
-
-        # 7. 分离深度概率和上下文特征
-        depth = depth_feature[:, :self.D].softmax(dim=1)
-        context = depth_feature[:, self.D:]
-        # Expected Shape: [B*N, D, H_actual, W_actual]
-        # Expected Shape: [B*N, C, H_actual, W_actual]
-
-        # 8. 使用深度概率对上下文特征加权
-        # context 需要 unsqueeze(2) -> [B*N, C, 1, H, W]
-        # depth 需要 unsqueeze(1) -> [B*N, 1, D, H, W]
-        weighted_x = depth.unsqueeze(1) * context.unsqueeze(2)
-        # Expected Shape: [B*N, C, D, H_actual, W_actual]
-
-        # 9. 将加权特征重塑为 [B, N, C, D, H_actual, W_actual]
-        weighted_x = weighted_x.view(
-            B, N, self.camC, self.D, H_actual, W_actual)
-
-        # 10. 应用体素池化 (使用动态计算的 geom)
-        # voxel_pooling 输入 geom: [B, N, D, H, W, 3], x: [B, N, C, D, H, W]
-        bev_feat = self.voxel_pooling(geom, weighted_x)
+        bev_feat = self.voxel_pooling(geom, x)
 
         return bev_feat
 
@@ -488,30 +446,31 @@ def compile_model(grid_conf, data_aug_conf, outC, model='vit', num_classes=10, l
 
 class CamEncoder(nn.Module):
     """
-    CamEncoder is a neural network module designed for encoding camera input features.
+    CamEncoder 是一个用于编码相机输入特征的神经网络模块。
     Args:
-        c_in (int): Number of input channels.
-        c_out (int): Number of output channels.
+        c_in (int): 输入通道数。
+        c_out (int): 输出通道数。
     Attributes:
-        c_in (int): Number of input channels.
-        c_out (int): Number of output channels.
-        conv1 (nn.Module): First convolutional layer.
-        conv2 (nn.Sequential): Second convolutional block consisting of RepViTBlock layers.
-        conv3 (nn.Sequential): Third convolutional block consisting of RepViTBlock layers.
-        conv4 (nn.Sequential): Fourth convolutional block consisting of RepViTBlock and C2f layers.
-        conv5 (nn.Sequential): Fifth convolutional block consisting of SPPELAN and PSA layers.
-        conv6 (RepViTBlock): Sixth convolutional layer.
-        conv7 (C2fCIB): Seventh convolutional layer.
-        conv8 (RepViTBlock): Eighth convolutional layer.
-        conv9 (Gencov): Ninth convolutional layer.
-        up (nn.Upsample): Upsampling layer.
+        c_in (int): 输入通道数。
+        c_out (int): 输出通道数。
+        conv1 (nn.Module): 第一个卷积层。
+        conv2 (nn.Sequential): 第二个卷积块，由 RepViTBlock 层组成。
+        conv3 (nn.Sequential): 第三个卷积块，由 RepViTBlock 层组成。
+        conv4 (nn.Sequential): 第四个卷积块，由 RepViTBlock 和 C2f 层组成。
+        conv5 (nn.Sequential): 第五个卷积块，由 SPPELAN 和 PSA 层组成。
+        conv6 (RepViTBlock): 第六个卷积层。
+        conv7 (C2fCIB): 第七个卷积层。
+        conv8 (RepViTBlock): 第八个卷积层。
+        conv9 (Gencov): 第九个卷积层。
+        up (nn.Upsample): 上采样层。
     Methods:
         forward(x):
-            Forward pass of the network.
+            网络的前向传播。
             Args:
-                x (torch.Tensor): Input tensor.
+                x (torch.Tensor): 输入张量。
             Returns:
-                torch.Tensor: Output tensor reshaped to (-1, c_out, 8, 22).
+                torch.Tensor: 输出张量，重塑为 (-1, c_out, 8, 22)。
+
     """
 
     def __init__(self, c_in, c_out) -> None:
@@ -1329,80 +1288,6 @@ class BEVENet(nn.Module):
         return preds
 
 
-class CamEncoder_BEVE(nn.Module):
-    def __init__(self, D, C, downsample):
-        super(CamEncoder_BEVE, self).__init__()
-        self.D = D
-        self.C = C
-
-        # 使用 EfficientNet 作为特征提取器
-        self.trunk = EfficientNet.from_name('efficientnet-b0')
-        self.up1 = Up(320 + 112, 512)
-        # 修改 depthnet 的设计，确保维度正确
-        self.depth_conv = nn.Sequential(
-            Conv(512, 256, 3, 1, 1),  # 保持空间维度
-            Conv(256, 128, 3, 1, 1),
-            Conv(128, self.D + self.C, 1, 1, act=False, bn=False)  # 输出深度和特征通道
-        )
-
-    def get_depth_dist(self, x, eps=1e-20):
-        return x.softmax(dim=1)
-
-    def get_depth_feat(self, x):
-        """
-        Args:
-            x: 输入张量 [B*N, C, H, W]
-        Returns:
-            depth: 深度分布 [B*N, D, H', W']
-            features: 特征图 [B*N, C, D, H', W']
-        """
-
-        features = self.get_eff_depth(x)  # [B*N, 512, H', W']
-
-        # 生成深度和特征
-        combined = self.depth_conv(features)  # [B*N, D+C, H', W']
-
-        # 分离深度和特征
-        depth = self.get_depth_dist(combined[:, :self.D])  # [B*N, D, H', W']
-        feat = combined[:, self.D:(self.D + self.C)]  # [B*N, C, H', W']
-
-        # 生成最终特征
-        new_x = depth.unsqueeze(1) * feat.unsqueeze(2)  # [B*N, C, D, H', W']
-
-        return depth, new_x
-
-    def get_eff_depth(self, x):
-        """使用 EfficientNet 提取特征，保持空间维度的一致性"""
-        # Stem
-        x = self.trunk._swish(self.trunk._bn0(self.trunk._conv_stem(x)))
-        prev_x = x
-
-        # Blocks
-        endpoints = dict()
-        for idx, block in enumerate(self.trunk._blocks):
-            # drop_connect_rate = self.trunk._global_params.drop_connect_rate # 原代码
-            # 修复：检查 _global_params 是否存在以及 drop_connect_rate 属性
-            drop_connect_rate = 0.0
-            if hasattr(self.trunk, '_global_params') and self.trunk._global_params is not None and hasattr(self.trunk._global_params, 'drop_connect_rate'):
-                drop_connect_rate = self.trunk._global_params.drop_connect_rate
-
-            if drop_connect_rate and drop_connect_rate > 0:  # 添加检查 > 0
-                drop_connect_rate *= float(idx) / len(self.trunk._blocks)
-            x = block(x, drop_connect_rate=drop_connect_rate)
-            if prev_x.size(2) > x.size(2):
-                endpoints['reduction_{}'.format(len(endpoints) + 1)] = prev_x
-            prev_x = x
-
-        # Head
-        endpoints['reduction_{}'.format(len(endpoints) + 1)] = x
-        x = self.up1(endpoints['reduction_5'], endpoints['reduction_4'])
-        return x
-
-    def forward(self, x):
-        depth, x = self.get_depth_feat(x)
-        return x
-
-
 class BEVEncoder_BEVE(nn.Module):
     # --- 修改：接收 num_classes 参数，并移除对 outC 的错误依赖 ---
     def __init__(self, inC, outC, num_classes):
@@ -1442,21 +1327,21 @@ class BEVEncoder_BEVE(nn.Module):
             # 3x3 Conv + BN + ReLU (assuming Conv includes this)
             Conv(128, head_inter_channels, k=3, p=1),
             # Final 1x1 Conv: Output logits, no activation/BN
-            Conv(head_inter_channels, self.num_classes, k=1, act=False, bn=False)
+            Conv(head_inter_channels, self.num_classes, k=1)
         )
 
         # Regression Head
         self.reg_head = nn.Sequential(
             Conv(128, head_inter_channels, k=3, p=1),
             # Final 1x1 Conv: Output 9 regression values, no activation/BN
-            Conv(head_inter_channels, 9, k=1, act=False, bn=False)
+            Conv(head_inter_channels, 9, k=1)
         )
 
         # IoU Head
         self.iou_head = nn.Sequential(
             Conv(128, head_inter_channels, k=3, p=1),
             # Final 1x1 Conv: Output 1 IoU logit, no activation/BN
-            Conv(head_inter_channels, 1, k=1, act=False, bn=False)
+            Conv(head_inter_channels, 1, k=1)
         )
         # --- End Refactored Head ---
 

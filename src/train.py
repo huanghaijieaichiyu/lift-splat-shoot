@@ -296,8 +296,7 @@ def train_3d(version,
              gpuid=0,
              cuDNN=False,
              resume='',
-             load_weight='',
-             amp=True,  # 默认启用混合精度训练，但在验证时需要注意类型一致性
+             load_weight='',  # 默认启用混合精度训练，但在验证时需要注意类型一致性
              H=900, W=1600,
              resize_lim=(0.193, 0.225),
              final_dim=(128, 352),
@@ -305,7 +304,7 @@ def train_3d(version,
              rot_lim=(-5.4, 5.4),
              rand_flip=True,
              ncams=6,
-             max_grad_norm=5.0,
+             max_grad_norm=10.0,
              logdir='./runs_3d',
 
              xbound=[-50.0, 50.0, 0.5],
@@ -315,8 +314,8 @@ def train_3d(version,
 
              bsz=4,
              nworkers=4,
-             lr=1e-3,
-             weight_decay=5e-5,
+             lr=2e-4,
+             weight_decay=1e-7,
              num_classes=10,
              enable_multiscale=True,  # 支持多尺度特征训练
              use_enhanced_bev=True,   # 使用增强的BEV投影
@@ -399,6 +398,7 @@ def train_3d(version,
 
     # 优化器设置
     opt = torch.optim.Adam(model.parameters(), lr=lr,
+                           betas=(0.5, 0.999),
                            weight_decay=weight_decay)
 
     # 设置学习率调度器 - 使用余弦退火调度
@@ -414,8 +414,8 @@ def train_3d(version,
     from .tools import DetectionBEVLoss
     # 初始化损失函数，只使用支持的参数
     loss_fn = DetectionBEVLoss(num_classes=num_classes,
-                               cls_weight=2.0,  # Increased weight from 1.0
-                               iou_weight=1.0).to(device)
+                               cls_weight=1.0,  # Increased weight from 1.0
+                               iou_weight=4.0).to(device)
 
     if resume != '':
         path = os.path.dirname(resume)
@@ -423,7 +423,7 @@ def train_3d(version,
         path = save_path(logdir)
 
     writer = SummaryWriter(logdir=path)
-    val_step = 1 if version == 'mini' else 30
+    val_step = 10 if version == 'mini' else 30
 
     model.train()
     counter = 0
@@ -446,11 +446,6 @@ def train_3d(version,
         model.load_state_dict(checkpoint['net'], strict=False)
 
     # 自动混合精度训练
-    if amp:
-        # 使用正确的API，注意torch.cuda.amp仍然有效
-        scaler = GradScaler() if torch.cuda.is_available() else None
-    else:
-        scaler = None
 
     while epoch < nepochs:
         np.random.seed()
@@ -477,55 +472,47 @@ def train_3d(version,
             opt.zero_grad()
 
             # 处理当前批次
-            # 使用autocast进行混合精度训练
-            with autocast(enabled=amp) if amp and torch.cuda.is_available() else nullcontext():
-                preds = model(imgs.to(device),
-                              rots.to(device),
-                              trans.to(device),
-                              intrins.to(device),
-                              post_rots.to(device),
-                              post_trans.to(device),
-                              )
+            preds = model(imgs.to(device),
+                          rots.to(device),
+                          trans.to(device),
+                          intrins.to(device),
+                          post_rots.to(device),
+                          post_trans.to(device),
+                          )
 
-                # Ensure targets is a dictionary and move to device
-                targets_dict = {}
-                # targets_list is the dictionary yielded by the DataLoader
-                for key, val in targets_list.items():
-                    if isinstance(val, torch.Tensor):
-                        targets_dict[key] = val.to(device)
-                    else:
-                        targets_dict[key] = val
+            # Ensure targets is a dictionary and move to device
+            targets_dict = {}
+            # targets_list is the dictionary yielded by the DataLoader
+            for key, val in targets_list.items():
+                if isinstance(val, torch.Tensor):
+                    targets_dict[key] = val.to(device)
+                else:
+                    targets_dict[key] = val
 
-                # Calculate loss using the correctly processed dictionary
-                losses = loss_fn(preds, targets_dict)
+            # Calculate loss using the correctly processed dictionary
+            losses = loss_fn(preds, targets_dict)
 
-                total_loss = losses['total_loss']
-                cls_loss = losses['cls_loss']
-                iou_loss = losses.get('iou_loss', torch.tensor(0.0))
-                # Get individual regression losses
-                bev_diou_loss = losses.get('bev_diou_loss', torch.tensor(0.0))
-                z_loss = losses.get('z_loss', torch.tensor(0.0))
-                h_loss = losses.get('h_loss', torch.tensor(0.0))
-                vel_loss = losses.get('vel_loss', torch.tensor(0.0))
+            total_loss = losses['total_loss']
+            cls_loss = losses['cls_loss']
+            iou_loss = losses.get('iou_loss', torch.tensor(0.0))
+            # Get individual regression losses
+            bev_diou_loss = losses.get('bev_diou_loss', torch.tensor(0.0))
+            z_loss = losses.get('z_loss', torch.tensor(0.0))
+            h_loss = losses.get('h_loss', torch.tensor(0.0))
+            vel_loss = losses.get('vel_loss', torch.tensor(0.0))
 
-                # 多尺度损失
-                if enable_multiscale and 'scale_losses' in losses:
-                    scale_losses = losses['scale_losses']
-
-            # 使用混合精度训练
-            if scaler:
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(opt)  # 反向传播前解缩放，以便进行梯度裁剪
+            # 多尺度损失
+            if enable_multiscale and 'scale_losses' in losses:
+                scale_losses = losses['scale_losses']
 
             # 梯度裁剪，避免梯度爆炸
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-            # Step optimizer and scheduler
-            if scaler:
-                scaler.step(opt)   # Calls optimizer.step() implicitly
-                scaler.update()
-            else:  # Handle case where AMP is disabled
-                opt.step()
+            # 反向传播
+            losses['total_loss'].backward()
+
+            # 更新参数
+            opt.step()
 
             # Scheduler step should happen after optimizer step
             # This should be outside the scaler check, called every step where optimizer is stepped
@@ -546,7 +533,6 @@ def train_3d(version,
                     epoch_scale_losses[i] += loss.item()
 
             counter += 1
-            t1 = time.time()  # 确保是浮点数
 
             # 构建进度条描述
             desc = '||Epoch: [%d/%d]|Loss: %.4f|Cls: %.4f|BEV: %.4f|Z: %.4f|H: %.4f|Vel: %.4f|IoU: %.4f||' % (
@@ -599,7 +585,6 @@ def train_3d(version,
             'epoch': epoch,
             'best_map': best_map,
             'model_configs': model_configs,  # 保存模型配置
-            'amp_scaler': scaler.state_dict() if scaler is not None else None,  # 修复None调用问题
         }
         last_model = os.path.join(path, "last.pt")
         torch.save(last_checkpoint, last_model)
@@ -631,8 +616,7 @@ def train_3d(version,
                 for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sample_tokens) in enumerate(valloader):
                     # 使用autocast进行混合精度训练 (如果验证时也启用AMP)
                     # 注意：为了评估指标的稳定性，通常建议验证时不使用autocast，除非内存非常受限
-                    context_manager = autocast(
-                        enabled=amp) if amp and torch.cuda.is_available() else nullcontext()
+                    context_manager = nullcontext()
                     with context_manager:
                         preds = model(imgs.to(device),
                                       rots.to(device),
@@ -1007,7 +991,7 @@ def train_3d(version,
                         'epoch': epoch,
                         'best_map': best_map,  # Store the best mAP score
                         'model_configs': model_configs,
-                        'amp_scaler': scaler.state_dict() if scaler is not None else None,
+                        'amp_scaler': losses['total_loss'].state_dict() if losses['total_loss'] is not None else None,
                     }
                     best_model_path = os.path.join(
                         path, "best_map.pt")  # Use a distinct name
@@ -1471,7 +1455,7 @@ def train_fusion(version,
 
                     # === 新增：应用NMS ===
                     batch_dets_nms = []
-                    nms_dist_threshold = 1.0  # 示例距离阈值 (单位：米)，需要调整
+                    nms_dist_threshold = 0.2  # 示例距离阈值 (单位：米)，需要调整
                     # score_threshold 已在 decode_predictions 中使用或定义 (如 debug_score_thresh)
 
                     # 遍历批次中的每个样本
