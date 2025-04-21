@@ -1345,17 +1345,6 @@ class BEVEncoder_BEVE(nn.Module):
         )
         # --- End Refactored Head ---
 
-        # # --- Original Simple Head ---
-        # # 分类头 - 预测每个位置的类别
-        # self.cls_head = Conv(128, self.num_classes, k=1)
-        #
-        # # 回归头 - 预测边界框参数 (x,y,z,w,l,h,sin,cos,vel)
-        # self.reg_head = Conv(128, 9, k=1)
-        #
-        # # IoU头 - 预测检测质量
-        # self.iou_head = Conv(128, 1, k=1)
-        # # --- End Original Simple Head ---
-
     def forward(self, x):
         x = self.layer1(x)
         x = self.layer2(x)

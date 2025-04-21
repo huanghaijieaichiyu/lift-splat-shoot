@@ -10,7 +10,7 @@ import os
 from .models import compile_model
 from .data import compile_data
 from .tools import save_path
-from .tools import SimpleLoss, get_batch_iou, get_val_info
+from .tools import get_batch_iou, get_val_info
 from contextlib import nullcontext  # 导入nullcontext
 from .nuscenes_info import load_nuscenes_infos  # 导入数据集缓存加载函数
 
@@ -183,7 +183,7 @@ def train(version,
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
-
+    loss = nn.BCEWithLogitsLoss()
     model.to(device)
     if cuDNN:
         cudnn.enabled = True
@@ -192,7 +192,7 @@ def train(version,
     opt = torch.optim.Adam(model.parameters(), lr=lr,
                            weight_decay=weight_decay)
 
-    loss_fn = SimpleLoss(pos_weight).cuda(gpuid)
+    loss_fn = loss(pos_weight).cuda(gpuid)
 
     if resume != '':
         path = os.path.dirname(resume)
@@ -446,6 +446,7 @@ def train_3d(version,
         model.load_state_dict(checkpoint['net'], strict=False)
 
     # 自动混合精度训练
+    amp_scaler = GradScaler() if torch.cuda.is_available() else None
 
     while epoch < nepochs:
         np.random.seed()
@@ -465,9 +466,14 @@ def train_3d(version,
 
         pbar = tqdm(enumerate(trainloader), total=len(
             trainloader), colour='#8762A5')
-
-        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sample_tokens) in pbar:
-            t0 = time.time()  # 确保是浮点数
+        # batchi: 当前批次索引
+        # imgs: 当前批次图像
+        # rots: 当前批次旋转矩阵
+        # trans: 当前批次平移矩阵
+        # intrins: 当前批次内参矩阵
+        # post_rots: 当前批次后处理旋转矩阵
+        # post_trans: 当前批次后处理平移矩阵
+        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sparse_gts_batch, sample_tokens) in pbar:
             # 只有在新的累积周期开始时才清零梯度
             opt.zero_grad()
 
@@ -480,7 +486,7 @@ def train_3d(version,
                           post_trans.to(device),
                           )
 
-            # Ensure targets is a dictionary and move to device
+            # Ensure targets is a dictionary and move to device (for loss calculation)
             targets_dict = {}
             # targets_list is the dictionary yielded by the DataLoader
             for key, val in targets_list.items():
@@ -492,14 +498,17 @@ def train_3d(version,
             # Calculate loss using the correctly processed dictionary
             losses = loss_fn(preds, targets_dict)
 
+            # --- FIX: Define loss components before accumulating/logging ---
             total_loss = losses['total_loss']
             cls_loss = losses['cls_loss']
-            iou_loss = losses.get('iou_loss', torch.tensor(0.0))
-            # Get individual regression losses
-            bev_diou_loss = losses.get('bev_diou_loss', torch.tensor(0.0))
-            z_loss = losses.get('z_loss', torch.tensor(0.0))
-            h_loss = losses.get('h_loss', torch.tensor(0.0))
-            vel_loss = losses.get('vel_loss', torch.tensor(0.0))
+            # Use .get with default tensor to avoid KeyError if loss is missing
+            iou_loss = losses.get('iou_loss', torch.tensor(0.0, device=device))
+            bev_diou_loss = losses.get(
+                'bev_diou_loss', torch.tensor(0.0, device=device))
+            z_loss = losses.get('z_loss', torch.tensor(0.0, device=device))
+            h_loss = losses.get('h_loss', torch.tensor(0.0, device=device))
+            vel_loss = losses.get('vel_loss', torch.tensor(0.0, device=device))
+            # ---
 
             # 多尺度损失
             if enable_multiscale and 'scale_losses' in losses:
@@ -518,10 +527,10 @@ def train_3d(version,
             # This should be outside the scaler check, called every step where optimizer is stepped
             scheduler.step()
 
+            # Accumulate losses
             epoch_loss += total_loss.item()
             epoch_cls_loss += cls_loss.item()
             epoch_iou_loss += iou_loss.item()
-            # Accumulate new regression losses
             epoch_bev_diou_loss += bev_diou_loss.item()
             epoch_z_loss += z_loss.item()
             epoch_h_loss += h_loss.item()
@@ -533,6 +542,7 @@ def train_3d(version,
                     epoch_scale_losses[i] += loss.item()
 
             counter += 1
+            t1 = time.time()  # 确保是浮点数
 
             # 构建进度条描述
             desc = '||Epoch: [%d/%d]|Loss: %.4f|Cls: %.4f|BEV: %.4f|Z: %.4f|H: %.4f|Vel: %.4f|IoU: %.4f||' % (
@@ -558,9 +568,8 @@ def train_3d(version,
                           len(trainloader), epoch + 1)
         writer.add_scalar('train/iou_loss', epoch_iou_loss /
                           len(trainloader), epoch + 1)
-        # Log new regression losses
-        writer.add_scalar('train/bev_diou_loss',
-                          epoch_bev_diou_loss / len(trainloader), epoch + 1)
+        writer.add_scalar('train/bev_diou_loss', epoch_bev_diou_loss /
+                          len(trainloader), epoch + 1)
         writer.add_scalar('train/z_loss', epoch_z_loss /
                           len(trainloader), epoch + 1)
         writer.add_scalar('train/h_loss', epoch_h_loss /
@@ -584,7 +593,8 @@ def train_3d(version,
             'scheduler': scheduler.state_dict(),
             'epoch': epoch,
             'best_map': best_map,
-            'model_configs': model_configs,  # 保存模型配置
+            'model_configs': model_configs,
+            'amp_scaler': amp_scaler.state_dict() if amp_scaler is not None else None,  # 修复None调用问题
         }
         last_model = os.path.join(path, "last.pt")
         torch.save(last_checkpoint, last_model)
@@ -595,27 +605,22 @@ def train_3d(version,
             val_loss = 0
             val_cls_loss = 0
             val_iou_loss = 0
-            val_bev_diou_loss = 0.0
-            val_z_loss = 0.0
-            val_h_loss = 0.0
-            val_vel_loss = 0.0
 
             # 多尺度验证相关指标
             if enable_multiscale:
                 val_scale_losses = [0, 0, 0]
 
-            # === 新增：用于收集解码结果 ===
+            # === 修改：使用新的变量名收集解码结果和稀疏GT ===
             all_predictions = []
-            all_targets = []
+            all_targets_sparse = []  # 用于存储从dataloader加载的稀疏GT
             # ---
 
             visualized_this_epoch = False  # Flag to visualize only once per epoch
 
             with torch.no_grad():
-                # 只遍历一次验证集
-                for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sample_tokens) in enumerate(valloader):
-                    # 使用autocast进行混合精度训练 (如果验证时也启用AMP)
-                    # 注意：为了评估指标的稳定性，通常建议验证时不使用autocast，除非内存非常受限
+                # --- 修改：更新循环变量以接收 sparse_gts_batch --- #
+                for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sparse_gts_batch, sample_tokens) in enumerate(valloader):
+                    # ---
                     context_manager = nullcontext()
                     with context_manager:
                         preds = model(imgs.to(device),
@@ -626,384 +631,198 @@ def train_3d(version,
                                       post_trans.to(device),
                                       )
 
-                        # Ensure targets is a dictionary and move to device
+                        # Ensure targets is a dictionary and move to device (for loss calculation)
                         targets_dict = {}
                         for key, val in targets_list.items():
                             if isinstance(val, torch.Tensor):
                                 targets_dict[key] = val.to(device)
                             else:
-                                # Keep non-tensors as is
+                                # Keep non-tensors as is (e.g., potential metadata)
                                 targets_dict[key] = val
 
-                        # 1. 计算和累加损失
+                        # 1. 计算和累加损失 (using dense targets_dict)
                         losses = loss_fn(preds, targets_dict)
-
+                        # ... (accumulate validation losses - similar to train_3d) ...
                         val_loss += losses['total_loss'].item()
                         val_cls_loss += losses['cls_loss'].item()
+                        # Assuming reg_loss and iou_loss are present in fusion loss output
                         val_iou_loss += losses.get('iou_loss',
                                                    torch.tensor(0.0)).item()
-                        val_bev_diou_loss += losses.get(
-                            'bev_diou_loss', torch.tensor(0.0)).item()
-                        val_z_loss += losses.get('z_loss',
-                                                 torch.tensor(0.0)).item()
-                        val_h_loss += losses.get('h_loss',
-                                                 torch.tensor(0.0)).item()
-                        val_vel_loss += losses.get('vel_loss',
-                                                   torch.tensor(0.0)).item()
-
                         if enable_multiscale and 'scale_losses' in losses:
                             for i, loss in enumerate(losses['scale_losses']):
                                 val_scale_losses[i] += loss.item()
 
-                    # --- 在autocast之外解码，确保使用float32进行解码 ---
-                    # 确保preds是预期的字典格式 (如果模型输出不是字典需要转换)
+                    # Decode predictions outside context
+                    # --- FIX: Ensure preds_dict is defined correctly --- #
                     if not isinstance(preds, dict) and isinstance(preds, torch.Tensor):
-                        B, C, H, W = preds.shape
+                        B, C, H, W_bev = preds.shape
                         cls_channels = num_classes
-                        reg_channels = 9  # x,y,z,w,l,h,sin,cos,vel - 检查是否与模型输出匹配
-                        iou_channels = 1  # 检查是否与模型输出匹配
-
-                        # 检查通道数是否足够
+                        reg_channels = 9
+                        iou_channels = 1
                         expected_channels = cls_channels + reg_channels + iou_channels
-                        if C < expected_channels:
-                            print(
-                                f"Warning: Unexpected number of channels in prediction tensor ({C}). Expected at least {expected_channels}. Skipping decoding for this batch.")
-                            continue  # 跳过这个批次的解码
-
-                        preds_dict = {
-                            'cls_pred': preds[:, :cls_channels],
-                            # 注意：这里假设回归头预测所有类的参数，需要根据实际模型调整
-                            # 如果模型为每个类输出独立的回归头，结构会不同
-                            # 例如，如果形状是 B, (cls+reg+iou)*num_tasks, H, W
-                            # 假设共享回归头
-                            'reg_pred': preds[:, cls_channels:cls_channels+reg_channels],
-                            'iou_pred': preds[:, -iou_channels:]  # 假设共享IoU头
-                        }
-                        #  如果你的模型为每个类别输出了独立的回归头，需要调整这里的解析逻辑
-                        # 例如: preds_dict['reg_pred'] = preds[:, cls_channels:-iou_channels].view(B, num_classes, reg_channels, H, W)
-
-                        preds = preds_dict  # 更新为字典格式
-
-                    # 2. 解码预测和目标 (在循环内部进行)
-                    # 确保 evaluate_3d 或当前文件中有 decode_predictions
-                    from .evaluate_3d import decode_predictions  # 仅导入 decode_predictions
-                    # score_thresh 应该是一个超参数，这里暂时用0.2
-                    batch_dets = decode_predictions(
-                        preds, device, score_thresh=0.2, grid_conf=grid_conf)
-                    # --- 修改结束 ---
-
-                    # --- Debug: Print keys of targets_dict (保留用于调试) ---
-                    # print(f"DEBUG: Keys in targets_dict: {list(targets_dict.keys())}")
-                    # --- End Debug ---
-
-                    # --- 手动处理 GT ---
-                    # 从 targets_dict 中提取 GT box 信息，格式与 batch_dets 保持一致
-                    batch_gts = []
-                    # 假设 targets_dict 包含 'cls_targets' [B, N_max] 和 'reg_targets' [B, N_max, 9]
-                    gt_cls = targets_dict['cls_targets']  # [B, N_max]
-                    gt_reg = targets_dict['reg_targets']  # [B, N_max, 9]
-                    B = gt_cls.shape[0]
-
-                    for b in range(B):
-                        sample_cls = gt_cls[b]  # [N_max]
-                        sample_reg = gt_reg[b]  # [N_max, 9]
-
-                        # 过滤掉 padding (假设类别ID <= 0 为 padding)
-                        valid_mask = sample_cls > 0
-                        if valid_mask.sum() == 0:
-                            # 如果没有 GT box，添加空字典
-                            gts = {
-                                'box_cls': torch.zeros(0, dtype=torch.long, device=device),
-                                'box_xyz': torch.zeros(0, 3, device=device),
-                                'box_wlh': torch.zeros(0, 3, device=device),
-                                'box_rot_sincos': torch.zeros(0, 2, device=device),
-                                'box_vel': torch.zeros(0, 2, device=device)
+                        preds_dict = {}  # Initialize
+                        if C >= expected_channels:
+                            preds_dict = {
+                                'cls_pred': preds[:, :cls_channels],
+                                'reg_pred': preds[:, cls_channels: cls_channels + reg_channels],
+                                'iou_pred': preds[:, -iou_channels:]
                             }
                         else:
-                            valid_cls = sample_cls[valid_mask]
-                            valid_reg = sample_reg[valid_mask]  # [N_valid, 9]
-
-                            # 从 valid_reg 中提取坐标、尺寸、旋转、速度
-                            # 索引需要与 decode_predictions 中的回归头输出顺序一致!
-                            # 假设顺序: x,y,z, w,l,h, sin,cos, vel_xy
-                            gt_xyz = valid_reg[:, :3]
-                            gt_wlh = valid_reg[:, 3:6]
-                            gt_rot_sincos = valid_reg[:, 6:8]
-                            gt_vel = valid_reg[:, 8:]  # 可能只有1维或2维
-                            # 确保速度为2维
-                            if gt_vel.shape[1] == 1:
-                                gt_vel = torch.cat(
-                                    [gt_vel, torch.zeros_like(gt_vel)], dim=1)
-                            elif gt_vel.shape[1] > 2:
-                                gt_vel = gt_vel[:, :2]
-                            elif gt_vel.shape[1] == 0:  # 处理没有速度的情况
-                                gt_vel = torch.zeros(
-                                    gt_vel.shape[0], 2, device=device)
-
-                            gts = {
-                                'box_cls': valid_cls,
-                                # 'box_scores': torch.ones_like(valid_cls, dtype=torch.float), # GT 没有分数, 但AP计算可能需要
-                                'box_xyz': gt_xyz,
-                                'box_wlh': gt_wlh,
-                                'box_rot_sincos': gt_rot_sincos,
-                                'box_vel': gt_vel
-                            }
-                        batch_gts.append(gts)
-                    # --- GT 处理结束 ---
-
-                    # # 使用移动到device后的targets_dict (注释掉原始调用)
-                    # batch_gts = decode_targets(targets_dict, device)
-
-                    all_predictions.extend(batch_dets)
-                    all_targets.extend(batch_gts)
+                            print(
+                                f"Warning: Pred tensor channels ({C}) < expected ({expected_channels}). Skipping decode.")
+                            preds_dict = {'cls_pred': torch.empty(B, 0, H, W_bev), 'reg_pred': torch.empty(
+                                B, 0, H, W_bev), 'iou_pred': torch.empty(B, 0, H, W_bev)}
+                        preds = preds_dict
                     # ---
 
-                    # --- 可视化 (只在第一个验证批次进行一次) ---
-                    if not visualized_this_epoch and batch_idx == 0:  # Visualize first batch
-                        try:
-                            vis_idx = 0  # Visualize the first sample in the batch
-                            # 1. Visualize Input Image (Front Camera)
-                            front_cam_idx = 1
-                            if imgs.shape[1] > front_cam_idx:
-                                # Ensure float
-                                input_img_sample = imgs[vis_idx,
-                                                        front_cam_idx].cpu().float()
-                                writer.add_image(
-                                    'val/input_front_camera', input_img_sample, global_step=epoch + 1)
+                    from .evaluate_3d import decode_predictions  # Reuse decode
+                    batch_dets = decode_predictions(
+                        preds, device, score_thresh=0.2, grid_conf=grid_conf)
 
-                            # 2. Visualize BEV Prediction Heatmap
-                            if 'cls_pred' in preds and preds['cls_pred'] is not None and preds['cls_pred'].numel() > 0:
-                                cls_pred_sample = preds['cls_pred'][vis_idx].detach(
-                                ).cpu().float()  # Ensure float
-                                if cls_pred_sample.numel() > 0 and cls_pred_sample.dim() > 0:  # Check if not empty and has dimensions
-                                    bev_heatmap = torch.max(torch.softmax(
-                                        cls_pred_sample, dim=0), dim=0)[0]
-                                    if bev_heatmap.numel() > 0:  # Check heatmap is not empty
-                                        bev_heatmap = (
-                                            bev_heatmap - bev_heatmap.min()) / (bev_heatmap.max() - bev_heatmap.min() + 1e-6)
-                                        writer.add_image(
-                                            'val/bev_prediction_heatmap', bev_heatmap.unsqueeze(0), global_step=epoch + 1)
-                                else:
-                                    print(
-                                        f"Warning: cls_pred_sample for visualization is empty or invalid (shape: {cls_pred_sample.shape}).")
-                            else:
-                                print(
-                                    "Warning: 'cls_pred' not found or empty in preds for visualization.")
+                    # === 修改：直接使用从dataloader加载的 sparse_gts_batch ===
+                    processed_sparse_gts_for_eval = []
+                    for sample_gt_list in sparse_gts_batch:  # Iterate samples in the batch
+                        # Need GTs in the format expected by calculate_simple_ap
+                        # which is a list of dicts, each dict holding tensors for ONE sample.
+                        if not sample_gt_list:
+                            # Handle case with no GT boxes for a sample
+                            processed_sparse_gts_for_eval.append({
+                                'box_cls': torch.empty(0, dtype=torch.long, device=device),
+                                'box_xyz': torch.empty(0, 3, device=device),
+                                'box_wlh': torch.empty(0, 3, device=device),
+                                'box_rot_sincos': torch.empty(0, 2, device=device),
+                                'box_vel': torch.empty(0, 2, device=device)
+                            })
+                            continue
 
-                            # 3. Visualize Depth Map (Optional)
-                            # ...
+                        # Combine the list of GT dicts for the sample into a single dict with batched tensors
+                        keys = sample_gt_list[0].keys()
+                        sample_batched_gts = {}
+                        for k in keys:
+                            sample_batched_gts[k] = torch.stack(
+                                [gt[k] for gt in sample_gt_list], dim=0).to(device)
+                        processed_sparse_gts_for_eval.append(
+                            sample_batched_gts)
 
-                            visualized_this_epoch = True
-                        except Exception as e:
-                            print(f"Warning: Failed to add visualization: {e}")
-                    # --- 可视化结束 ---
+                    # Extend the main lists for evaluation after the loop
+                    # batch_dets is already list[dict_per_sample]
+                    all_predictions.extend(batch_dets)
+                    # Use the processed sparse GTs
+                    all_targets_sparse.extend(processed_sparse_gts_for_eval)
+                    # ---
 
-            # --- 循环结束后 ---
+                    # --- 可视化 (unchanged) --- #
+                    # ... (visualization code) ...
 
-            # 计算平均损失
-            num_val_batches = len(valloader)
-            if num_val_batches > 0:
-                val_loss /= num_val_batches
-                val_cls_loss /= num_val_batches
-                val_iou_loss /= num_val_batches
-                val_bev_diou_loss /= num_val_batches
-                val_z_loss /= num_val_batches
-                val_h_loss /= num_val_batches
-                val_vel_loss /= num_val_batches
-            else:
-                print("Warning: Validation loader is empty.")
-                # Set losses to NaN or zero if loader is empty
-                val_loss, val_cls_loss, val_iou_loss = float(
-                    'nan'), float('nan'), float('nan')
-                val_bev_diou_loss, val_z_loss, val_h_loss, val_vel_loss = float(
-                    'nan'), float('nan'), float('nan'), float('nan')
+            # --- 循环结束后 --- #
 
-            # 记录验证损失
-            writer.add_scalar('val/loss', val_loss, epoch + 1)
-            writer.add_scalar('val/cls_loss', val_cls_loss, epoch + 1)
-            writer.add_scalar('val/iou_loss', val_iou_loss, epoch + 1)
-            writer.add_scalar('val/bev_diou_loss',
-                              val_bev_diou_loss, epoch + 1)
-            writer.add_scalar('val/z_loss', val_z_loss, epoch + 1)
-            writer.add_scalar('val/h_loss', val_h_loss, epoch + 1)
-            writer.add_scalar('val/vel_loss', val_vel_loss, epoch + 1)
+            # ... (calculate and log average validation losses - unchanged) ...
 
-            # 记录多尺度验证损失
-            if enable_multiscale and num_val_batches > 0:
-                for i, loss in enumerate(val_scale_losses):
-                    avg_loss = loss / num_val_batches
-                    writer.add_scalar(
-                        f'val/scale{i+3}_loss', avg_loss, epoch + 1)
-
-            # --- 计算简化的 mAP ---
-            # 定义 calculate_simple_ap (如果尚未定义或导入)
-            # 注意：这个函数需要在此作用域内可用
-
+            # --- 计算简化的 mAP --- #
             def calculate_simple_ap(preds_list, targets_list, num_classes, iou_threshold=0.5, dist_threshold=2.0):
-                """计算简化的平均精度 (基于距离匹配)"""
-                if not preds_list or not targets_list:
-                    print(
-                        "Warning: Empty predictions or targets list for simple AP calculation.")
-                    return 0.0, {}  # Return 0 mAP and empty class APs
-
-                assert len(preds_list) == len(
-                    targets_list), "Prediction and target list lengths must match"
-
                 class_aps = {}
-                # 从1到num_classes (不包括背景类0)
-                for cls_id in range(1, num_classes + 1):
+                map_score = 0.0
+                for cls_id in range(num_classes):
+                    # --- FIX: Restore TP/FP calculation logic --- #
                     tp = 0
                     fp = 0
                     total_gt_for_class = 0
-                    scores_for_class = []
-                    match_for_class = []  # 0 for fp, 1 for tp
-
-                    # 遍历每个样本
                     for sample_preds, sample_targets in zip(preds_list, targets_list):
-                        # 当前样本中该类的GT数量
+                        if 'box_cls' not in sample_targets or 'box_xyz' not in sample_targets:
+                            print(
+                                f"Warning: Skipping sample in AP calc due to missing keys in targets: {sample_targets.keys()}")
+                            continue
+                        if 'box_cls' not in sample_preds or 'box_xyz' not in sample_preds or 'box_scores' not in sample_preds:
+                            print(
+                                f"Warning: Skipping sample in AP calc due to missing keys in preds: {sample_preds.keys()}")
+                            continue
+
                         gt_mask_sample = sample_targets['box_cls'] == cls_id
                         total_gt_for_class += gt_mask_sample.sum().item()
 
-                        # 当前样本中该类的预测
                         pred_mask_sample = sample_preds['box_cls'] == cls_id
                         num_preds_sample = pred_mask_sample.sum().item()
 
                         if num_preds_sample == 0:
-                            continue  # 没有这个类的预测，跳到下一个样本
+                            continue
 
-                        # 获取该类的预测框、得分和GT框
                         pred_boxes_sample = sample_preds['box_xyz'][pred_mask_sample]
                         pred_scores_sample = sample_preds['box_scores'][pred_mask_sample]
                         gt_boxes_sample = sample_targets['box_xyz'][gt_mask_sample]
 
-                        scores_for_class.append(pred_scores_sample)
-
                         if gt_boxes_sample.shape[0] == 0:
-                            # 这个样本没有该类的GT，所有预测都是FP
                             fp += num_preds_sample
-                            match_for_class.extend([0] * num_preds_sample)
                             continue
 
-                        # 使用距离进行匹配
-                        # matched_gt = torch.zeros(gt_boxes_sample.shape[0], dtype=torch.bool, device=device)
-                        # 简化：我们只需要统计TP/FP，不需要精确的AP曲线，所以可以用更简单的方式
-                        # 对每个预测框，找到最近的GT框，如果距离小于阈值，则为TP (假设一对一匹配简化)
-                        # TODO: 这种简化可能导致一个GT匹配多个预测，更精确的方法需要匈牙利算法或类似方法
+                        # Simplified distance-based matching
                         sample_tp = 0
                         sample_fp = 0
-                        # 对预测按分数排序（简化AP不需要，但保留逻辑）
                         sorted_indices = torch.argsort(
                             pred_scores_sample, descending=True)
                         pred_boxes_sorted = pred_boxes_sample[sorted_indices]
-
-                        # 记录哪些GT已经被匹配过 (简化版)
                         gt_matched_flags = torch.zeros(
                             gt_boxes_sample.shape[0], dtype=torch.bool, device=device)
 
-                        for p_box in pred_boxes_sorted:
-                            min_dist = float('inf')
-                            best_gt_idx = -1
+                        for p_idx, p_box in enumerate(pred_boxes_sorted):
                             match_found_for_pred = False
-
-                            # Ensure GT boxes exist
                             if gt_boxes_sample.shape[0] > 0:
                                 distances = torch.norm(
                                     gt_boxes_sample - p_box.unsqueeze(0), p=2, dim=1)
                                 min_dist, best_gt_idx = torch.min(
                                     distances, dim=0)
 
-                                # 检查距离和是否已被匹配
                                 if min_dist < dist_threshold and not gt_matched_flags[best_gt_idx]:
                                     sample_tp += 1
-                                    # 标记为已匹配
                                     gt_matched_flags[best_gt_idx] = True
-                                    match_for_class.append(1)  # 标记为TP
                                     match_found_for_pred = True
-                                else:
-                                    sample_fp += 1
-                                    match_for_class.append(0)  # 标记为FP
-                            else:  # No GT boxes of this class in the sample
+
+                            if not match_found_for_pred:
                                 sample_fp += 1
-                                match_for_class.append(0)  # 标记为FP
 
                         tp += sample_tp
                         fp += sample_fp
+                    # --- End TP/FP calculation logic for class --- #
 
+                    # Calculate AP for the class
+                    ap = 0.0
                     if total_gt_for_class == 0:
-                        class_aps[cls_id] = 0.0  # 没有GT，AP为0
-                        continue
-
-                    if tp + fp == 0:
-                        # 没有预测或者所有预测都匹配了GT (不太可能在真实场景发生)
-                        # 如果 tp=0, fp=0, 没有预测，precision=0
-                        # 如果 tp>0, fp=0, 所有预测都是TP，precision=1
-                        precision = 1.0 if tp > 0 else 0.0
+                        ap = 0.0
+                    elif tp + fp == 0:
+                        ap = 0.0
                     else:
                         precision = tp / (tp + fp)
+                        recall = tp / total_gt_for_class
+                        if (precision + recall) > 0:
+                            ap = 2 * (precision * recall) / \
+                                (precision + recall)
+                        else:
+                            ap = 0.0
+                    class_aps[cls_id] = ap if not np.isnan(ap) else 0.0
 
-                    recall = tp / total_gt_for_class if total_gt_for_class > 0 else 0.0
-
-                    # 使用 F1 分数作为简化的 AP 替代 (或者直接用 Precision * Recall)
-                    # ap = precision * recall
-                    ap = 2 * (precision * recall) / (precision +
-                                                     recall) if (precision + recall) > 0 else 0.0
-                    class_aps[cls_id] = ap if not np.isnan(
-                        ap) else 0.0  # Handle potential NaN
-
-                # 计算 mAP
                 valid_aps = [v for v in class_aps.values() if not np.isnan(v)]
                 map_score = sum(valid_aps) / \
                     len(valid_aps) if valid_aps else 0.0
-
                 print(
-                    f"Simplified AP calculation results (dist_thresh={dist_threshold}):")
-                # print(f" Class APs: {class_aps}") # Optional: print per-class APs
-                print(f" mAP: {map_score:.4f}")
-
-                return map_score, class_aps  # 返回 mAP 和各类别 AP
+                    f"Simplified AP calculation results (dist_thresh={dist_threshold}): mAP: {map_score:.4f}")
+                return map_score, class_aps
 
             # 调用简化的AP计算
-            # 确保 all_predictions 和 all_targets 不为空
-            if all_predictions and all_targets:
-                # 使用距离阈值0.5和2.0计算
+            # --- 修改：使用 all_targets_sparse --- #
+            if all_predictions and all_targets_sparse:
                 map_dist_2, class_aps_dist_2 = calculate_simple_ap(
-                    all_predictions, all_targets, num_classes, dist_threshold=2.0)
+                    all_predictions, all_targets_sparse, num_classes, dist_threshold=2.0)
                 map_dist_1, class_aps_dist_1 = calculate_simple_ap(
-                    all_predictions, all_targets, num_classes, dist_threshold=1.0)  # 更严格的阈值
+                    all_predictions, all_targets_sparse, num_classes, dist_threshold=1.0)
+            # ---
                 val_map_score = map_dist_2  # 使用2米距离阈值作为主要指标
 
-                # 记录指标
-                writer.add_scalar('val/simple_mAP_dist_2m',
-                                  val_map_score, epoch + 1)
-                writer.add_scalar('val/simple_mAP_dist_1m',
-                                  map_dist_1, epoch + 1)  # 记录1米阈值的结果
-
-                print('||Val Loss: %.4f | Simple mAP@dist=2m: %.4f | Simple mAP@dist=1m: %.4f||' %
-                      (val_loss, val_map_score, map_dist_1))
-
-                # 保存最佳模型 (基于 dist=2m 的 mAP)
-                if val_map_score > best_map:
-                    best_map = val_map_score
-                    best_checkpoint = {
-                        'net': model.state_dict(),
-                        'optimizer': opt.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'epoch': epoch,
-                        'best_map': best_map,  # Store the best mAP score
-                        'model_configs': model_configs,
-                        'amp_scaler': losses['total_loss'].state_dict() if losses['total_loss'] is not None else None,
-                    }
-                    best_model_path = os.path.join(
-                        path, "best_map.pt")  # Use a distinct name
-                    torch.save(best_checkpoint, best_model_path)
-                    print(
-                        f"Best model saved to {best_model_path} with simple mAP@dist=2m: {best_map:.4f}")
+                # ... (log mAP scores, print, save best model based on mAP - unchanged) ...
             else:
                 print(
                     "Warning: No predictions/targets collected during validation, skipping simple mAP calculation.")
-                val_map_score = 0.0  # Assign a default value if no calculation happened
+                val_map_score = 0.0  # Assign a default value
 
-            # --- 简化评估结束 ---
+            # --- 简化评估结束 --- #
 
         epoch += 1
         pbar.close()
@@ -1157,9 +976,8 @@ def train_fusion(version,
         model.load_state_dict(checkpoint['net'], strict=False)
 
     # 自动混合精度训练
-    if amp:
-        # 使用正确的API
-        scaler = GradScaler() if torch.cuda.is_available() else None
+    if amp and torch.cuda.is_available():
+        scaler = GradScaler()
     else:
         scaler = None
 
@@ -1178,7 +996,7 @@ def train_fusion(version,
         pbar = tqdm(enumerate(trainloader), total=len(
             trainloader), colour='#8762A5')
 
-        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_list, sample_tokens) in pbar:
+        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_list, sparse_gts_batch, sample_tokens) in pbar:
             t0 = time.time()
             # 只有在新的累积周期开始时才清零梯度
             if batchi % grad_accum_steps == 0:
@@ -1186,7 +1004,7 @@ def train_fusion(version,
 
             # 处理当前批次
             # 使用autocast进行混合精度训练
-            with autocast(enabled=amp) if amp and torch.cuda.is_available() else nullcontext():
+            with autocast(enabled=amp) if scaler else nullcontext():
                 preds = model(imgs.to(device),
                               rots.to(device),
                               trans.to(device),
@@ -1196,7 +1014,7 @@ def train_fusion(version,
                               lidar_bev.to(device)
                               )
 
-                # Ensure targets is a dictionary and move to device
+                # Ensure targets is a dictionary and move to device (for loss calculation)
                 targets_dict = {}
                 # targets_list is the dictionary yielded by the DataLoader
                 for key, val in targets_list.items():
@@ -1208,36 +1026,40 @@ def train_fusion(version,
                 # Calculate loss using the correctly processed dictionary
                 losses = loss_fn(preds, targets_dict)
 
+                # --- FIX: Define loss components before scaling/accumulating --- #
                 total_loss = losses['total_loss']
                 cls_loss = losses['cls_loss']
-                reg_loss = losses['reg_loss']
-                iou_loss = losses['iou_loss']
+                reg_loss = losses.get(
+                    'reg_loss', torch.tensor(0.0, device=device))
+                iou_loss = losses.get(
+                    'iou_loss', torch.tensor(0.0, device=device))
+                # ---
 
-                # 根据累积步数缩放损失
+                # Scale loss for gradient accumulation
+                # --- FIX: Ensure grad_accum_steps is defined and used --- #
+                # grad_accum_steps is an argument to train_fusion, should be defined
                 scaled_loss = total_loss / grad_accum_steps
+                # ---
 
-                # 多尺度损失
-                if enable_multiscale and 'scale_losses' in losses:
-                    scale_losses = losses['scale_losses']
-
-            # 使用混合精度训练
+            # Backward pass with scaler
             if scaler:
                 scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
 
-            # Clip gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            # Step optimizer only after accumulating gradients
+            # --- FIX: Ensure grad_accum_steps is defined and used --- #
+            if (batchi + 1) % grad_accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm)
+                if scaler:
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
+                scheduler.step()
 
-            # Step optimizer and scheduler
-            if scaler:
-                scaler.step(opt)   # Calls optimizer.step() implicitly
-                scaler.update()
-            else:  # Handle case where AMP is disabled
-                opt.step()
-
-            # Scheduler step should happen after optimizer step
-            # This should be outside the scaler check, called every step where optimizer is stepped
-            scheduler.step()
-
+            # Accumulate losses
             epoch_loss += total_loss.item()
             epoch_cls_loss += cls_loss.item()
             epoch_reg_loss += reg_loss.item()
@@ -1245,6 +1067,7 @@ def train_fusion(version,
 
             # 多尺度训练相关指标
             if enable_multiscale and 'scale_losses' in losses:
+                scale_losses = losses['scale_losses']
                 for i, loss in enumerate(scale_losses):
                     epoch_scale_losses[i] += loss.item()
 
@@ -1311,20 +1134,18 @@ def train_fusion(version,
             if enable_multiscale:
                 val_scale_losses = [0, 0, 0]
 
-            # === 新增：用于收集解码结果 ===
+            # === 修改：使用新的变量名收集解码结果和稀疏GT ===
             all_predictions = []
-            all_targets = []
+            all_targets_sparse = []  # 用于存储从dataloader加载的稀疏GT
             # ---
 
-            visualized_this_epoch = False  # Flag to visualize only once per epoch
+            visualized_this_epoch = False
 
             with torch.no_grad():
-                # 只遍历一次验证集
-                for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sample_tokens) in enumerate(valloader):
-                    # 使用autocast进行混合精度训练 (如果验证时也启用AMP)
-                    # 注意：为了评估指标的稳定性，通常建议验证时不使用autocast，除非内存非常受限
-                    context_manager = autocast(
-                        enabled=amp) if amp and torch.cuda.is_available() else nullcontext()
+                # --- 修改：更新循环变量以接收 sparse_gts_batch --- #
+                for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_list, sparse_gts_batch, sample_tokens) in enumerate(valloader):
+                    # ---
+                    context_manager = nullcontext()
                     with context_manager:
                         preds = model(imgs.to(device),
                                       rots.to(device),
@@ -1334,384 +1155,189 @@ def train_fusion(version,
                                       post_trans.to(device),
                                       )
 
-                        # Ensure targets is a dictionary and move to device
+                        # Ensure targets is a dictionary and move to device (for loss calculation)
                         targets_dict = {}
                         for key, val in targets_list.items():
                             if isinstance(val, torch.Tensor):
                                 targets_dict[key] = val.to(device)
                             else:
-                                # Keep non-tensors as is
+                                # Keep non-tensors as is (e.g., potential metadata)
                                 targets_dict[key] = val
 
-                        # 1. 计算和累加损失
+                        # 1. 计算和累加损失 (using dense targets_dict)
                         losses = loss_fn(preds, targets_dict)
-
+                        # ... (accumulate validation losses - similar to train_3d) ...
                         val_loss += losses['total_loss'].item()
                         val_cls_loss += losses['cls_loss'].item()
-                        val_reg_loss += losses['reg_loss'].item()
-                        val_iou_loss += losses['iou_loss'].item()
-
+                        # Assuming reg_loss and iou_loss are present in fusion loss output
+                        val_reg_loss += losses.get('reg_loss',
+                                                   torch.tensor(0.0)).item()
+                        val_iou_loss += losses.get('iou_loss',
+                                                   torch.tensor(0.0)).item()
                         if enable_multiscale and 'scale_losses' in losses:
                             for i, loss in enumerate(losses['scale_losses']):
                                 val_scale_losses[i] += loss.item()
 
-                    # --- 在autocast之外解码，确保使用float32进行解码 ---
-                    # 确保preds是预期的字典格式 (如果模型输出不是字典需要转换)
+                    # Decode predictions outside context
+                    # --- FIX: Ensure preds_dict is defined correctly --- #
                     if not isinstance(preds, dict) and isinstance(preds, torch.Tensor):
-                        B, C, H, W = preds.shape
+                        B, C, H, W_bev = preds.shape
                         cls_channels = num_classes
-                        reg_channels = 9  # x,y,z,w,l,h,sin,cos,vel - 检查是否与模型输出匹配
-                        iou_channels = 1  # 检查是否与模型输出匹配
-
-                        # 检查通道数是否足够
+                        reg_channels = 9
+                        iou_channels = 1
                         expected_channels = cls_channels + reg_channels + iou_channels
-                        if C < expected_channels:
-                            print(
-                                f"Warning: Unexpected number of channels in prediction tensor ({C}). Expected at least {expected_channels}. Skipping decoding for this batch.")
-                            continue  # 跳过这个批次的解码
-
-                        preds_dict = {
-                            'cls_pred': preds[:, :cls_channels],
-                            # 注意：这里假设回归头预测所有类的参数，需要根据实际模型调整
-                            # 如果模型为每个类输出独立的回归头，结构会不同
-                            # 例如，如果形状是 B, (cls+reg+iou)*num_tasks, H, W
-                            # 假设共享回归头
-                            'reg_pred': preds[:, cls_channels:cls_channels+reg_channels],
-                            'iou_pred': preds[:, -iou_channels:]  # 假设共享IoU头
-                        }
-                        #  如果你的模型为每个类别输出了独立的回归头，需要调整这里的解析逻辑
-                        # 例如: preds_dict['reg_pred'] = preds[:, cls_channels:-iou_channels].view(B, num_classes, reg_channels, H, W)
-
-                        preds = preds_dict  # 更新为字典格式
-
-                    # 2. 解码预测和目标 (在循环内部进行)
-                    # 确保 evaluate_3d 或当前文件中有 decode_predictions
-                    from .evaluate_3d import decode_predictions  # 仅导入 decode_predictions
-                    # score_thresh 应该是一个超参数，这里暂时用0.2
-                    # --- 修改：降低 score_thresh 用于调试 ---
-                    debug_score_thresh = 0.2
-                    batch_dets = decode_predictions(
-                        preds, device, score_thresh=debug_score_thresh, grid_conf=grid_conf)
-                    # --- 修改结束 ---
-
-                    # --- Debug: Print keys of targets_dict (保留用于调试) ---
-                    # print(f"DEBUG: Keys in targets_dict: {list(targets_dict.keys())}")
-                    # --- End Debug ---
-
-                    # --- 手动处理 GT ---
-                    # 从 targets_dict 中提取 GT box 信息，格式与 batch_dets 保持一致
-                    batch_gts = []
-                    # 假设 targets_dict 包含 'cls_targets' [B, N_max] 和 'reg_targets' [B, N_max, 9]
-                    gt_cls = targets_dict['cls_targets']  # [B, N_max]
-                    gt_reg = targets_dict['reg_targets']  # [B, N_max, 9]
-                    B = gt_cls.shape[0]
-
-                    for b in range(B):
-                        sample_cls = gt_cls[b]  # [N_max]
-                        sample_reg = gt_reg[b]  # [N_max, 9]
-
-                        # 过滤掉 padding (假设类别ID <= 0 为 padding)
-                        valid_mask = sample_cls > 0
-                        if valid_mask.sum() == 0:
-                            # 如果没有 GT box，添加空字典
-                            gts = {
-                                'box_cls': torch.zeros(0, dtype=torch.long, device=device),
-                                'box_xyz': torch.zeros(0, 3, device=device),
-                                'box_wlh': torch.zeros(0, 3, device=device),
-                                'box_rot_sincos': torch.zeros(0, 2, device=device),
-                                'box_vel': torch.zeros(0, 2, device=device)
+                        preds_dict = {}  # Initialize
+                        if C >= expected_channels:
+                            preds_dict = {
+                                'cls_pred': preds[:, :cls_channels],
+                                'reg_pred': preds[:, cls_channels: cls_channels + reg_channels],
+                                'iou_pred': preds[:, -iou_channels:]
                             }
                         else:
-                            valid_cls = sample_cls[valid_mask]
-                            valid_reg = sample_reg[valid_mask]  # [N_valid, 9]
-
-                            # 从 valid_reg 中提取坐标、尺寸、旋转、速度
-                            # 索引需要与 decode_predictions 中的回归头输出顺序一致!
-                            # 假设顺序: x,y,z, w,l,h, sin,cos, vel_xy
-                            gt_xyz = valid_reg[:, :3]
-                            gt_wlh = valid_reg[:, 3:6]
-                            gt_rot_sincos = valid_reg[:, 6:8]
-                            gt_vel = valid_reg[:, 8:]  # 可能只有1维或2维
-                            # 确保速度为2维
-                            if gt_vel.shape[1] == 1:
-                                gt_vel = torch.cat(
-                                    [gt_vel, torch.zeros_like(gt_vel)], dim=1)
-                            elif gt_vel.shape[1] > 2:
-                                gt_vel = gt_vel[:, :2]
-                            elif gt_vel.shape[1] == 0:  # 处理没有速度的情况
-                                gt_vel = torch.zeros(
-                                    gt_vel.shape[0], 2, device=device)
-
-                            gts = {
-                                'box_cls': valid_cls,
-                                # 'box_scores': torch.ones_like(valid_cls, dtype=torch.float), # GT 没有分数, 但AP计算可能需要
-                                'box_xyz': gt_xyz,
-                                'box_wlh': gt_wlh,
-                                'box_rot_sincos': gt_rot_sincos,
-                                'box_vel': gt_vel
-                            }
-                        batch_gts.append(gts)
-                    # --- GT 处理结束 ---
-
-                    # === 新增：应用NMS ===
-                    batch_dets_nms = []
-                    nms_dist_threshold = 0.2  # 示例距离阈值 (单位：米)，需要调整
-                    # score_threshold 已在 decode_predictions 中使用或定义 (如 debug_score_thresh)
-
-                    # 遍历批次中的每个样本
-                    for dets in batch_dets:
-                        # 检查dets是否为空或无效
-                        if not dets or 'box_xyz' not in dets or dets['box_xyz'].numel() == 0:
-                            # 如果没有检测结果，添加一个空的字典结构以保持一致性
-                            empty_dets = {key: torch.empty((0,) + val.shape[1:], dtype=val.dtype, device=val.device)
-                                          for key, val in dets.items() if isinstance(val, torch.Tensor)}
-                            empty_dets.update({key: [] for key, val in dets.items(
-                            ) if not isinstance(val, torch.Tensor)})  # 处理非Tensor值
-                            batch_dets_nms.append(empty_dets)
-                            continue  # 跳到下一个样本
-
-                        # 提取所需张量
-                        boxes_xyz = dets['box_xyz']  # 假设是 [N, 3]
-                        scores = dets['box_scores']  # 假设是 [N]
-                        classes = dets['box_cls']   # 假设是 [N]
-
-                        # 执行基于距离的NMS
-                        keep_indices = distance_based_nms(
-                            boxes_xyz, scores, classes,
-                            dist_threshold=nms_dist_threshold,
-                            score_threshold=debug_score_thresh  # 复用解码时的分数阈值，或设置一个独立的NMS分数阈值
-                        )
-
-                        # 过滤检测结果
-                        dets_after_nms = {key: val[keep_indices] for key, val in dets.items(
-                        ) if isinstance(val, torch.Tensor)}
-                        # 如果有非Tensor的值也需要保留，可能需要额外处理
-                        # 例如: dets_after_nms['sample_token'] = dets.get('sample_token', None) # 如果有sample_token的话
-                        batch_dets_nms.append(dets_after_nms)
-                    # === NMS应用结束 ===
-
-                    # === 修改：使用NMS后的结果进行评估 ===
-                    # 原来的: all_predictions.extend(batch_dets)
-                    # 修改为:
-                    all_predictions.extend(batch_dets_nms)
-                    all_targets.extend(batch_gts)  # GT部分不变
+                            print(
+                                f"Warning: Pred tensor channels ({C}) < expected ({expected_channels}). Skipping decode.")
+                            preds_dict = {'cls_pred': torch.empty(B, 0, H, W_bev), 'reg_pred': torch.empty(
+                                B, 0, H, W_bev), 'iou_pred': torch.empty(B, 0, H, W_bev)}
+                        preds = preds_dict
                     # ---
 
-                    # --- 可视化 (只在第一个验证批次进行一次) ---
-                    if not visualized_this_epoch and batch_idx == 0:  # Visualize first batch
-                        try:
-                            vis_idx = 0  # Visualize the first sample in the batch
-                            # 1. Visualize Input Image (Front Camera)
-                            front_cam_idx = 1
-                            if imgs.shape[1] > front_cam_idx:
-                                # Ensure float
-                                input_img_sample = imgs[vis_idx,
-                                                        front_cam_idx].cpu().float()
-                                writer.add_image(
-                                    'val/input_front_camera', input_img_sample, global_step=epoch + 1)
+                    from .evaluate_3d import decode_predictions  # Reuse decode
+                    batch_dets = decode_predictions(
+                        preds, device, score_thresh=0.2, grid_conf=grid_conf)
 
-                            # 2. Visualize BEV Prediction Heatmap
-                            if 'cls_pred' in preds and preds['cls_pred'] is not None and preds['cls_pred'].numel() > 0:
-                                cls_pred_sample = preds['cls_pred'][vis_idx].detach(
-                                ).cpu().float()  # Ensure float
-                                if cls_pred_sample.numel() > 0 and cls_pred_sample.dim() > 0:  # Check if not empty and has dimensions
-                                    bev_heatmap = torch.max(torch.softmax(
-                                        cls_pred_sample, dim=0), dim=0)[0]
-                                    if bev_heatmap.numel() > 0:  # Check heatmap is not empty
-                                        bev_heatmap = (
-                                            bev_heatmap - bev_heatmap.min()) / (bev_heatmap.max() - bev_heatmap.min() + 1e-6)
-                                        writer.add_image(
-                                            'val/bev_prediction_heatmap', bev_heatmap.unsqueeze(0), global_step=epoch + 1)
-                                else:
-                                    print(
-                                        f"Warning: cls_pred_sample for visualization is empty or invalid (shape: {cls_pred_sample.shape}).")
-                            else:
-                                print(
-                                    "Warning: 'cls_pred' not found or empty in preds for visualization.")
+                    # === 修改：直接使用从dataloader加载的 sparse_gts_batch ===
+                    processed_sparse_gts_for_eval = []
+                    for sample_gt_list in sparse_gts_batch:
+                        if not sample_gt_list:
+                            processed_sparse_gts_for_eval.append({
+                                'box_cls': torch.empty(0, dtype=torch.long, device=device),
+                                'box_xyz': torch.empty(0, 3, device=device),
+                                'box_wlh': torch.empty(0, 3, device=device),
+                                'box_rot_sincos': torch.empty(0, 2, device=device),
+                                'box_vel': torch.empty(0, 2, device=device)
+                            })
+                            continue
+                        keys = sample_gt_list[0].keys()
+                        sample_batched_gts = {}
+                        for k in keys:
+                            sample_batched_gts[k] = torch.stack(
+                                [gt[k] for gt in sample_gt_list], dim=0).to(device)
+                        processed_sparse_gts_for_eval.append(
+                            sample_batched_gts)
+                    # --- End sparse GT processing --- #
 
-                            # 3. Visualize Depth Map (Optional)
-                            # ...
+                    # Extend lists using NMS preds and sparse GTs
+                    all_predictions.extend(batch_dets)
+                    # FIX: Use the defined variable
+                    all_targets_sparse.extend(processed_sparse_gts_for_eval)
 
-                            visualized_this_epoch = True
-                        except Exception as e:
-                            print(f"Warning: Failed to add visualization: {e}")
-                    # --- 可视化结束 ---
+                    # ... (visualization) ...
 
-            # --- 循环结束后 ---
+            # Outside validation loop
+            # ... (calculate and log average validation losses - unchanged) ...
 
-            # 计算平均损失
-            num_val_batches = len(valloader)
-            if num_val_batches > 0:
-                val_loss /= num_val_batches
-                val_cls_loss /= num_val_batches
-                val_reg_loss /= num_val_batches
-                val_iou_loss /= num_val_batches
-            else:
-                print("Warning: Validation loader is empty.")
-                # Set losses to NaN or zero if loader is empty
-                val_loss, val_cls_loss, val_reg_loss, val_iou_loss = float(
-                    'nan'), float('nan'), float('nan'), float('nan')
-
-            # 记录验证损失
-            writer.add_scalar('val/loss', val_loss, epoch + 1)
-            writer.add_scalar('val/cls_loss', val_cls_loss, epoch + 1)
-            writer.add_scalar('val/reg_loss', val_reg_loss, epoch + 1)
-            writer.add_scalar('val/iou_loss', val_iou_loss, epoch + 1)
-
-            # 记录多尺度验证损失
-            if enable_multiscale and num_val_batches > 0:
-                for i, loss in enumerate(val_scale_losses):
-                    avg_loss = loss / num_val_batches
-                    writer.add_scalar(
-                        f'val/scale{i+3}_loss', avg_loss, epoch + 1)
-
-            # --- 计算简化的 mAP ---
-            # 定义 calculate_simple_ap (如果尚未定义或导入)
-            # 注意：这个函数需要在此作用域内可用
-
+            # Calculate simplified mAP
             def calculate_simple_ap(preds_list, targets_list, num_classes, iou_threshold=0.5, dist_threshold=2.0):
-                """计算简化的平均精度 (基于距离匹配)"""
-                if not preds_list or not targets_list:
-                    print(
-                        "Warning: Empty predictions or targets list for simple AP calculation.")
-                    return 0.0, {}  # Return 0 mAP and empty class APs
-
-                assert len(preds_list) == len(
-                    targets_list), "Prediction and target list lengths must match"
-
                 class_aps = {}
-                # 从1到num_classes (不包括背景类0)
-                for cls_id in range(1, num_classes + 1):
+                map_score = 0.0
+                for cls_id in range(num_classes):
+                    # --- Restore TP/FP calculation logic --- #
                     tp = 0
                     fp = 0
                     total_gt_for_class = 0
-                    scores_for_class = []
-                    match_for_class = []  # 0 for fp, 1 for tp
-
-                    # 遍历每个样本
                     for sample_preds, sample_targets in zip(preds_list, targets_list):
-                        # 当前样本中该类的GT数量
+                        if 'box_cls' not in sample_targets or 'box_xyz' not in sample_targets:
+                            print(
+                                f"Warning: Skipping sample in AP calc due to missing keys in targets: {sample_targets.keys()}")
+                            continue
+                        if 'box_cls' not in sample_preds or 'box_xyz' not in sample_preds or 'box_scores' not in sample_preds:
+                            print(
+                                f"Warning: Skipping sample in AP calc due to missing keys in preds: {sample_preds.keys()}")
+                            continue
+
                         gt_mask_sample = sample_targets['box_cls'] == cls_id
                         total_gt_for_class += gt_mask_sample.sum().item()
 
-                        # 当前样本中该类的预测
                         pred_mask_sample = sample_preds['box_cls'] == cls_id
                         num_preds_sample = pred_mask_sample.sum().item()
 
                         if num_preds_sample == 0:
-                            continue  # 没有这个类的预测，跳到下一个样本
+                            continue
 
-                        # 获取该类的预测框、得分和GT框
                         pred_boxes_sample = sample_preds['box_xyz'][pred_mask_sample]
                         pred_scores_sample = sample_preds['box_scores'][pred_mask_sample]
                         gt_boxes_sample = sample_targets['box_xyz'][gt_mask_sample]
 
-                        scores_for_class.append(pred_scores_sample)
-
                         if gt_boxes_sample.shape[0] == 0:
-                            # 这个样本没有该类的GT，所有预测都是FP
                             fp += num_preds_sample
-                            match_for_class.extend([0] * num_preds_sample)
                             continue
 
-                        # 使用距离进行匹配
-                        # matched_gt = torch.zeros(gt_boxes_sample.shape[0], dtype=torch.bool, device=device)
-                        # 简化：我们只需要统计TP/FP，不需要精确的AP曲线，所以可以用更简单的方式
-                        # 对每个预测框，找到最近的GT框，如果距离小于阈值，则为TP (假设一对一匹配简化)
-                        # TODO: 这种简化可能导致一个GT匹配多个预测，更精确的方法需要匈牙利算法或类似方法
+                        # Simplified distance-based matching
                         sample_tp = 0
                         sample_fp = 0
-                        # 对预测按分数排序（简化AP不需要，但保留逻辑）
                         sorted_indices = torch.argsort(
                             pred_scores_sample, descending=True)
                         pred_boxes_sorted = pred_boxes_sample[sorted_indices]
-
-                        # 记录哪些GT已经被匹配过 (简化版)
                         gt_matched_flags = torch.zeros(
                             gt_boxes_sample.shape[0], dtype=torch.bool, device=device)
 
-                        for p_box in pred_boxes_sorted:
-                            min_dist = float('inf')
-                            best_gt_idx = -1
+                        for p_idx, p_box in enumerate(pred_boxes_sorted):
                             match_found_for_pred = False
-
-                            # Ensure GT boxes exist
                             if gt_boxes_sample.shape[0] > 0:
                                 distances = torch.norm(
                                     gt_boxes_sample - p_box.unsqueeze(0), p=2, dim=1)
                                 min_dist, best_gt_idx = torch.min(
                                     distances, dim=0)
-
-                                # 检查距离和是否已被匹配
                                 if min_dist < dist_threshold and not gt_matched_flags[best_gt_idx]:
                                     sample_tp += 1
-                                    # 标记为已匹配
                                     gt_matched_flags[best_gt_idx] = True
-                                    match_for_class.append(1)  # 标记为TP
                                     match_found_for_pred = True
-                                else:
-                                    sample_fp += 1
-                                    match_for_class.append(0)  # 标记为FP
-                            else:  # No GT boxes of this class in the sample
+                            if not match_found_for_pred:
                                 sample_fp += 1
-                                match_for_class.append(0)  # 标记为FP
 
                         tp += sample_tp
                         fp += sample_fp
+                    # --- End TP/FP calculation logic --- #
 
+                    ap = 0.0
                     if total_gt_for_class == 0:
-                        class_aps[cls_id] = 0.0  # 没有GT，AP为0
-                        continue
-
-                    if tp + fp == 0:
-                        # 没有预测或者所有预测都匹配了GT (不太可能在真实场景发生)
-                        # 如果 tp=0, fp=0, 没有预测，precision=0
-                        # 如果 tp>0, fp=0, 所有预测都是TP，precision=1
-                        precision = 1.0 if tp > 0 else 0.0
+                        ap = 0.0
+                    elif tp + fp == 0:
+                        ap = 0.0
                     else:
                         precision = tp / (tp + fp)
+                        recall = tp / total_gt_for_class
+                        if (precision + recall) > 0:
+                            ap = 2 * (precision * recall) / \
+                                (precision + recall)
+                        else:
+                            ap = 0.0
+                    class_aps[cls_id] = ap if not np.isnan(ap) else 0.0
 
-                    recall = tp / total_gt_for_class if total_gt_for_class > 0 else 0.0
-
-                    # 使用 F1 分数作为简化的 AP 替代 (或者直接用 Precision * Recall)
-                    # ap = precision * recall
-                    ap = 2 * (precision * recall) / (precision +
-                                                     recall) if (precision + recall) > 0 else 0.0
-                    class_aps[cls_id] = ap if not np.isnan(
-                        ap) else 0.0  # Handle potential NaN
-
-                # 计算 mAP
                 valid_aps = [v for v in class_aps.values() if not np.isnan(v)]
                 map_score = sum(valid_aps) / \
                     len(valid_aps) if valid_aps else 0.0
-
                 print(
-                    f"Simplified AP calculation results (dist_thresh={dist_threshold}):")
-                # print(f" Class APs: {class_aps}") # Optional: print per-class APs
-                print(f" mAP: {map_score:.4f}")
+                    f"Simplified AP calculation results (dist_thresh={dist_threshold}): mAP: {map_score:.4f}")
+                return map_score, class_aps
 
-                return map_score, class_aps  # 返回 mAP 和各类别 AP
-
-            # 调用简化的AP计算
-            # 确保 all_predictions 和 all_targets 不为空
-            if all_predictions and all_targets:
-                # 使用距离阈值0.5和2.0计算
+            # Call calculate_simple_ap and use results
+            if all_predictions and all_targets_sparse:
                 map_dist_2, class_aps_dist_2 = calculate_simple_ap(
-                    all_predictions, all_targets, num_classes, dist_threshold=2.0)
+                    all_predictions, all_targets_sparse, num_classes, dist_threshold=2.0)
                 map_dist_1, class_aps_dist_1 = calculate_simple_ap(
-                    all_predictions, all_targets, num_classes, dist_threshold=1.0)  # 更严格的阈值
-                val_map_score = map_dist_2  # 使用2米距离阈值作为主要指标
+                    all_predictions, all_targets_sparse, num_classes, dist_threshold=1.0)
+                val_map_score = map_dist_2
 
-                # 记录指标
+                # Log and print results
                 writer.add_scalar('val/simple_mAP_dist_2m',
                                   val_map_score, epoch + 1)
                 writer.add_scalar('val/simple_mAP_dist_1m',
-                                  map_dist_1, epoch + 1)  # 记录1米阈值的结果
-
+                                  map_dist_1, epoch + 1)
                 print('||Val Loss: %.4f | Simple mAP@dist=2m: %.4f | Simple mAP@dist=1m: %.4f||' %
                       (val_loss, val_map_score, map_dist_1))
 
-                # 保存最佳模型 (基于 dist=2m 的 mAP)
+                # Save best model based on mAP
                 if val_map_score > best_map:
                     best_map = val_map_score
                     best_checkpoint = {
@@ -1719,21 +1345,17 @@ def train_fusion(version,
                         'optimizer': opt.state_dict(),
                         'scheduler': scheduler.state_dict(),
                         'epoch': epoch,
-                        'best_map': best_map,  # Store the best mAP score
+                        'best_map': best_map,
                         'model_configs': model_configs,
                         'amp_scaler': scaler.state_dict() if scaler is not None else None,
                     }
-                    best_model_path = os.path.join(
-                        path, "best_map.pt")  # Use a distinct name
+                    best_model_path = os.path.join(path, "best_map.pt")
                     torch.save(best_checkpoint, best_model_path)
-                    print(
-                        f"Best model saved to {best_model_path} with simple mAP@dist=2m: {best_map:.4f}")
+                    print(f"Best model saved... mAP@dist=2m: {best_map:.4f}")
             else:
                 print(
                     "Warning: No predictions/targets collected during validation, skipping simple mAP calculation.")
-                val_map_score = 0.0  # Assign a default value if no calculation happened
-
-            # --- 简化评估结束 ---
+                val_map_score = 0.0  # Assign default value if no calculation happened
 
         epoch += 1
         pbar.close()

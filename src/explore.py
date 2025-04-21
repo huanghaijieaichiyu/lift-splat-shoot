@@ -6,7 +6,7 @@ Authors: Jonah Philion and Sanja Fidler
 
 from .models import compile_model
 from .tools import (ego_to_cam, get_only_in_img_mask, denormalize_img,
-                    SimpleLoss, get_val_info, add_ego, gen_dx_bx,
+                    get_val_info, add_ego, gen_dx_bx,
                     get_nusc_maps, plot_nusc_map, get_local_map)
 from .data import compile_data
 from .nuscenes_info import load_nuscenes_infos  # 导入数据集缓存加载函数
@@ -324,8 +324,8 @@ def eval_model_iou(version,
     else:
         model.load_state_dict(torch.load(modelf))
     model.to(device)
-
-    loss_fn = SimpleLoss(1.0).cuda(gpuid)
+    loss = nn.BCEWithLogitsLoss()
+    loss_fn = loss.cuda(gpuid)
 
     model.eval()
     val_info = get_val_info(model, valloader, loss_fn, device)
@@ -731,28 +731,6 @@ def viz_3d_detection(version,
                 # ------------------------- #
 
                 # 可视化预测结果
-                # 创建一个热力图来显示检测置信度
-                detection_map = np.zeros((H_bev, W_bev, 4))
-                # 为每个类别创建图例项
-                legend_handles = []
-                # 对每个类别进行可视化
-                for cls_idx in range(num_classes):
-                    # 结合类别置信度和IoU预测
-                    final_conf = pred_cls[si, cls_idx] * pred_iou[si, 0]
-                    cls_mask = final_conf > conf_thresh
-                    if cls_mask.sum() > 0:
-                        color = cmap(cls_idx)
-                        # 在检测图上用对应颜色和透明度标记
-                        mask_indices = np.where(cls_mask.numpy())
-                        for idx in zip(*mask_indices):
-                            detection_map[idx[0], idx[1]] = color
-                        # 添加到图例
-                        legend_handles.append(mpatches.Patch(
-                            color=color, label=class_names[cls_idx]))
-
-                # 显示检测结果
-                plt.imshow(detection_map, origin='lower')
-
                 # --- 绘制变换后的自车 --- #
                 ego_W = 1.85
                 ego_L = 4.084
@@ -782,30 +760,9 @@ def viz_3d_detection(version,
                 plt.gca().set_aspect('equal', adjustable='box')
 
                 # 添加图例
-                if legend_handles:
-                    plt.legend(handles=legend_handles + [mpatches.Patch(color='#76b900', label='Ego Vehicle'),
-                                                         mpatches.Patch(color=(1.00, 0.50, 0.31), alpha=0.2, label='Map')],
-                               loc=(0.01, 0.80), fontsize='x-small')
-                # ------------------------- #
-
-                # --- 显示置信度热力图 --- #
-                ax = plt.subplot(gs[1, :])
-                ax.get_xaxis().set_ticks([])
-                ax.get_yaxis().set_ticks([])
-                for spine_name, spine in ax.spines.items():
-                    plt.setp(spine, color='g', linewidth=2)
-                plt.title("Max Confidence Heatmap (class * IoU)")
-
-                # 计算所有类别的最大置信度 (cls * iou)
-                conf_heatmap = (
-                    pred_cls[si] * pred_iou[si]).max(dim=0)[0].numpy()
-                im = plt.imshow(conf_heatmap, cmap='viridis', vmin=0,
-                                vmax=1, origin='lower')  # 使用 viridis colormap
-                plt.colorbar(im, label='Max Confidence')
-
-                plt.xlim((W_bev, 0))
-                plt.ylim((0, H_bev))
-                plt.gca().set_aspect('equal', adjustable='box')
+                plt.legend(handles=[mpatches.Patch(color='#76b900', label='Ego Vehicle'),
+                                    mpatches.Patch(color=(1.00, 0.50, 0.31), alpha=0.2, label='Map')],
+                           loc=(0.01, 0.80), fontsize='x-small')
                 # ------------------------- #
 
                 # 保存图像
