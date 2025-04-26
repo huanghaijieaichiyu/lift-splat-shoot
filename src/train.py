@@ -611,28 +611,41 @@ def train_3d(version,
                                            post_trans.to(device),
                                            )
 
+                        # === MODIFICATION START: Correctly use collated targets in VALIDATION ===
+                        # targets_list IS the collated dictionary from custom_collate
+                        # NO NEED to stack or pad again here.
+                        # Just move the tensors in the dictionary to the correct device.
                         targets_on_device = {}
-                        try:
-                            targets_on_device['target_heatmap'] = torch.stack(
-                                [t['target_heatmap'] for t in targets_list]).to(device)
-                            targets_on_device['target_mask'] = torch.stack(
-                                [t['target_mask'] for t in targets_list]).to(device)
-                        except Exception as e:
+                        # --- Check if targets_list is actually a dict ---
+                        if not isinstance(targets_list, dict):
                             print(
-                                f"[Validation] Error stacking dense targets: {e}")
+                                f"[Validation Error] Expected targets_list to be a dict, but got {type(targets_list)}. Skipping batch {batch_idx}.")
+                            # Handle this case: skip batch or raise error
                             continue
+                        # --- End Check ---
 
-                        sparse_keys = ['target_indices', 'target_offset', 'target_z_coord',
-                                       'target_dimension', 'target_rotation', 'target_velocity', 'num_objs']
-                        for key in sparse_keys:
-                            try:
-                                targets_on_device[key] = [t[key].to(device) if isinstance(
-                                    t[key], torch.Tensor) else t[key] for t in targets_list]
-                            except Exception as e:
-                                print(
-                                    f"[Validation] Error processing sparse key '{key}': {e}")
-                                targets_on_device[key] = [
-                                    None] * len(targets_list)
+                        for key, value in targets_list.items():  # Iterate through the collated dictionary
+                            if isinstance(value, torch.Tensor):
+                                targets_on_device[key] = value.to(device)
+                            else:
+                                # Keep non-tensor items
+                                targets_on_device[key] = value
+                        # Remove the erroneous print statement
+                        # print("[Validation] Error stacking dense targets: string indices must be integers")
+
+                        # === Original (now removed/commented) problematic logic: ===
+                        # targets_on_device = {}
+                        # try:
+                        #     targets_on_device['target_heatmap'] = torch.stack(
+                        #         [t['target_heatmap'] for t in targets_list]).to(device)
+                        #     targets_on_device['target_mask'] = torch.stack(
+                        #         [t['target_mask'] for t in targets_list]).to(device)
+                        # except Exception as e:
+                        #     print(f"[Validation] Error stacking dense targets: {e}") # <-- This print
+                        #     continue
+                        # ... (manual processing of sparse keys) ...
+                        # === End of problematic logic ===
+                        # === MODIFICATION END ===
 
                         raw_losses = loss_fn(preds_dict, targets_on_device)
                         for key in all_possible_loss_keys:
@@ -1045,3 +1058,232 @@ def train_fusion(version,
                     loss_key = f'raw_{key}_loss'
                     if loss_key in raw_losses and raw_losses[loss_key] is not None:
                         total_loss += dwa_weights[key] * raw_losses[loss_key]
+
+            scaled_loss = total_loss
+
+            if amp_scaler is not None:
+                amp_scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            if (batchi + 1) % num_batches == 0:
+                if amp_scaler is not None:
+                    amp_scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm)
+
+                if amp_scaler is not None:
+                    amp_scaler.step(opt)
+                    amp_scaler.update()
+                else:
+                    opt.step()
+
+            epoch_loss += total_loss.item()
+            for key in cp_dwa_loss_keys:
+                loss_key = f'raw_{key}_loss'
+                if loss_key in raw_losses and raw_losses[loss_key] is not None:
+                    epoch_raw_losses_sum[key] += raw_losses[loss_key].item()
+
+            counter += 1
+            t1 = time.time()
+
+            desc_losses = " | ".join([f"{k[:4].upper()}: {raw_losses.get(f'raw_{k}_loss', torch.tensor(0.0)).item():.3f}"
+                                      for k in cp_dwa_loss_keys])
+            desc = f'||Epoch: [{epoch + 1}/{nepochs}]|WLoss: {total_loss.item():.3f}|{desc_losses}||'
+            pbar.set_description(desc)
+
+        avg_epoch_loss = epoch_loss / num_batches
+        avg_raw_losses = {
+            k: epoch_raw_losses_sum[k] / num_batches for k in cp_dwa_loss_keys}
+
+        writer.add_scalar('train/total_weighted_loss',
+                          avg_epoch_loss, epoch + 1)
+        for key in cp_dwa_loss_keys:
+            writer.add_scalar(
+                f'train/raw_{key}_loss', avg_raw_losses[key], epoch + 1)
+            if key in dwa_weights:
+                writer.add_scalar(
+                    f'dwa_weights/{key}_weight', dwa_weights[key].item(), epoch + 1)
+
+        last_checkpoint = {
+            'net': model.state_dict(),
+            'optimizer': opt.state_dict(),
+            'epoch': epoch,
+            'best_map': best_map,
+            'model_configs': model_configs,
+            'amp_scaler': amp_scaler.state_dict() if amp_scaler is not None else None,
+        }
+        last_model = os.path.join(path, "last.pt")
+        torch.save(last_checkpoint, last_model)
+
+        if (epoch + 1) % val_step == 0 and (epoch + 1) >= val_step:
+            model.eval()
+            val_raw_losses_sum = {k: 0.0 for k in cp_dwa_loss_keys}
+
+            all_pred_scores_list = []
+            all_pred_cls_list = []
+            all_pred_xyz_list = []
+            all_pred_wlh_list = []
+            all_pred_rot_sincos_list = []
+            all_pred_vel_list = []
+            all_pred_token_list = []
+            all_val_tokens_processed = []
+
+            with torch.no_grad():
+                for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sample_tokens) in enumerate(valloader):
+                    all_val_tokens_processed.extend(sample_tokens)
+                    B_val = imgs.size(0)
+
+                    with autocast(enabled=(amp_scaler is not None)):
+                        preds_dict = model(imgs.to(device),
+                                           rots.to(device),
+                                           trans.to(device),
+                                           intrins.to(device),
+                                           post_rots.to(device),
+                                           post_trans.to(device),
+                                           )
+
+                        # === MODIFICATION START: Correctly use collated targets in VALIDATION ===
+                        # targets_list IS the collated dictionary from custom_collate
+                        # NO NEED to stack or pad again here.
+                        # Just move the tensors in the dictionary to the correct device.
+                        targets_on_device = {}
+                        # --- Check if targets_list is actually a dict ---
+                        if not isinstance(targets_list, dict):
+                            print(
+                                f"[Validation Error] Expected targets_list to be a dict, but got {type(targets_list)}. Skipping batch {batch_idx}.")
+                            # Handle this case: skip batch or raise error
+                            continue
+                        # --- End Check ---
+
+                        for key, value in targets_list.items():  # Iterate through the collated dictionary
+                            if isinstance(value, torch.Tensor):
+                                targets_on_device[key] = value.to(device)
+                            else:
+                                # Keep non-tensor items
+                                targets_on_device[key] = value
+                        # Remove the erroneous print statement
+                        # print("[Validation] Error stacking dense targets: string indices must be integers")
+
+                        # === Original (now removed/commented) problematic logic: ===
+                        # targets_on_device = {}
+                        # try:
+                        #     targets_on_device['target_heatmap'] = torch.stack(
+                        #         [t['target_heatmap'] for t in targets_list]).to(device)
+                        #     targets_on_device['target_mask'] = torch.stack(
+                        #         [t['target_mask'] for t in targets_list]).to(device)
+                        # except Exception as e:
+                        #     print(f"[Validation] Error stacking dense targets: {e}") # <-- This print
+                        #     continue
+                        # ... (manual processing of sparse keys) ...
+                        # === End of problematic logic ===
+                        # === MODIFICATION END ===
+
+                        raw_losses = loss_fn(preds_dict, targets_on_device)
+                        for key in cp_dwa_loss_keys:
+                            loss_key = f'raw_{key}_loss'
+                            if loss_key in raw_losses and raw_losses[loss_key] is not None:
+                                val_raw_losses_sum[key] += raw_losses[loss_key].item()
+
+                    batch_dets_list = decode_predictions(
+                        preds_dict, device, score_thresh=0.1, grid_conf=grid_conf, K=500
+                    )
+                    for sample_idx, dets_dict in enumerate(batch_dets_list):
+                        num_dets_in_sample = dets_dict['box_scores'].shape[0]
+                        if num_dets_in_sample > 0:
+                            all_pred_scores_list.append(
+                                dets_dict['box_scores'].cpu())
+                            all_pred_cls_list.append(
+                                dets_dict['box_cls'].cpu())
+                            all_pred_xyz_list.append(
+                                dets_dict['box_xyz'].cpu())
+                            all_pred_wlh_list.append(
+                                dets_dict['box_wlh'].cpu())
+                            all_pred_rot_sincos_list.append(
+                                dets_dict['box_rot_sincos'].cpu())
+                            all_pred_vel_list.append(
+                                dets_dict['box_vel'].cpu())
+                            sample_token = sample_tokens[sample_idx]
+                            all_pred_token_list.extend(
+                                [sample_token] * num_dets_in_sample)
+
+            avg_val_raw_losses = {
+                k: val_raw_losses_sum[k] /
+                len(valloader) if len(valloader) > 0 else 0.0
+                for k in cp_dwa_loss_keys
+            }
+            for key in cp_dwa_loss_keys:
+                writer.add_scalar(
+                    f'val/raw_{key}_loss', avg_val_raw_losses[key], epoch + 1)
+
+            val_map_score = 0.0
+            val_nds_score = 0.0
+            metrics_dict = {}
+
+            if not all_pred_scores_list:
+                print(
+                    "Warning: No detections found across validation set for nuScenes evaluation.")
+            else:
+                all_predictions_dict = {
+                    'box_scores': torch.cat(all_pred_scores_list).numpy(),
+                    'box_cls': torch.cat(all_pred_cls_list).numpy(),
+                    'box_xyz': torch.cat(all_pred_xyz_list).numpy(),
+                    'box_wlh': torch.cat(all_pred_wlh_list).numpy(),
+                    'box_rot_sincos': torch.cat(all_pred_rot_sincos_list).numpy(),
+                    'box_vel': torch.cat(all_pred_vel_list).numpy(),
+                    'sample_tokens': all_pred_token_list
+                }
+
+                eval_set = 'val' if 'mini' not in version else 'mini_val'
+                full_version = f'v1.0-{version}'
+
+                try:
+                    print("Starting official nuScenes evaluation...")
+                    metrics_dict = evaluate_with_nuscenes(
+                        predictions_dict=all_predictions_dict,
+                        nuscenes_version=full_version,
+                        nuscenes_dataroot=dataroot,
+                        eval_set=eval_set,
+                        output_dir=path,
+                        verbose=True,
+                        all_sample_tokens=list(set(all_val_tokens_processed))
+                    )
+                    val_map_score = metrics_dict.get('mAP', 0.0)
+                    val_nds_score = metrics_dict.get('NDS', 0.0)
+                    print("nuScenes evaluation finished.")
+                except Exception as e:
+                    print(f"Error during nuScenes evaluation: {e}")
+                    print("Skipping mAP/NDS reporting for this epoch.")
+                    val_map_score = 0.0
+                    val_nds_score = 0.0
+                    metrics_dict = {}
+
+            val_loss_str = " | ".join(
+                [f"R-{k[:4].upper()}: {avg_val_raw_losses[k]:.3f}" for k in cp_dwa_loss_keys])
+            print(
+                f'||Val {val_loss_str} | mAP: {val_map_score:.4f} | NDS: {val_nds_score:.4f} ||')
+            writer.add_scalar('val/mAP', val_map_score, epoch + 1)
+            writer.add_scalar('val/NDS', val_nds_score, epoch + 1)
+            for k, v in metrics_dict.items():
+                if k not in ['per_class_AP', 'per_class_TP_Errors']:
+                    writer.add_scalar(f'val_nusc/{k}', v, epoch + 1)
+
+            if val_nds_score > best_map:
+                best_map = val_nds_score
+                best_checkpoint = {
+                    'net': model.state_dict(),
+                    'optimizer': opt.state_dict(),
+                    'epoch': epoch,
+                    'best_map': best_map,
+                    'model_configs': model_configs,
+                    'amp_scaler': amp_scaler.state_dict() if amp_scaler is not None else None,
+                }
+                best_model_path = os.path.join(
+                    path, "best_map.pt")
+                torch.save(best_checkpoint, best_model_path)
+                print(f"Best model saved... NDS: {best_map:.4f}")
+
+        epoch += 1
+        pbar.close()
+
+    writer.close()
