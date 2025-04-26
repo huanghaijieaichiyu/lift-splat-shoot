@@ -617,7 +617,7 @@ def viz_3d_detection(version,
     model.eval()
     counter = 0
     with torch.no_grad():
-        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, _, _) in enumerate(loader):
+        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, _, _, _) in enumerate(loader):
             # 前向传播获取预测结果
             with torch.cuda.amp.autocast(enabled=True):
                 preds = model(imgs.to(device),

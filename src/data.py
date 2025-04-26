@@ -9,44 +9,201 @@ from nuscenes.utils.splits import create_splits_scenes
 from nuscenes.utils.data_classes import Box
 from glob import glob
 import pickle
+import torch.utils.data  # 显式导入以备后用
 
 from .tools import get_lidar_data, img_transform, normalize_img, gen_dx_bx
 
 # --- Define custom_collate at the top level --- #
 
+# === MODIFICATION START: Revise custom_collate for CenterPoint targets ===
+
 
 def custom_collate(batch):
-    # This basic collate handles the structure change where the last element is sample_token
-    # and the second last is sparse_gt_list (list of lists of dicts)
-    # It relies on default_collate for most elements but handles the sparse GT list specifically.
-
-    # Check if batch is empty
+    """
+    自定义的 collate 函数，用于处理来自 Detection3DData 或 MultiModalDetectionData 的批次。
+    它使用 default_collate 对初始项目 (0-5) 进行整理，
+    并正确地填充和堆叠 targets_dict (索引 6) 中的张量。
+    sample_tokens (索引 7) 保持为列表。
+    """
+    # 检查批次是否为空
     if not batch:
-        return None  # Or raise an error, depending on desired behavior
+        return None  # 或引发错误
 
-    num_items = len(batch[0])
-    elem_0 = batch[0]
+    elem = batch[0]
+    num_items = len(elem)
 
-    # Check consistency of item count in batch
+    # 检查一致性
     if not all(len(item) == num_items for item in batch):
-        raise ValueError("Batch items have inconsistent lengths")
+        raise ValueError("批次项目的长度不一致")
 
-    # Separate potentially non-collated items (sparse GTs and tokens)
-    # Assuming sparse GTs are second to last, tokens are last
-    sparse_gts_batch = [item[num_items - 2] for item in batch]
-    sample_tokens = [item[num_items - 1] for item in batch]
+    if num_items < 8:  # 期望至少 8 个项目
+        raise ValueError(
+            f"每个批次元素期望至少 8 个项目，但得到 {num_items}")
 
-    # Collate the rest using default collate
-    # Ensure there are items to collate
-    if num_items > 2:
-        other_items_batch = [item[:num_items - 2] for item in batch]
-        collated_others = torch.utils.data.default_collate(other_items_batch)
-        # Return collated items + the uncollated sparse GT list + uncollated tokens
-        return (*collated_others, sparse_gts_batch, sample_tokens)
-    elif num_items == 2:  # Only sparse GTs and tokens
-        return (sparse_gts_batch, sample_tokens)
-    else:  # Should not happen if __getitem__ returns at least 2 items
-        return (sample_tokens,)
+    # --- 新的 Collation 逻辑 ---
+    B = len(batch)
+    list_of_targets_dicts = [item[6] for item in batch]
+    sample_tokens = [item[7] for item in batch]
+
+    # --- Add Check ---
+    if not all(isinstance(d, dict) for d in list_of_targets_dicts):
+        print("错误：list_of_targets_dicts 包含非字典项！")
+        for i, item in enumerate(list_of_targets_dicts):
+            if not isinstance(item, dict):
+                print(f" 索引 {i} 处的项类型：{type(item)}，值：{item}")
+        raise TypeError("在整理过程中检测到 list_of_targets_dicts 中的非字典项。")
+    # --- End Check ---
+
+    # 1. 整理初始元素 (0 到 5)
+    items_to_collate = [item[:6] for item in batch]
+    try:
+        collated_items_0_to_5 = torch.utils.data.default_collate(
+            items_to_collate)
+    except Exception as e:
+        print(f"对项目 0-5 进行 default_collate 时出错: {e}")
+        raise
+
+    # 2. 整理 targets_dict
+    collated_targets_dict = {}
+    # 获取第一个有效字典的键（处理可能的空批次或错误项）
+    first_valid_dict = next(
+        (d for d in list_of_targets_dicts if isinstance(d, dict)), None)
+    if first_valid_dict is None:
+        raise ValueError("批次中未找到有效的 targets_dict。")
+    target_keys = first_valid_dict.keys()
+
+    # 检查所有样本是否具有相同的目标键
+    for i in range(B):
+        if isinstance(list_of_targets_dicts[i], dict) and list_of_targets_dicts[i].keys() != target_keys:
+            raise ValueError(
+                f"目标字典键在批次中不一致。样本 0: {target_keys}, 样本 {i}: {list_of_targets_dicts[i].keys()}")
+
+    # 定义需要填充的稀疏键和直接堆叠的密集键
+    sparse_keys = ['target_indices', 'target_offset', 'target_z_coord',
+                   'target_dimension', 'target_rotation', 'target_velocity', 'reg_mask']
+    dense_keys = ['target_heatmap', 'target_mask']
+    scalar_keys = ['num_objs']  # 标量键直接转换为张量
+
+    # 确定最大对象数
+    max_objs = 0
+    num_objs_list = []
+    try:
+        for targets in list_of_targets_dicts:
+            # 确保 targets 是字典并且包含 num_objs
+            if isinstance(targets, dict) and 'num_objs' in targets:
+                num = targets['num_objs'].item()  # 获取标量值
+                num_objs_list.append(num)
+                max_objs = max(max_objs, num)
+            else:
+                # 如果某个样本的目标无效，则添加 0 并继续
+                num_objs_list.append(0)
+                print(f"警告：批次中发现无效的目标字典或缺少 'num_objs' 键。类型：{type(targets)}")
+        # CenterPoint 通常限制最大对象数
+        max_objs = min(max_objs, 500)  # 使用 CenterPoint 中常见的限制
+    except KeyError:
+        # 这个错误不应该发生，因为我们在上面检查了 'num_objs'
+        raise KeyError("'num_objs' 键在 targets_dict 中是必需的，用于确定最大对象数和填充。")
+    except Exception as e:
+        print(f"获取 'num_objs' 时出错: {e}")
+        raise
+
+    # 处理每个目标键
+    for key in target_keys:
+        # 安全地获取张量列表，跳过无效的目标字典
+        tensor_list = []
+        valid_indices = []  # 跟踪哪些样本具有此键的有效张量
+        for idx, targets in enumerate(list_of_targets_dicts):
+            if isinstance(targets, dict) and key in targets:
+                tensor_list.append(targets[key])
+                valid_indices.append(idx)
+            # else: # 可选：如果键丢失，则添加警告
+            #     print(f"警告：样本 {idx} 的目标字典中缺少键 '{key}'")
+
+        if not tensor_list:  # 如果没有样本具有此键，则跳过
+            print(f"警告：在批次中没有样本找到键 '{key}'，跳过此键的整理。")
+            continue
+
+        if key in dense_keys:
+            # === Pre-stack check ===
+            valid_types = True
+            for i, t in enumerate(tensor_list):
+                if not isinstance(t, torch.Tensor):
+                    print(f"!!! PRE-STACK CHECK FAILED for key '{key}' !!!")
+                    print(
+                        f"  Item {i} (from original batch index {valid_indices[i]}) is NOT a Tensor.")
+                    print(f"  Type: {type(t)}")
+                    print(f"  Value: {t}")
+                    valid_types = False
+            if not valid_types:
+                # Maybe raise a different error here to pinpoint the pre-stack issue
+                raise TypeError(
+                    f"Non-tensor found in list for key '{key}' before torch.stack.")
+            # === End Pre-stack check ===
+
+            # 直接堆叠密集张量
+            try:
+                collated_targets_dict[key] = torch.stack(tensor_list)
+            # === MODIFICATION START: Enhanced Debugging for Stacking Error ===
+            except Exception as e:  # 捕获更广泛的异常以查看确切类型
+                print(f"--- 在密集键 '{key}' 的 torch.stack 期间出错 ---")
+                print(f"错误类型: {type(e)}")
+                print(f"错误消息: {e}")
+                print(f"列表中的张量数量: {len(tensor_list)}")
+                for i, t in enumerate(tensor_list):
+                    print(f" 张量 {i} (来自原始批次索引 {valid_indices[i]}):")
+                    if isinstance(t, torch.Tensor):
+                        print(f"  形状: {t.shape}")
+                        print(f"  数据类型: {t.dtype}")
+                        print(f"  设备: {t.device}")
+                        # === ADDITION: Check tensor properties ===
+                        print(f"  是否连续: {t.is_contiguous()}")
+                        print(f"  Strides: {t.stride()}")
+                        # === END ADDITION ===
+                    else:
+                        print(f"  类型: {type(t)}")  # 检查它是否真的是张量
+                        print(f"  值: {t}")
+                print("--- 错误信息结束 ---")
+                raise  # 重新引发原始异常
+            # === MODIFICATION END ===
+        elif key in sparse_keys:
+            # 填充和堆叠稀疏张量
+            first_tensor = tensor_list[0]  # 获取第一个有效张量
+            element_shape = first_tensor.shape[1:]  # 获取除对象数量之外的维度
+            padded_shape = (B, max_objs) + element_shape  # 填充形状基于完整批次大小 B
+            # 根据第一个张量的数据类型和设备创建填充张量
+            padded_tensor = torch.zeros(
+                padded_shape, dtype=first_tensor.dtype, device=first_tensor.device)
+
+            for i, original_idx in enumerate(valid_indices):  # 仅迭代具有此键的有效样本
+                # 使用来自完整列表的正确 num_objs
+                num_obj_in_sample = num_objs_list[original_idx]
+                if num_obj_in_sample > 0:
+                    # 确保我们不会尝试填充超过 max_objs 的对象
+                    num_to_copy = min(num_obj_in_sample, max_objs)
+                    current_tensor = tensor_list[i]  # 从有效张量列表中获取当前张量
+                    # 确保源张量足够大
+                    if current_tensor.shape[0] >= num_to_copy:
+                        # 使用原始批次索引 original_idx 进行填充
+                        padded_tensor[original_idx,
+                                      :num_to_copy] = current_tensor[:num_to_copy]
+                    else:  # 源张量小于 num_to_copy（可能由于裁剪或其他问题）
+                        print(
+                            f"警告：样本 {original_idx}, 键 '{key}', 张量形状 {current_tensor.shape[0]} < num_to_copy {num_to_copy} (num_objs: {num_obj_in_sample}). 仅复制 {current_tensor.shape[0]} 个元素。")
+                        if current_tensor.shape[0] > 0:
+                            padded_tensor[original_idx,
+                                          :current_tensor.shape[0]] = current_tensor
+
+            collated_targets_dict[key] = padded_tensor
+        elif key in scalar_keys:
+            # 将标量列表转换为张量（使用完整的 num_objs_list）
+            collated_targets_dict[key] = torch.tensor(
+                num_objs_list, dtype=torch.long)
+        else:
+            print(f"警告：跳过未知的目标键 '{key}' 的整理。")
+
+    # 3. 返回整理好的项目
+    return (*collated_items_0_to_5, collated_targets_dict, sample_tokens)
+# === MODIFICATION END ===
 
 # Add Gaussian heatmap helper functions (adapted from mmdet3d)
 
@@ -95,15 +252,41 @@ def gaussian_2d(shape, sigma=1):
     Returns:
         np.ndarray: Generated heatmap.
     """
-    # --- FIX: Ensure m, n are floats for calculations ---
-    m, n = [(float(ss) - 1.) / 2. for ss in shape]
-    y, x = np.ogrid[-m:m + 1, -n:n + 1]
-    # Ensure x and y are floats before exponentiation
-    x = x.astype(float)
-    y = y.astype(float)
-    # ---
+    # Ensure m, n are calculated from numerical types
+    try:
+        h_dim = float(shape[0])
+        w_dim = float(shape[1])
+    except (TypeError, IndexError) as e:
+        raise ValueError(
+            f"Invalid shape tuple provided to gaussian_2d: {shape}. Error: {e}")
 
-    h = np.exp(-(x * x + y * y) / (2 * sigma * sigma))
+    m = (h_dim - 1.) / 2.
+    n = (w_dim - 1.) / 2.
+
+    # Use meshgrid for safer coordinate generation
+    y_range = np.arange(-m, m + 1, dtype=float)
+    x_range = np.arange(-n, n + 1, dtype=float)
+    x, y = np.meshgrid(x_range, y_range)
+
+    # === MODIFICATION START: Explicitly set dtype for h ===
+    denominator = (2 * sigma * sigma)
+    if denominator == 0:
+        # Handle sigma=0 case to avoid division by zero
+        # Return an array of zeros or a delta function depending on desired behavior
+        # Here, returning zeros except at the center might be appropriate
+        h = np.zeros((len(y_range), len(x_range)), dtype=np.float64)
+        center_y_idx = len(y_range) // 2
+        center_x_idx = len(x_range) // 2
+        if 0 <= center_y_idx < h.shape[0] and 0 <= center_x_idx < h.shape[1]:
+            h[center_y_idx, center_x_idx] = 1.0
+    else:
+        # Explicitly cast numerator to float64 to avoid potential type issues hinted by linter
+        numerator = -(x * x + y * y).astype(np.float64)
+        h = np.exp(numerator / denominator, dtype=np.float64)
+    # === MODIFICATION END ===
+
+    # Ensure h is float before comparison
+    h = h.astype(np.float64)
     h[h < np.finfo(h.dtype).eps * h.max()] = 0
     return h
 
@@ -251,8 +434,7 @@ class NuscData(torch.utils.data.Dataset):
                 di, fi, fname = find_name(f)
                 info[f'sweeps/{di}/{fi}'] = fname
             for rec in self.nusc.sample_data:
-                if rec['channel'] == 'LIDAR_TOP' or (
-                        rec['is_key_frame'] and rec['channel'] in self.data_aug_conf['cams']):
+                if rec['channel'] == 'LIDAR_TOP' or (rec['is_key_frame'] and rec['channel'] in self.data_aug_conf['cams']):
                     rec['filename'] = info[rec['filename']]
 
     def get_scenes(self):
@@ -283,7 +465,7 @@ class NuscData(torch.utils.data.Dataset):
         fH, fW = self.data_aug_conf['final_dim']
         if self.is_train:
             resize = np.random.uniform(*self.data_aug_conf['resize_lim'])
-            resize_dims = (int(W * resize), int(H * resize))
+            resize_dims = (int(W*resize), int(H*resize))
             newW, newH = resize_dims
             crop_h = int(
                 (1 - np.random.uniform(*self.data_aug_conf['bot_pct_lim'])) * newH) - fH
@@ -294,8 +476,8 @@ class NuscData(torch.utils.data.Dataset):
                 flip = True
             rotate = np.random.uniform(*self.data_aug_conf['rot_lim'])
         else:
-            resize = max(fH / H, fW / W)
-            resize_dims = (int(W * resize), int(H * resize))
+            resize = max(fH/H, fW/W)
+            resize_dims = (int(W*resize), int(H*resize))
             newW, newH = resize_dims
             crop_h = int(
                 (1 - np.mean(self.data_aug_conf['bot_pct_lim'])) * newH) - fH
@@ -352,13 +534,12 @@ class NuscData(torch.utils.data.Dataset):
                 torch.stack(intrins), torch.stack(post_rots), torch.stack(post_trans))
 
     def get_lidar_data(self, rec, nsweeps):
-        pts = get_lidar_data(self.nusc, rec,
-                             nsweeps=nsweeps, min_distance=2.2)
+        pts = get_lidar_data(self.nusc, rec, nsweeps=nsweeps, min_distance=2.2)
         return torch.Tensor(pts)[:3]  # x,y,z
 
     def get_binimg(self, rec):
-        egopose = self.nusc.get('ego_pose',
-                                self.nusc.get('sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
+        egopose = self.nusc.get('ego_pose', self.nusc.get(
+            'sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
         trans = -np.array(egopose['translation'])
         rot = Quaternion(egopose['rotation']).inverse
         img = np.zeros((self.nx[0], self.nx[1]))
@@ -372,14 +553,14 @@ class NuscData(torch.utils.data.Dataset):
             velocity = (np.nan, np.nan, np.nan)  # 默认值
             if 'velocity' in inst:
                 velocity = tuple(inst['velocity'])
-            box = Box(inst['translation'], inst['size'], Quaternion(
-                inst['rotation']), velocity=velocity)
+            box = Box(inst['translation'], inst['size'],
+                      Quaternion(inst['rotation']), velocity=velocity)
             box.translate(trans)
             box.rotate(rot)
 
             pts = box.bottom_corners()[:2].T
             pts = np.round(
-                (pts - self.bx[:2] + self.dx[:2] / 2.) / self.dx[:2]
+                (pts - self.bx[:2] + self.dx[:2]/2.) / self.dx[:2]
             ).astype(np.int32)
             pts[:, [1, 0]] = pts[:, [0, 1]]
             cv2.fillPoly(img, [pts], (1.0,))
@@ -484,34 +665,47 @@ class Detection3DData(NuscData):
         cams = self.choose_cams()
         imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(
             rec, cams)
-        dense_target_maps, sparse_gt_list = self.get_detection_targets(rec)
+        # --- 修改：直接获取 CenterPoint 格式的目标字典 ---
+        targets_dict = self.get_detection_targets(rec)
+        # 移除旧的 sparse_gt_list，因为它现在包含在 targets_dict 或用于评估
+        # sparse_gt_list = targets_dict.pop('sparse_gt_list', []) # Example if needed elsewhere
+        # ---
 
-        # 返回包含sample_token的元组
-        return imgs, rots, trans, intrins, post_rots, post_trans, dense_target_maps, sparse_gt_list, sample_token
+        # 返回包含sample_token的元组 (移除 dense_target_maps, sparse_gt_list)
+        return imgs, rots, trans, intrins, post_rots, post_trans, targets_dict, sample_token
 
     def get_detection_targets(self, rec):
         """
-        生成3D目标检测任务的标签 (优化版，使用高斯热图)
-        同时返回用于评估的稀疏GT标注列表。
+        生成 CenterPoint 风格的密集目标图和稀疏回归目标。
+        Returns:
+            targets_dict (dict): Dictionary containing targets for CenterPointLoss.
         """
         # 获取BEV网格尺寸
         H, W = int(self.nx[1].item()), int(self.nx[0].item())
-        # 获取类别数量 (从映射中获取，+1表示背景)
         num_classes = len(self.DETECTION_CLASSES)
+        # --- CenterPoint Target Generation ---
+        max_objs = 500  # Define maximum objects per sample
 
-        # 创建空标签地图
-        # 分类热图 (每个类别一个通道)
-        cls_map = np.zeros((num_classes, H, W), dtype=np.float32)
-        # 回归图 (x, y, z, w, l, h, sin(θ), cos(θ), vel)
-        reg_map = np.zeros((9, H, W), dtype=np.float32)
-        # 回归权重图 (只在目标中心为1)
-        reg_weight = np.zeros((1, H, W), dtype=np.float32)
-        # IoU/Centerness 图 (在目标中心为1，可以根据需要修改)
-        iou_map = np.zeros((1, H, W), dtype=np.float32)
+        # Initialize dense maps
+        target_heatmap = np.zeros((num_classes, H, W), dtype=np.float32)
+        # Mask for positive locations
+        target_mask = np.zeros((H, W), dtype=np.bool_)
+        # Note: Regression maps are not stored densely, only gathered values
 
-        # --- 新增：用于存储稀疏GT标注 ---
-        sparse_gt_boxes = []
+        # Initialize sparse target arrays (size max_objs)
+        target_indices = np.zeros((max_objs), dtype=np.int64)
+        target_offset = np.zeros((max_objs, 2), dtype=np.float32)
+        target_z_coord = np.zeros((max_objs, 1), dtype=np.float32)
+        target_dimension = np.zeros(
+            (max_objs, 3), dtype=np.float32)  # Will store log(dim)
+        target_rotation = np.zeros((max_objs, 2), dtype=np.float32)  # sin, cos
+        target_velocity = np.zeros((max_objs, 2), dtype=np.float32)  # vx, vy
+        obj_count = 0  # Counter for valid objects found
         # ---
+
+        # --- 新增：用于指示有效对象的掩码 ---
+        reg_mask = np.zeros((max_objs), dtype=np.bool_)
+        # --- 结束 ---
 
         # 获取自车姿态
         lidar_top_data = self.nusc.get('sample_data', rec['data']['LIDAR_TOP'])
@@ -556,119 +750,121 @@ class Detection3DData(NuscData):
             box.translate(trans)
             box.rotate(rot)
 
-            # --- 生成Dense Target Map ---
+            # --- 生成 CenterPoint Targets ---
             # 边界框中心在BEV图中的位置
             center = box.center[:2]  # 只关心 x, y
 
             # 将中心点坐标转换为网格索引 (浮点数，用于高斯中心)
-            # --- 修复: 使用 self.bx 和 self.dx (tensor) 进行计算 ---
             center_in_grid_x = (
                 center[0] - self.bx[0].item()) / self.dx[0].item()
             center_in_grid_y = (
                 center[1] - self.bx[1].item()) / self.dx[1].item()
-            # ---
 
             # 获取整数网格索引用于赋值
-            grid_x = int(center_in_grid_x)
-            grid_y = int(center_in_grid_y)
+            grid_x = int(np.round(center_in_grid_x))
+            grid_y = int(np.round(center_in_grid_y))
 
             # 检查中心点是否在网格范围内
-            if 0 <= grid_x < W and 0 <= grid_y < H:
-                # 计算高斯半径 (使用BEV下的长宽)
-                # box.wlh: [width, length, height]
-                # det_size需要 (height, width) -> 在BEV下是 (length, width)
-                # --- 修复: 使用 self.dx (tensor) 进行计算 ---
-                det_size_bev = (box.wlh[1] / self.dx[1].item(),
-                                box.wlh[0] / self.dx[0].item())
-                # ---
+            if 0 <= grid_x < W and 0 <= grid_y < H and obj_count < max_objs:
+                # 计算高斯半径
+                det_size_bev = (
+                    box.wlh[1] / self.dx[1].item(), box.wlh[0] / self.dx[0].item())
                 radius = gaussian_radius(det_size_bev)
                 radius = max(0, int(radius))
 
                 # 在对应类别的热图上绘制高斯分布
-                # 使用浮点数中心坐标以获得更准确的高斯峰值位置
                 draw_heatmap_gaussian(
-                    cls_map[class_id], (center_in_grid_x, center_in_grid_y), radius)
+                    target_heatmap[class_id], (center_in_grid_x, center_in_grid_y), radius)
 
-                # 仅在中心点设置回归目标和权重
-                # 中心点坐标 (x, y, z)
-                reg_map[0, grid_y, grid_x] = box.center[0]
-                reg_map[1, grid_y, grid_x] = box.center[1]
-                reg_map[2, grid_y, grid_x] = box.center[2]
-                # 尺寸 (w, l, h)
-                reg_map[3, grid_y, grid_x] = box.wlh[0]  # width
-                reg_map[4, grid_y, grid_x] = box.wlh[1]  # length
-                reg_map[5, grid_y, grid_x] = box.wlh[2]  # height
-                # 旋转角
+                # --- 填充稀疏回归目标和索引 ---
+                flat_idx = grid_y * W + grid_x
+                target_indices[obj_count] = flat_idx
+                # Mark this location as positive
+                target_mask[grid_y, grid_x] = True
+
+                # Offset (precise location within the grid cell)
+                target_offset[obj_count, 0] = center_in_grid_x - grid_x
+                target_offset[obj_count, 1] = center_in_grid_y - grid_y
+
+                # Z-coordinate
+                target_z_coord[obj_count, 0] = box.center[2]
+
+                # Dimension (log scale)
+                # log(width) Add epsilon for stability before log
+                target_dimension[obj_count, 0] = np.log(box.wlh[0] + 1e-6)
+                target_dimension[obj_count, 1] = np.log(
+                    box.wlh[1] + 1e-6)  # log(length)
+                target_dimension[obj_count, 2] = np.log(
+                    box.wlh[2] + 1e-6)  # log(height)
+
+                # Rotation (sin, cos)
                 yaw = box.orientation.yaw_pitch_roll[0]
-                reg_map[6, grid_y, grid_x] = np.sin(yaw)
-                reg_map[7, grid_y, grid_x] = np.cos(yaw)
-                # 速度 (x, y 分量)
-                # --- 修复: 提取x,y速度, 处理NaN ---
+                target_rotation[obj_count, 0] = np.sin(yaw)
+                target_rotation[obj_count, 1] = np.cos(yaw)
+
+                # Velocity (vx, vy)
                 vel_xy = box.velocity[:2]
                 if vel_xy is None or np.any(np.isnan(vel_xy)):
                     vel_xy = np.array([0.0, 0.0])
-                # 确保是2维
-                if len(vel_xy) == 1:
+                if len(vel_xy) == 1:  # Ensure 2D
                     vel_xy = np.append(vel_xy, 0.0)
                 elif len(vel_xy) > 2:
                     vel_xy = vel_xy[:2]
-                # 只存储x,y速度，假设回归图第9个通道是x速度，第10个是y速度 (需要调整reg_map大小)
-                # 或者只存储速度大小 (如原代码)
-                # --- 保持原逻辑：存储速度大小 ---
-                velocity_norm = float(np.linalg.norm(vel_xy))
-                reg_map[8, grid_y, grid_x] = velocity_norm
-                # ---
+                target_velocity[obj_count, 0] = vel_xy[0]
+                target_velocity[obj_count, 1] = vel_xy[1]
 
-                # 设置中心点的权重和IoU值
-                reg_weight[0, grid_y, grid_x] = 1.0
-                # Can be adjusted based on strategy
-                iou_map[0, grid_y, grid_x] = 1.0
-            # --- Dense Target 生成结束 ---
+                # --- 新增：标记此对象为有效 ---
+                reg_mask[obj_count] = True
+                # --- 结束 ---
 
-            # --- 生成Sparse Target ---
-            # 使用转换到自车坐标系后的box信息
-            vel_xy_sparse = box.velocity[:2]
-            if vel_xy_sparse is None or np.any(np.isnan(vel_xy_sparse)):
-                vel_xy_sparse = np.array([0.0, 0.0])
-            if len(vel_xy_sparse) == 1:
-                vel_xy_sparse = np.append(vel_xy_sparse, 0.0)
-            elif len(vel_xy_sparse) > 2:
-                vel_xy_sparse = vel_xy_sparse[:2]
+                obj_count += 1  # Increment object counter
+                # --- 稀疏目标填充结束 ---
 
-            gt_dict = {
-                'box_cls': torch.tensor(class_id, dtype=torch.long),
-                'box_xyz': torch.from_numpy(box.center.astype(np.float32)),
-                'box_wlh': torch.from_numpy(box.wlh.astype(np.float32)),
-                'box_rot_sincos': torch.tensor([np.sin(box.orientation.yaw_pitch_roll[0]),
-                                                np.cos(box.orientation.yaw_pitch_roll[0])], dtype=torch.float32),
-                # Store [vx, vy]
-                'box_vel': torch.from_numpy(vel_xy_sparse.astype(np.float32))
-            }
-            sparse_gt_boxes.append(gt_dict)
-            # --- Sparse Target 生成结束 ---
+            # --- 移除旧的 Dense 回归图填充 ---
+            # if 0 <= grid_x < W and 0 <= grid_y < H:
+                # ... (移除 reg_map, reg_weight, iou_map 填充)
+            # ---
 
-        # 转换为Tensor
-        cls_map_tensor = torch.from_numpy(cls_map)
-        reg_map_tensor = torch.from_numpy(reg_map)
-        reg_weight_tensor = torch.from_numpy(reg_weight)
-        iou_map_tensor = torch.from_numpy(iou_map)
+            # --- 生成Sparse Target (可选，如果评估需要) ---
+            # vel_xy_sparse = ...
+            # gt_dict = { ... }
+            # sparse_gt_boxes_for_eval.append(gt_dict)
+            # ---
 
-        # *** 重要：确定损失函数期望的分类目标格式 ***
-        # 选项 A: 使用原始的多通道高斯热图 (如果损失函数支持，如Focal Loss)
-        # cls_target_for_loss = cls_map_tensor
-        # 选项 B: 使用单通道类别索引图 (如果损失函数是标准的CrossEntropyLoss)
-        cls_index_map = torch.argmax(cls_map_tensor, dim=0).long()
-        cls_target_for_loss = cls_index_map
+        # --- 构建最终的 targets_dict ---
+        targets_dict = {
+            # Dense heatmap
+            'target_heatmap': torch.from_numpy(target_heatmap),
+            # Add channel dim [1, H, W]
+            'target_mask': torch.from_numpy(target_mask).unsqueeze(0),
 
-        # 构建用于训练(损失计算)的稠密目标字典
-        dense_maps = {'cls_targets': cls_target_for_loss,  # 使用选定的格式
-                      'reg_targets': reg_map_tensor,
-                      'reg_weights': reg_weight_tensor,
-                      'iou_targets': iou_map_tensor
-                      }
+            # --- 修改：返回完整的、填充过的稀疏目标 ---
+            'target_indices': torch.from_numpy(target_indices),
+            'target_offset': torch.from_numpy(target_offset),
+            'target_z_coord': torch.from_numpy(target_z_coord),
+            'target_dimension': torch.from_numpy(target_dimension),
+            'target_rotation': torch.from_numpy(target_rotation),
+            'target_velocity': torch.from_numpy(target_velocity),
+            # --- 结束 ---
 
-        # 返回稠密图和稀疏列表
-        return dense_maps, sparse_gt_boxes
+            # --- 新增：包含用于稀疏目标的掩码 ---
+            'reg_mask': torch.from_numpy(reg_mask),
+            # --- 结束 ---
+
+            # Add obj_count for potential use elsewhere (e.g., logging)
+            'num_objs': torch.tensor(obj_count, dtype=torch.int)
+            # 'sparse_gt_list': sparse_gt_boxes_for_eval # Optional: Add if needed elsewhere
+        }
+        # --- 结束 ---
+
+        # --- 移除旧的返回逻辑 ---
+        # cls_map_tensor = torch.from_numpy(cls_map)
+        # ...
+        # dense_maps = { ... }
+        # return dense_maps, sparse_gt_boxes
+        # ---
+
+        return targets_dict
 
 
 class MultiModalDetectionData(Detection3DData):
@@ -703,11 +899,11 @@ class MultiModalDetectionData(Detection3DData):
         lidar_bev = self.get_lidar_bev(rec)
 
         # --- 修改：接收两个返回值 ---
-        targets, sparse_gt_list = self.get_detection_targets(rec)
+        targets_dict = self.get_detection_targets(rec)
         # ---
 
         # --- 修改：返回稀疏GT列表和sample_token ---
-        return imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets, sparse_gt_list, sample_token
+        return imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_dict, sample_token
         # ---
 
     def get_lidar_bev(self, rec):
@@ -785,14 +981,11 @@ class MultiModalDetectionData(Detection3DData):
         # Use scatter_max_ for efficiency if possible, but simple loop is clearer
         for i in range(len(x_indices)):
             x_idx, y_idx = x_indices[i], y_indices[i]
-            # Max height in the cell
             height_map[0, y_idx, x_idx] = torch.max(
-                height_map[0, y_idx, x_idx], z[i])
-            # Max intensity in the cell
+                height_map[0, y_idx, x_idx], z[i])  # Max height in the cell
             intensity_map[0, y_idx, x_idx] = torch.max(
-                intensity_map[0, y_idx, x_idx], intensity[i])
-            # Count points per cell
-            density_map[0, y_idx, x_idx] += 1
+                intensity_map[0, y_idx, x_idx], intensity[i])  # Max intensity in the cell
+            density_map[0, y_idx, x_idx] += 1  # Count points per cell
 
         # Normalize density map (using log(N+1) helps stabilize)
         density_map = torch.log1p(density_map)
@@ -805,8 +998,7 @@ class MultiModalDetectionData(Detection3DData):
             height_map, zbound[0], zbound[1]) - zbound[0]) / ((zbound[1]-zbound[0])/num_height_bins)).long()
         height_one_hot = torch.zeros(
             1, num_height_bins, ny, nx, dtype=torch.float32)
-        # Handle case where height_map might be empty (all zeros)
-        if height_bin_indices.numel() > 0:
+        if height_bin_indices.numel() > 0:  # Handle case where height_map might be empty (all zeros)
             height_one_hot.scatter_(
                 1, height_bin_indices.unsqueeze(1), 1)  # Add channel dim
         # Remove the batch dim added for scatter

@@ -13,6 +13,8 @@ from .tools import save_path
 from .tools import get_batch_iou, get_val_info
 from contextlib import nullcontext  # 导入nullcontext
 from .nuscenes_info import load_nuscenes_infos  # 导入数据集缓存加载函数
+from .tools import CenterPointLoss, DetectionBEVLoss  # 导入新的损失函数
+from .evaluate_3d import decode_predictions, evaluate_with_nuscenes  # Add import
 
 
 def distance_based_nms(boxes_xyz, scores, classes, dist_threshold, score_threshold):
@@ -183,16 +185,11 @@ def train(version,
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
     model = compile_model(grid_conf, data_aug_conf, outC=1)
-    loss = nn.BCEWithLogitsLoss()
+    loss_seg = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor(pos_weight)).to(device)  # 分割损失
     model.to(device)
-    if cuDNN:
-        cudnn.enabled = True
-        cudnn.benchmark = True
-        cudnn.deterministic = True
     opt = torch.optim.Adam(model.parameters(), lr=lr,
                            weight_decay=weight_decay)
-
-    loss_fn = loss(pos_weight).cuda(gpuid)
 
     if resume != '':
         path = os.path.dirname(resume)
@@ -208,7 +205,6 @@ def train(version,
         checkpoint = torch.load(resume)
         model.load_state_dict(checkpoint['net'])
         opt.load_state_dict(checkpoint['optimizer'])
-        loss_fn.load_state_dict(checkpoint['loss'])
         epoch = checkpoint['epoch']
 
     if load_weight != '':
@@ -216,7 +212,6 @@ def train(version,
         checkpoint = torch.load(load_weight)
         model.load_state_dict(checkpoint['net'], strict=False)
         opt.load_state_dict(checkpoint['optimizer'])
-        loss_fn.load_state_dict(checkpoint['loss'])
 
     while epoch < nepochs:
         np.random.seed()
@@ -239,15 +234,14 @@ def train(version,
             binimgs = binimgs.to(device)
 
             with autocast(enabled=amp):
-                loss = loss_fn(preds, binimgs)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_grad_norm)  # 梯度裁减
-                opt.step()
+                loss = loss_seg(preds, binimgs)  # 使用分割损失变量名
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_grad_norm)
+            opt.step()
             counter += 1
             t1 = time.time()  # 确保是浮点数
 
-            # print(counter, loss.item())
             pbar.set_description('||Epoch: [%d/%d]|-----|-----||Batch: [%d/%d]||-----|-----|| Loss: %.4f||'
                                  % (epoch + 1, nepochs, batchi + 1, len(trainloader), loss.item()))
 
@@ -256,7 +250,6 @@ def train(version,
             'net': model.state_dict(),
             'optimizer': opt.state_dict(),
             'epoch': epoch,
-            'loss': loss_fn.state_dict()
         }
         last_model = os.path.join(path, "last.pt")
         torch.save(last_checkpoint, last_model)
@@ -275,11 +268,11 @@ def train(version,
             writer.add_scalar('train/iou', iou, epoch + 1)
             step_time = t1 - t0  # 两个time.time()函数返回值相减得到的就是浮点数
             writer.add_scalar('train/step_time', step_time, epoch + 1)
-            val_info = get_val_info(model, valloader, loss_fn, device)
+            val_info = get_val_info(model, valloader, loss_seg, device)
             print(
                 '||val/loss: {} ||-----|-----||val/iou: {}||'.format(val_info['loss'], val_info['iou']))
-            writer.add_scalar('val/loss: %.4f', val_info['loss'], epoch + 1)
-            writer.add_scalar('val/iou: %.4f', val_info['iou'], epoch + 1)
+            writer.add_scalar('val/loss', val_info['loss'], epoch + 1)
+            writer.add_scalar('val/iou', val_info['iou'], epoch + 1)
             print('---------|Debug data print here|-----------')
             print(
                 '|intersect: {}|-----|-----|union: {}|-----|-----|iou: {}|'.format(intersect, union, iou))
@@ -296,7 +289,7 @@ def train_3d(version,
              gpuid=0,
              cuDNN=False,
              resume='',
-             load_weight='',  # 默认启用混合精度训练，但在验证时需要注意类型一致性
+             load_weight='',
              H=900, W=1600,
              resize_lim=(0.193, 0.225),
              final_dim=(128, 352),
@@ -317,12 +310,21 @@ def train_3d(version,
              lr=2e-4,
              weight_decay=1e-7,
              num_classes=10,
-             enable_multiscale=True,  # 支持多尺度特征训练
-             use_enhanced_bev=True,   # 使用增强的BEV投影
+             enable_multiscale=True,
+             use_enhanced_bev=True,
+             bev_loss_type='ciou',
+             loss_alpha=0.25,
+             loss_gamma=2.0,
+             loss_beta=1.0,
+             dwa_temperature: float = 2.0,
+             dwa_loss_keys: list = ['heatmap', 'offset',
+                                    'z_coord', 'dimension', 'rotation', 'velocity'],
+             eps: float = 1e-8  # Epsilon for numerical stability
              ):
     """
     训练用于3D目标检测的BEVENet模型
     增加多尺度特征训练支持和增强的BEV投影
+    使用 Dynamic Weight Averaging (DWA) 进行动态损失加权
     """
     # 训练前验证并确保数据集缓存存在
     check_and_ensure_cache(dataroot, version)
@@ -334,19 +336,19 @@ def train_3d(version,
         'dbound': dbound,
     }
     data_aug_conf = {
-        'resize_lim': resize_lim,
+        'resize_lim': (0.2, 0.2),  # 禁用随机 resize/crop
         'final_dim': final_dim,
-        'rot_lim': rot_lim,
+        'rot_lim': (0.0, 0.0),    # 禁用随机旋转
         'H': H, 'W': W,
-        'rand_flip': rand_flip,
-        'bot_pct_lim': bot_pct_lim,
+        'rand_flip': False,       # 禁用随机翻转
+        'bot_pct_lim': (0.0, 0.0),  # 禁用底部随机裁剪/填充
         'cams': ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                  'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
         'Ncams': ncams,
     }
     trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
-                                          parser_name='detection3d')  # 使用3D检测数据解析器
+                                          parser_name='detection3d')
 
     device = torch.device(
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
@@ -366,9 +368,10 @@ def train_3d(version,
     print(
         f"配置BEVE模型，num_classes={actual_num_classes}, total_output_channels={total_output_channels}")
     model = compile_model(grid_conf, data_aug_conf,
-                          outC=total_output_channels,  # 传递总通道数
+                          outC=total_output_channels,
                           model='beve',
-                          num_classes=actual_num_classes)  # num_classes 参数可能仍用于内部层
+                          num_classes=actual_num_classes,
+                          backbone_type='resnet18')
     # --- 修改结束 ---
 
     # 记录模型配置
@@ -396,26 +399,29 @@ def train_3d(version,
         cudnn.benchmark = True
         cudnn.deterministic = True
 
-    # 优化器设置
-    opt = torch.optim.Adam(model.parameters(), lr=lr,
-                           betas=(0.5, 0.999),
-                           weight_decay=weight_decay)
+    # === MODIFICATION START: Change Loss Function to CenterPointLoss ===
+    # Define loss weights for CenterPointLoss
+    cp_loss_weights = {
+        'heatmap': 1.0,
+        'offset': 1.0,
+        'z_coord': 1.0,
+        'dimension': 1.0,
+        'rotation': 1.0,
+        'velocity': 1.0
+    }
 
-    # 设置学习率调度器 - 使用余弦退火调度
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=lr, total_steps=nepochs * len(trainloader),
-        pct_start=0.2, div_factor=10, final_div_factor=10,
-        anneal_strategy='cos'  # 使用余弦退火
+    # Instantiate CenterPointLoss
+    loss_fn = CenterPointLoss(num_classes=actual_num_classes,
+                              loss_weights=cp_loss_weights
+                              ).to(device)
+    # === MODIFICATION END ===
+
+    opt = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        betas=(0.9, 0.999),
+        weight_decay=weight_decay
     )
-
-    # 检查如果启用了多尺度训练，打印一条警告信息但不影响程序运行
-
-    # 损失函数
-    from .tools import DetectionBEVLoss
-    # 初始化损失函数，只使用支持的参数
-    loss_fn = DetectionBEVLoss(num_classes=num_classes,
-                               cls_weight=1.0,  # Increased weight from 1.0
-                               iou_weight=4.0).to(device)
 
     if resume != '':
         path = os.path.dirname(resume)
@@ -430,399 +436,307 @@ def train_3d(version,
     epoch = 0
     best_map = 0
 
-    # 恢复训练
+    # === MODIFICATION START: Update possible loss keys ===
+    all_possible_loss_keys = ['heatmap', 'offset',
+                              'z_coord', 'dimension', 'rotation', 'velocity']
+    # === MODIFICATION END ===
+    prev_epoch_raw_losses = {k: torch.tensor(
+        1.0, device=device) for k in all_possible_loss_keys}
+    dwa_weights = {k: torch.tensor(1.0, device=device)
+                   for k in all_possible_loss_keys}
+
     if resume != '':
         print("Loading checkpoint '{}'".format(resume))
         checkpoint = torch.load(resume)
         model.load_state_dict(checkpoint['net'])
         opt.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
         epoch = checkpoint['epoch']
         best_map = checkpoint.get('best_map', 0)
+        resume = ''
 
     if load_weight != '':
         print("Loading weight '{}'".format(load_weight))
         checkpoint = torch.load(load_weight)
         model.load_state_dict(checkpoint['net'], strict=False)
 
-    # 自动混合精度训练
     amp_scaler = GradScaler() if torch.cuda.is_available() else None
 
     while epoch < nepochs:
         np.random.seed()
         model.train()
         epoch_loss = 0
-        epoch_cls_loss = 0
-        epoch_iou_loss = 0
-        # Add accumulators for new regression loss components
-        epoch_bev_diou_loss = 0.0
-        epoch_z_loss = 0.0
-        epoch_h_loss = 0.0
-        epoch_vel_loss = 0.0
+        epoch_raw_losses_sum = {k: 0.0 for k in all_possible_loss_keys}
+        num_batches = len(trainloader)
 
-        # 多尺度训练相关指标
-        if enable_multiscale:
-            epoch_scale_losses = [0, 0, 0]  # P3, P4, P5尺度的损失
+        if epoch > 0:
+            current_avg_raw_losses = {k: epoch_raw_losses_sum[k] / num_batches
+                                      for k in all_possible_loss_keys}
+            loss_ratios = {k: current_avg_raw_losses[k] / (prev_epoch_raw_losses[k] + eps)
+                           for k in all_possible_loss_keys}
 
-        pbar = tqdm(enumerate(trainloader), total=len(
-            trainloader), colour='#8762A5')
-        # batchi: 当前批次索引
-        # imgs: 当前批次图像
-        # rots: 当前批次旋转矩阵
-        # trans: 当前批次平移矩阵
-        # intrins: 当前批次内参矩阵
-        # post_rots: 当前批次后处理旋转矩阵
-        # post_trans: 当前批次后处理平移矩阵
-        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sparse_gts_batch, sample_tokens) in pbar:
-            # 只有在新的累积周期开始时才清零梯度
+            exps = {k: torch.exp(
+                loss_ratios[k] / dwa_temperature) for k in all_possible_loss_keys}
+            sum_exps = sum(exps.values())
+
+            num_tasks = len(all_possible_loss_keys)
+            dwa_weights = {k: exps[k] / (sum_exps + eps) * num_tasks
+                           for k in all_possible_loss_keys}
+
+            prev_epoch_raw_losses = {k: torch.tensor(current_avg_raw_losses[k], device=device)
+                                     for k in all_possible_loss_keys}
+        else:
+            dwa_weights = {k: torch.tensor(1.0, device=device)
+                           for k in all_possible_loss_keys}
+
+        pbar = tqdm(enumerate(trainloader),
+                    total=num_batches, colour='#8762A5')
+
+        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sample_tokens) in pbar:
             opt.zero_grad()
+            B = imgs.size(0)  # Get batch size
 
-            # 处理当前批次
-            preds = model(imgs.to(device),
-                          rots.to(device),
-                          trans.to(device),
-                          intrins.to(device),
-                          post_rots.to(device),
-                          post_trans.to(device),
-                          )
+            with autocast(enabled=(amp_scaler is not None)):
+                preds = model(imgs.to(device),
+                              rots.to(device),
+                              trans.to(device),
+                              intrins.to(device),
+                              post_rots.to(device),
+                              post_trans.to(device),
+                              )
 
-            # Ensure targets is a dictionary and move to device (for loss calculation)
-            targets_dict = {}
-            # targets_list is the dictionary yielded by the DataLoader
-            for key, val in targets_list.items():
-                if isinstance(val, torch.Tensor):
-                    targets_dict[key] = val.to(device)
+                # === MODIFICATION START: Correctly use collated targets ===
+                # targets_list IS the collated dictionary from custom_collate
+                # NO NEED to stack or pad again here.
+                # Just move the tensors in the dictionary to the correct device.
+                targets_on_device = {}
+                for key, value in targets_list.items():  # Iterate through the collated dictionary
+                    if isinstance(value, torch.Tensor):
+                        targets_on_device[key] = value.to(device)
+                    else:
+                        # Keep non-tensor items (like sample_tokens if they were part of dict)
+                        targets_on_device[key] = value
+                # === MODIFICATION END ===
+
+                # Calculate loss using CenterPointLoss (expects the collated dictionary with tensors on device)
+                raw_losses = loss_fn(preds, targets_on_device)
+
+                # Calculate total weighted loss (remains the same logic)
+                total_loss = torch.tensor(0.0, device=device)
+                for key in all_possible_loss_keys:
+                    loss_key = f'raw_{key}_loss'
+                    if loss_key in raw_losses and raw_losses[loss_key] is not None:
+                        total_loss += dwa_weights[key] * raw_losses[loss_key]
+
+            scaled_loss = total_loss
+
+            if amp_scaler is not None:
+                amp_scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            if (batchi + 1) % num_batches == 0:
+                if amp_scaler is not None:
+                    amp_scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm)
+
+                if amp_scaler is not None:
+                    amp_scaler.step(opt)
+                    amp_scaler.update()
                 else:
-                    targets_dict[key] = val
+                    opt.step()
 
-            # Calculate loss using the correctly processed dictionary
-            losses = loss_fn(preds, targets_dict)
-
-            # --- FIX: Define loss components before accumulating/logging ---
-            total_loss = losses['total_loss']
-            cls_loss = losses['cls_loss']
-            # Use .get with default tensor to avoid KeyError if loss is missing
-            iou_loss = losses.get('iou_loss', torch.tensor(0.0, device=device))
-            bev_diou_loss = losses.get(
-                'bev_diou_loss', torch.tensor(0.0, device=device))
-            z_loss = losses.get('z_loss', torch.tensor(0.0, device=device))
-            h_loss = losses.get('h_loss', torch.tensor(0.0, device=device))
-            vel_loss = losses.get('vel_loss', torch.tensor(0.0, device=device))
-            # ---
-
-            # 多尺度损失
-            if enable_multiscale and 'scale_losses' in losses:
-                scale_losses = losses['scale_losses']
-
-            # 梯度裁剪，避免梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-
-            # 反向传播
-            losses['total_loss'].backward()
-
-            # 更新参数
-            opt.step()
-
-            # Scheduler step should happen after optimizer step
-            # This should be outside the scaler check, called every step where optimizer is stepped
-            scheduler.step()
-
-            # Accumulate losses
             epoch_loss += total_loss.item()
-            epoch_cls_loss += cls_loss.item()
-            epoch_iou_loss += iou_loss.item()
-            epoch_bev_diou_loss += bev_diou_loss.item()
-            epoch_z_loss += z_loss.item()
-            epoch_h_loss += h_loss.item()
-            epoch_vel_loss += vel_loss.item()
-
-            # 多尺度训练相关指标
-            if enable_multiscale and 'scale_losses' in losses:
-                for i, loss in enumerate(scale_losses):
-                    epoch_scale_losses[i] += loss.item()
+            for key in all_possible_loss_keys:
+                loss_key = f'raw_{key}_loss'
+                if loss_key in raw_losses and raw_losses[loss_key] is not None:
+                    epoch_raw_losses_sum[key] += raw_losses[loss_key].item()
 
             counter += 1
-            t1 = time.time()  # 确保是浮点数
+            t1 = time.time()
 
-            # 构建进度条描述
-            desc = '||Epoch: [%d/%d]|Loss: %.4f|Cls: %.4f|BEV: %.4f|Z: %.4f|H: %.4f|Vel: %.4f|IoU: %.4f||' % (
-                epoch + 1, nepochs, total_loss.item(), cls_loss.item(),
-                bev_diou_loss.item(), z_loss.item(), h_loss.item(),
-                vel_loss.item(), iou_loss.item()
-            )
-
-            # 如果启用多尺度训练，添加多尺度损失信息
-            if enable_multiscale and 'scale_losses' in losses:
-                desc += ' MS: [%.2f,%.2f,%.2f]' % (
-                    scale_losses[0].item(),
-                    scale_losses[1].item(),
-                    scale_losses[2].item()
-                )
-
+            desc_losses = " | ".join([f"{k[:4].upper()}: {raw_losses.get(f'raw_{k}_loss', torch.tensor(0.0)).item():.3f}"
+                                      for k in all_possible_loss_keys])
+            desc = f'||Epoch: [{epoch + 1}/{nepochs}]|WLoss: {total_loss.item():.3f}|{desc_losses}||'
             pbar.set_description(desc)
 
-        # 每个epoch结束后记录训练损失
-        writer.add_scalar('train/loss', epoch_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/cls_loss', epoch_cls_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/iou_loss', epoch_iou_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/bev_diou_loss', epoch_bev_diou_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/z_loss', epoch_z_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/h_loss', epoch_h_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/vel_loss', epoch_vel_loss /
-                          len(trainloader), epoch + 1)
+        avg_epoch_loss = epoch_loss / num_batches
+        avg_raw_losses = {
+            k: epoch_raw_losses_sum[k] / num_batches for k in all_possible_loss_keys}
 
-        # 记录多尺度训练损失
-        if enable_multiscale:
-            for i, loss in enumerate(epoch_scale_losses):
+        writer.add_scalar('train/total_weighted_loss',
+                          avg_epoch_loss, epoch + 1)
+        for key in all_possible_loss_keys:
+            writer.add_scalar(
+                f'train/raw_{key}_loss', avg_raw_losses[key], epoch + 1)
+            if key in dwa_weights:
                 writer.add_scalar(
-                    f'train/scale{i+3}_loss', loss / len(trainloader), epoch + 1)
+                    f'dwa_weights/{key}_weight', dwa_weights[key].item(), epoch + 1)
 
-        # 记录学习率
-        writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch + 1)
-
-        # 保存最后的模型，用于恢复训练
         last_checkpoint = {
             'net': model.state_dict(),
             'optimizer': opt.state_dict(),
-            'scheduler': scheduler.state_dict(),
             'epoch': epoch,
             'best_map': best_map,
             'model_configs': model_configs,
-            'amp_scaler': amp_scaler.state_dict() if amp_scaler is not None else None,  # 修复None调用问题
+            'amp_scaler': amp_scaler.state_dict() if amp_scaler is not None else None,
         }
         last_model = os.path.join(path, "last.pt")
         torch.save(last_checkpoint, last_model)
 
-        # 验证
         if (epoch + 1) % val_step == 0 and (epoch + 1) >= val_step:
             model.eval()
-            val_loss = 0
-            val_cls_loss = 0
-            val_iou_loss = 0
+            val_raw_losses_sum = {k: 0.0 for k in all_possible_loss_keys}
 
-            # 多尺度验证相关指标
-            if enable_multiscale:
-                val_scale_losses = [0, 0, 0]
-
-            # === 修改：使用新的变量名收集解码结果和稀疏GT ===
-            all_predictions = []
-            all_targets_sparse = []  # 用于存储从dataloader加载的稀疏GT
-            # ---
-
-            visualized_this_epoch = False  # Flag to visualize only once per epoch
+            all_pred_scores_list = []
+            all_pred_cls_list = []
+            all_pred_xyz_list = []
+            all_pred_wlh_list = []
+            all_pred_rot_sincos_list = []
+            all_pred_vel_list = []
+            all_pred_token_list = []
+            all_val_tokens_processed = []
 
             with torch.no_grad():
-                # --- 修改：更新循环变量以接收 sparse_gts_batch --- #
-                for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sparse_gts_batch, sample_tokens) in enumerate(valloader):
-                    # ---
-                    context_manager = nullcontext()
-                    with context_manager:
-                        preds = model(imgs.to(device),
-                                      rots.to(device),
-                                      trans.to(device),
-                                      intrins.to(device),
-                                      post_rots.to(device),
-                                      post_trans.to(device),
-                                      )
+                for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, targets_list, sample_tokens) in enumerate(valloader):
+                    all_val_tokens_processed.extend(sample_tokens)
+                    B_val = imgs.size(0)
 
-                        # Ensure targets is a dictionary and move to device (for loss calculation)
-                        targets_dict = {}
-                        for key, val in targets_list.items():
-                            if isinstance(val, torch.Tensor):
-                                targets_dict[key] = val.to(device)
-                            else:
-                                # Keep non-tensors as is (e.g., potential metadata)
-                                targets_dict[key] = val
+                    with autocast(enabled=(amp_scaler is not None)):
+                        preds_dict = model(imgs.to(device),
+                                           rots.to(device),
+                                           trans.to(device),
+                                           intrins.to(device),
+                                           post_rots.to(device),
+                                           post_trans.to(device),
+                                           )
 
-                        # 1. 计算和累加损失 (using dense targets_dict)
-                        losses = loss_fn(preds, targets_dict)
-                        # ... (accumulate validation losses - similar to train_3d) ...
-                        val_loss += losses['total_loss'].item()
-                        val_cls_loss += losses['cls_loss'].item()
-                        # Assuming reg_loss and iou_loss are present in fusion loss output
-                        val_iou_loss += losses.get('iou_loss',
-                                                   torch.tensor(0.0)).item()
-                        if enable_multiscale and 'scale_losses' in losses:
-                            for i, loss in enumerate(losses['scale_losses']):
-                                val_scale_losses[i] += loss.item()
-
-                    # Decode predictions outside context
-                    # --- FIX: Ensure preds_dict is defined correctly --- #
-                    if not isinstance(preds, dict) and isinstance(preds, torch.Tensor):
-                        B, C, H, W_bev = preds.shape
-                        cls_channels = num_classes
-                        reg_channels = 9
-                        iou_channels = 1
-                        expected_channels = cls_channels + reg_channels + iou_channels
-                        preds_dict = {}  # Initialize
-                        if C >= expected_channels:
-                            preds_dict = {
-                                'cls_pred': preds[:, :cls_channels],
-                                'reg_pred': preds[:, cls_channels: cls_channels + reg_channels],
-                                'iou_pred': preds[:, -iou_channels:]
-                            }
-                        else:
+                        targets_on_device = {}
+                        try:
+                            targets_on_device['target_heatmap'] = torch.stack(
+                                [t['target_heatmap'] for t in targets_list]).to(device)
+                            targets_on_device['target_mask'] = torch.stack(
+                                [t['target_mask'] for t in targets_list]).to(device)
+                        except Exception as e:
                             print(
-                                f"Warning: Pred tensor channels ({C}) < expected ({expected_channels}). Skipping decode.")
-                            preds_dict = {'cls_pred': torch.empty(B, 0, H, W_bev), 'reg_pred': torch.empty(
-                                B, 0, H, W_bev), 'iou_pred': torch.empty(B, 0, H, W_bev)}
-                        preds = preds_dict
-                    # ---
-
-                    from .evaluate_3d import decode_predictions  # Reuse decode
-                    batch_dets = decode_predictions(
-                        preds, device, score_thresh=0.2, grid_conf=grid_conf)
-
-                    # === 修改：直接使用从dataloader加载的 sparse_gts_batch ===
-                    processed_sparse_gts_for_eval = []
-                    for sample_gt_list in sparse_gts_batch:  # Iterate samples in the batch
-                        # Need GTs in the format expected by calculate_simple_ap
-                        # which is a list of dicts, each dict holding tensors for ONE sample.
-                        if not sample_gt_list:
-                            # Handle case with no GT boxes for a sample
-                            processed_sparse_gts_for_eval.append({
-                                'box_cls': torch.empty(0, dtype=torch.long, device=device),
-                                'box_xyz': torch.empty(0, 3, device=device),
-                                'box_wlh': torch.empty(0, 3, device=device),
-                                'box_rot_sincos': torch.empty(0, 2, device=device),
-                                'box_vel': torch.empty(0, 2, device=device)
-                            })
+                                f"[Validation] Error stacking dense targets: {e}")
                             continue
 
-                        # Combine the list of GT dicts for the sample into a single dict with batched tensors
-                        keys = sample_gt_list[0].keys()
-                        sample_batched_gts = {}
-                        for k in keys:
-                            sample_batched_gts[k] = torch.stack(
-                                [gt[k] for gt in sample_gt_list], dim=0).to(device)
-                        processed_sparse_gts_for_eval.append(
-                            sample_batched_gts)
+                        sparse_keys = ['target_indices', 'target_offset', 'target_z_coord',
+                                       'target_dimension', 'target_rotation', 'target_velocity', 'num_objs']
+                        for key in sparse_keys:
+                            try:
+                                targets_on_device[key] = [t[key].to(device) if isinstance(
+                                    t[key], torch.Tensor) else t[key] for t in targets_list]
+                            except Exception as e:
+                                print(
+                                    f"[Validation] Error processing sparse key '{key}': {e}")
+                                targets_on_device[key] = [
+                                    None] * len(targets_list)
 
-                    # Extend the main lists for evaluation after the loop
-                    # batch_dets is already list[dict_per_sample]
-                    all_predictions.extend(batch_dets)
-                    # Use the processed sparse GTs
-                    all_targets_sparse.extend(processed_sparse_gts_for_eval)
-                    # ---
+                        raw_losses = loss_fn(preds_dict, targets_on_device)
+                        for key in all_possible_loss_keys:
+                            loss_key = f'raw_{key}_loss'
+                            if loss_key in raw_losses and raw_losses[loss_key] is not None:
+                                val_raw_losses_sum[key] += raw_losses[loss_key].item()
 
-                    # --- 可视化 (unchanged) --- #
-                    # ... (visualization code) ...
+                    batch_dets_list = decode_predictions(
+                        preds_dict, device, score_thresh=0.1, grid_conf=grid_conf, K=500
+                    )
+                    for sample_idx, dets_dict in enumerate(batch_dets_list):
+                        num_dets_in_sample = dets_dict['box_scores'].shape[0]
+                        if num_dets_in_sample > 0:
+                            all_pred_scores_list.append(
+                                dets_dict['box_scores'].cpu())
+                            all_pred_cls_list.append(
+                                dets_dict['box_cls'].cpu())
+                            all_pred_xyz_list.append(
+                                dets_dict['box_xyz'].cpu())
+                            all_pred_wlh_list.append(
+                                dets_dict['box_wlh'].cpu())
+                            all_pred_rot_sincos_list.append(
+                                dets_dict['box_rot_sincos'].cpu())
+                            all_pred_vel_list.append(
+                                dets_dict['box_vel'].cpu())
+                            sample_token = sample_tokens[sample_idx]
+                            all_pred_token_list.extend(
+                                [sample_token] * num_dets_in_sample)
 
-            # --- 循环结束后 --- #
+            avg_val_raw_losses = {
+                k: val_raw_losses_sum[k] /
+                len(valloader) if len(valloader) > 0 else 0.0
+                for k in all_possible_loss_keys
+            }
+            for key in all_possible_loss_keys:
+                writer.add_scalar(
+                    f'val/raw_{key}_loss', avg_val_raw_losses[key], epoch + 1)
 
-            # ... (calculate and log average validation losses - unchanged) ...
+            val_map_score = 0.0
+            val_nds_score = 0.0
+            metrics_dict = {}
 
-            # --- 计算简化的 mAP --- #
-            def calculate_simple_ap(preds_list, targets_list, num_classes, iou_threshold=0.5, dist_threshold=2.0):
-                class_aps = {}
-                map_score = 0.0
-                for cls_id in range(num_classes):
-                    # --- FIX: Restore TP/FP calculation logic --- #
-                    tp = 0
-                    fp = 0
-                    total_gt_for_class = 0
-                    for sample_preds, sample_targets in zip(preds_list, targets_list):
-                        if 'box_cls' not in sample_targets or 'box_xyz' not in sample_targets:
-                            print(
-                                f"Warning: Skipping sample in AP calc due to missing keys in targets: {sample_targets.keys()}")
-                            continue
-                        if 'box_cls' not in sample_preds or 'box_xyz' not in sample_preds or 'box_scores' not in sample_preds:
-                            print(
-                                f"Warning: Skipping sample in AP calc due to missing keys in preds: {sample_preds.keys()}")
-                            continue
-
-                        gt_mask_sample = sample_targets['box_cls'] == cls_id
-                        total_gt_for_class += gt_mask_sample.sum().item()
-
-                        pred_mask_sample = sample_preds['box_cls'] == cls_id
-                        num_preds_sample = pred_mask_sample.sum().item()
-
-                        if num_preds_sample == 0:
-                            continue
-
-                        pred_boxes_sample = sample_preds['box_xyz'][pred_mask_sample]
-                        pred_scores_sample = sample_preds['box_scores'][pred_mask_sample]
-                        gt_boxes_sample = sample_targets['box_xyz'][gt_mask_sample]
-
-                        if gt_boxes_sample.shape[0] == 0:
-                            fp += num_preds_sample
-                            continue
-
-                        # Simplified distance-based matching
-                        sample_tp = 0
-                        sample_fp = 0
-                        sorted_indices = torch.argsort(
-                            pred_scores_sample, descending=True)
-                        pred_boxes_sorted = pred_boxes_sample[sorted_indices]
-                        gt_matched_flags = torch.zeros(
-                            gt_boxes_sample.shape[0], dtype=torch.bool, device=device)
-
-                        for p_idx, p_box in enumerate(pred_boxes_sorted):
-                            match_found_for_pred = False
-                            if gt_boxes_sample.shape[0] > 0:
-                                distances = torch.norm(
-                                    gt_boxes_sample - p_box.unsqueeze(0), p=2, dim=1)
-                                min_dist, best_gt_idx = torch.min(
-                                    distances, dim=0)
-
-                                if min_dist < dist_threshold and not gt_matched_flags[best_gt_idx]:
-                                    sample_tp += 1
-                                    gt_matched_flags[best_gt_idx] = True
-                                    match_found_for_pred = True
-
-                            if not match_found_for_pred:
-                                sample_fp += 1
-
-                        tp += sample_tp
-                        fp += sample_fp
-                    # --- End TP/FP calculation logic for class --- #
-
-                    # Calculate AP for the class
-                    ap = 0.0
-                    if total_gt_for_class == 0:
-                        ap = 0.0
-                    elif tp + fp == 0:
-                        ap = 0.0
-                    else:
-                        precision = tp / (tp + fp)
-                        recall = tp / total_gt_for_class
-                        if (precision + recall) > 0:
-                            ap = 2 * (precision * recall) / \
-                                (precision + recall)
-                        else:
-                            ap = 0.0
-                    class_aps[cls_id] = ap if not np.isnan(ap) else 0.0
-
-                valid_aps = [v for v in class_aps.values() if not np.isnan(v)]
-                map_score = sum(valid_aps) / \
-                    len(valid_aps) if valid_aps else 0.0
+            if not all_pred_scores_list:
                 print(
-                    f"Simplified AP calculation results (dist_thresh={dist_threshold}): mAP: {map_score:.4f}")
-                return map_score, class_aps
-
-            # 调用简化的AP计算
-            # --- 修改：使用 all_targets_sparse --- #
-            if all_predictions and all_targets_sparse:
-                map_dist_2, class_aps_dist_2 = calculate_simple_ap(
-                    all_predictions, all_targets_sparse, num_classes, dist_threshold=2.0)
-                map_dist_1, class_aps_dist_1 = calculate_simple_ap(
-                    all_predictions, all_targets_sparse, num_classes, dist_threshold=1.0)
-            # ---
-                val_map_score = map_dist_2  # 使用2米距离阈值作为主要指标
-
-                # ... (log mAP scores, print, save best model based on mAP - unchanged) ...
+                    "Warning: No detections found across validation set for nuScenes evaluation.")
             else:
-                print(
-                    "Warning: No predictions/targets collected during validation, skipping simple mAP calculation.")
-                val_map_score = 0.0  # Assign a default value
+                all_predictions_dict = {
+                    'box_scores': torch.cat(all_pred_scores_list).numpy(),
+                    'box_cls': torch.cat(all_pred_cls_list).numpy(),
+                    'box_xyz': torch.cat(all_pred_xyz_list).numpy(),
+                    'box_wlh': torch.cat(all_pred_wlh_list).numpy(),
+                    'box_rot_sincos': torch.cat(all_pred_rot_sincos_list).numpy(),
+                    'box_vel': torch.cat(all_pred_vel_list).numpy(),
+                    'sample_tokens': all_pred_token_list
+                }
 
-            # --- 简化评估结束 --- #
+                eval_set = 'val' if 'mini' not in version else 'mini_val'
+                full_version = f'v1.0-{version}'
+
+                try:
+                    print("Starting official nuScenes evaluation...")
+                    metrics_dict = evaluate_with_nuscenes(
+                        predictions_dict=all_predictions_dict,
+                        nuscenes_version=full_version,
+                        nuscenes_dataroot=dataroot,
+                        eval_set=eval_set,
+                        output_dir=path,
+                        verbose=True,
+                        all_sample_tokens=list(set(all_val_tokens_processed))
+                    )
+                    val_map_score = metrics_dict.get('mAP', 0.0)
+                    val_nds_score = metrics_dict.get('NDS', 0.0)
+                    print("nuScenes evaluation finished.")
+                except Exception as e:
+                    print(f"Error during nuScenes evaluation: {e}")
+                    print("Skipping mAP/NDS reporting for this epoch.")
+                    val_map_score = 0.0
+                    val_nds_score = 0.0
+                    metrics_dict = {}
+
+            val_loss_str = " | ".join(
+                [f"R-{k[:4].upper()}: {avg_val_raw_losses[k]:.3f}" for k in all_possible_loss_keys])
+            print(
+                f'||Val {val_loss_str} | mAP: {val_map_score:.4f} | NDS: {val_nds_score:.4f} ||')
+            writer.add_scalar('val/mAP', val_map_score, epoch + 1)
+            writer.add_scalar('val/NDS', val_nds_score, epoch + 1)
+            for k, v in metrics_dict.items():
+                if k not in ['per_class_AP', 'per_class_TP_Errors']:
+                    writer.add_scalar(f'val_nusc/{k}', v, epoch + 1)
+
+            if val_nds_score > best_map:
+                best_map = val_nds_score
+                best_checkpoint = {
+                    'net': model.state_dict(),
+                    'optimizer': opt.state_dict(),
+                    'epoch': epoch,
+                    'best_map': best_map,
+                    'model_configs': model_configs,
+                    'amp_scaler': amp_scaler.state_dict() if amp_scaler is not None else None,
+                }
+                best_model_path = os.path.join(
+                    path, "best_map.pt")
+                torch.save(best_checkpoint, best_model_path)
+                print(f"Best model saved... NDS: {best_map:.4f}")
 
         epoch += 1
         pbar.close()
@@ -837,7 +751,7 @@ def train_fusion(version,
                  cuDNN=False,
                  resume='',
                  load_weight='',
-                 amp=True,  # 启用混合精度训练
+                 amp=True,
                  H=900, W=1600,
                  resize_lim=(0.193, 0.225),
                  final_dim=(128, 352),
@@ -851,7 +765,7 @@ def train_fusion(version,
                  ybound=[-50.0, 50.0, 0.5],
                  zbound=[-10.0, 10.0, 20.0],
                  dbound=[4.0, 45.0, 1.0],
-                 bsz=1,  # 减小批量大小
+                 bsz=1,
                  nworkers=0,
                  lr=1e-3,
                  weight_decay=1e-7,
@@ -859,10 +773,19 @@ def train_fusion(version,
                  lidar_channels=18,
                  enable_multiscale=True,
                  use_enhanced_fusion=True,
-                 grad_accum_steps=2):  # 添加梯度累积步数
+                 grad_accum_steps=2,
+                 bev_loss_type='ciou',
+                 loss_alpha=0.25,
+                 loss_gamma=2.0,
+                 loss_beta=1.0,
+                 dwa_temperature: float = 2.0,
+                 dwa_loss_keys: list = ['cls', 'bev', 'z', 'h', 'vel', 'iou'],
+                 eps: float = 1e-8  # Epsilon for numerical stability
+                 ):
     """
     训练用于3D目标检测的多模态融合模型
     结合相机和LiDAR特征进行训练
+    使用 Dynamic Weight Averaging (DWA) 进行动态损失加权
     """
     # 训练前验证并确保数据集缓存存在
     check_and_ensure_cache(dataroot, version)
@@ -893,32 +816,26 @@ def train_fusion(version,
     device = torch.device(
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
 
-    # 使用多模态融合模型
+    # 使用多模态融合模型 (BEVENet with fusion handling)
     actual_num_classes = max(1, num_classes)
-    # --- 修改开始 ---
-    # 计算模型总输出通道数 (分类 + 回归 + IoU)
-    # 回归参数: x,y,z, w,l,h, sin,cos, vel (9)
-    # IoU预测: 1 (假设存在)
-    total_output_channels = actual_num_classes + 9 + 1  # 假设包含IoU头
-    # 检查并确保通道数大于0
-    if total_output_channels <= 0:
-        raise ValueError(f"计算出的总输出通道数必须大于0，但得到 {total_output_channels}")
-
+    # total_output_channels is not directly relevant for CenterPoint head
+    # The underlying BEVENet model (when model='fusion') should handle the fusion internally
+    # and use the BEVEncoderCenterPointHead which defines its own outputs.
     print(
-        f"配置BEVE模型，num_classes={actual_num_classes}, total_output_channels={total_output_channels}")
+        f"配置 Fusion (BEVENet) 模型，num_classes={actual_num_classes}, lidar_channels={lidar_channels}")
+    # Assuming 'fusion' model uses the BEVENet we modified, which has CenterPoint head
     model = compile_model(grid_conf, data_aug_conf,
-                          outC=total_output_channels,  # 传递总通道数
-                          model='fusion',  # 使用融合模型
+                          outC=1,  # Placeholder outC, not used by CenterPoint head
+                          model='fusion',  # This should ideally configure BEVENet internally
                           num_classes=actual_num_classes,
-                          lidar_channels=lidar_channels)  # 传递LiDAR通道数
-    # --- 修改结束 ---
+                          lidar_channels=lidar_channels)  # Pass lidar_channels if BEVENet needs it for fusion
 
     # 记录模型配置
     model_configs = {
         'grid_conf': grid_conf,
         'data_aug_conf': data_aug_conf,
         'num_classes': actual_num_classes,
-        'enable_multiscale': enable_multiscale,
+        'enable_multiscale': enable_multiscale,  # These might be flags for the model?
         'use_enhanced_fusion': use_enhanced_fusion,
         'lidar_channels': lidar_channels
     }
@@ -930,22 +847,40 @@ def train_fusion(version,
         cudnn.benchmark = True
         cudnn.deterministic = True
 
-    # 优化器设置
-    opt = torch.optim.Adam(model.parameters(), lr=lr,
-                           weight_decay=weight_decay)
+    # --- CenterPoint Loss Setup ---
+    # Define loss weights
+    cp_loss_weights = {
+        'heatmap': 1.0,
+        'offset': 1.0,
+        'z_coord': 1.0,
+        'dimension': 1.0,
+        'rotation': 1.0,
+        'velocity': 1.0
+    }
+    # === ADDITION START: Re-introduce cp_dwa_loss_keys ===
+    # DWA loss keys specific to CenterPointLoss
+    cp_dwa_loss_keys = ['heatmap', 'offset',
+                        'z_coord', 'dimension', 'rotation', 'velocity']
+    # === ADDITION END ===
+
+    loss_fn = CenterPointLoss(num_classes=actual_num_classes,
+                              loss_weights=cp_loss_weights
+                              ).to(device)
+    # ---
+
+    opt = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay
+    )
 
     # 设置学习率调度器 - 使用余弦退火调度
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=lr, total_steps=nepochs * len(trainloader),
+        opt, max_lr=lr, total_steps=nepochs *
+        (len(trainloader) // grad_accum_steps),
         pct_start=0.2, div_factor=10, final_div_factor=10,
         anneal_strategy='cos'
     )
-
-    # 损失函数
-    from .tools import DetectionBEVLoss
-    loss_fn = DetectionBEVLoss(num_classes=num_classes,
-                               cls_weight=2.0,  # Increased weight from 1.0
-                               iou_weight=1.0).to(device)
 
     if resume != '':
         path = os.path.dirname(resume)
@@ -960,7 +895,14 @@ def train_fusion(version,
     epoch = 0
     best_map = 0
 
-    # 恢复训练
+    # === MODIFICATION START: Update possible loss keys (should match cp_dwa_loss_keys) ===
+    all_possible_loss_keys = cp_dwa_loss_keys
+    prev_epoch_raw_losses = {k: torch.tensor(
+        1.0, device=device) for k in all_possible_loss_keys}
+    dwa_weights = {k: torch.tensor(1.0, device=device)
+                   for k in all_possible_loss_keys}
+    # === MODIFICATION END ===
+
     if resume != '':
         print("Loading checkpoint '{}'".format(resume))
         checkpoint = torch.load(resume)
@@ -969,395 +911,137 @@ def train_fusion(version,
         scheduler.load_state_dict(checkpoint['scheduler'])
         epoch = checkpoint['epoch']
         best_map = checkpoint.get('best_map', 0)
+        resume = ''
 
     if load_weight != '':
         print("Loading weight '{}'".format(load_weight))
         checkpoint = torch.load(load_weight)
         model.load_state_dict(checkpoint['net'], strict=False)
 
-    # 自动混合精度训练
-    if amp and torch.cuda.is_available():
-        scaler = GradScaler()
-    else:
-        scaler = None
+    amp_scaler = GradScaler() if amp and torch.cuda.is_available() else None
 
     while epoch < nepochs:
         np.random.seed()
         model.train()
         epoch_loss = 0
-        epoch_cls_loss = 0
-        epoch_iou_loss = 0
-        # Add accumulators for new regression loss components
+        epoch_raw_losses_sum = {k: 0.0 for k in all_possible_loss_keys}
+        num_batches = len(trainloader)
+        num_opt_steps = num_batches // grad_accum_steps
 
-        # 多尺度训练相关指标
-        if enable_multiscale:
-            epoch_scale_losses = [0, 0, 0]  # P3, P4, P5尺度的损失
+        if epoch > 0:
+            # DWA calculation (uses cp_dwa_loss_keys)
+            current_avg_raw_losses = {k: epoch_raw_losses_sum[k] / num_batches
+                                      for k in cp_dwa_loss_keys}
+            loss_ratios = {k: current_avg_raw_losses[k] / (prev_epoch_raw_losses[k] + eps)
+                           for k in cp_dwa_loss_keys}
 
-        pbar = tqdm(enumerate(trainloader), total=len(
-            trainloader), colour='#8762A5')
+            exps = {k: torch.exp(
+                loss_ratios[k] / dwa_temperature) for k in cp_dwa_loss_keys}
+            sum_exps = sum(exps.values())
 
-        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_list, sparse_gts_batch, sample_tokens) in pbar:
+            num_tasks = len(cp_dwa_loss_keys)
+            dwa_weights = {k: exps[k] / (sum_exps + eps) * num_tasks
+                           for k in cp_dwa_loss_keys}
+
+            prev_epoch_raw_losses = {k: torch.tensor(current_avg_raw_losses[k], device=device)
+                                     for k in cp_dwa_loss_keys}
+        else:
+            # Initialize weights (uses cp_dwa_loss_keys)
+            dwa_weights = {k: torch.tensor(1.0, device=device)
+                           for k in cp_dwa_loss_keys}
+
+        opt.zero_grad()
+        pbar = tqdm(enumerate(trainloader),
+                    total=num_batches, colour='#8762A5')
+
+        # Training loop (uses cp_dwa_loss_keys for loss calculation and logging)
+        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_list, sample_tokens) in pbar:
             t0 = time.time()
-            # 只有在新的累积周期开始时才清零梯度
-            if batchi % grad_accum_steps == 0:
-                opt.zero_grad()
+            B = imgs.size(0)
 
-            # 处理当前批次
-            # 使用autocast进行混合精度训练
-            with autocast(enabled=amp) if scaler else nullcontext():
-                preds = model(imgs.to(device),
-                              rots.to(device),
-                              trans.to(device),
-                              intrins.to(device),
-                              post_rots.to(device),
-                              post_trans.to(device),
-                              lidar_bev.to(device)
-                              )
+            with autocast(enabled=(amp_scaler is not None)):
+                preds_dict = model(imgs.to(device),
+                                   rots.to(device),
+                                   trans.to(device),
+                                   intrins.to(device),
+                                   post_rots.to(device),
+                                   post_trans.to(device),
+                                   )
 
-                # Ensure targets is a dictionary and move to device (for loss calculation)
-                targets_dict = {}
-                # targets_list is the dictionary yielded by the DataLoader
-                for key, val in targets_list.items():
-                    if isinstance(val, torch.Tensor):
-                        targets_dict[key] = val.to(device)
-                    else:
-                        targets_dict[key] = val
+                # === MODIFICATION START: Pad and Stack Sparse Targets ===
+                targets_on_device = {}
+                # Stack dense maps
+                try:
+                    targets_on_device['target_heatmap'] = torch.stack(
+                        [t['target_heatmap'] for t in targets_list]).to(device)
+                    targets_on_device['target_mask'] = torch.stack(
+                        [t['target_mask'] for t in targets_list]).to(device)
+                except Exception as e:
+                    print(f"Error stacking dense targets: {e}")
+                    continue  # Skip batch if targets are bad
 
-                # Calculate loss using the correctly processed dictionary
-                losses = loss_fn(preds, targets_dict)
+                # Initialize padded sparse tensors and mask
+                padded_indices = torch.zeros(
+                    (B, 500), dtype=torch.long, device=device)
+                padded_offset = torch.zeros(
+                    (B, 500, 2), dtype=torch.float32, device=device)
+                padded_z = torch.zeros(
+                    (B, 500, 1), dtype=torch.float32, device=device)
+                padded_dim = torch.zeros(
+                    (B, 500, 3), dtype=torch.float32, device=device)
+                padded_rot = torch.zeros(
+                    (B, 500, 2), dtype=torch.float32, device=device)
+                padded_vel = torch.zeros(
+                    (B, 500, 2), dtype=torch.float32, device=device)
+                reg_padding_mask = torch.zeros(
+                    (B, 500), dtype=torch.bool, device=device)
 
-                # --- FIX: Define loss components before scaling/accumulating --- #
-                total_loss = losses['total_loss']
-                cls_loss = losses['cls_loss']
-                reg_loss = losses.get(
-                    'reg_loss', torch.tensor(0.0, device=device))
-                iou_loss = losses.get(
-                    'iou_loss', torch.tensor(0.0, device=device))
-                # ---
+                sparse_keys_to_pad = ['target_indices', 'target_offset', 'target_z_coord',
+                                      'target_dimension', 'target_rotation', 'target_velocity']
+                padded_tensors = {
+                    'target_indices': padded_indices,
+                    'target_offset': padded_offset,
+                    'target_z_coord': padded_z,
+                    'target_dimension': padded_dim,
+                    'target_rotation': padded_rot,
+                    'target_velocity': padded_vel
+                }
 
-                # Scale loss for gradient accumulation
-                # --- FIX: Ensure grad_accum_steps is defined and used --- #
-                # grad_accum_steps is an argument to train_fusion, should be defined
-                scaled_loss = total_loss / grad_accum_steps
-                # ---
+                for i in range(B):
+                    try:
+                        num_obj = targets_list[i]['num_objs'].item()
+                        if num_obj > 500:
+                            num_obj = 500  # Clip
 
-            # Backward pass with scaler
-            if scaler:
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+                        if num_obj > 0:
+                            reg_padding_mask[i, :num_obj] = True
+                            for key in sparse_keys_to_pad:
+                                source_tensor = targets_list[i][key]
+                                padded_tensors[key][i, :num_obj] = source_tensor[:num_obj].to(
+                                    device)
 
-            # Step optimizer only after accumulating gradients
-            # --- FIX: Ensure grad_accum_steps is defined and used --- #
-            if (batchi + 1) % grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_grad_norm)
-                if scaler:
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    opt.step()
-                scheduler.step()
+                    except KeyError as e:
+                        print(
+                            f"KeyError accessing targets for sample {i}: {e}.")
+                        continue
+                    except Exception as e:
+                        print(
+                            f"Error padding sparse targets for sample {i}: {e}")
+                        continue
 
-            # Accumulate losses
-            epoch_loss += total_loss.item()
-            epoch_cls_loss += cls_loss.item()
-            epoch_reg_loss += reg_loss.item()
-            epoch_iou_loss += iou_loss.item()
+                # Add padded sparse targets and mask to targets_on_device
+                targets_on_device.update(padded_tensors)
+                targets_on_device['reg_mask'] = reg_padding_mask
+                targets_on_device['num_objs'] = torch.tensor(
+                    [t['num_objs'].item() for t in targets_list], device=device)
+                # === MODIFICATION END ===
 
-            # 多尺度训练相关指标
-            if enable_multiscale and 'scale_losses' in losses:
-                scale_losses = losses['scale_losses']
-                for i, loss in enumerate(scale_losses):
-                    epoch_scale_losses[i] += loss.item()
+                # Calculate loss
+                raw_losses = loss_fn(preds_dict, targets_on_device)
 
-            counter += 1
-            t1 = time.time()  # 确保是浮点数
-
-            # 构建进度条描述
-            desc = '||Epoch: [%d/%d]|Loss: %.4f|Cls: %.4f|Reg: %.4f|IoU: %.4f||' % (
-                epoch + 1, nepochs, total_loss.item(), cls_loss.item(),
-                reg_loss.item(), iou_loss.item()
-            )
-
-            # 如果启用多尺度训练，添加多尺度损失信息
-            if enable_multiscale and 'scale_losses' in losses:
-                desc += ' MS: [%.2f,%.2f,%.2f]' % (
-                    scale_losses[0].item(),
-                    scale_losses[1].item(),
-                    scale_losses[2].item()
-                )
-
-            pbar.set_description(desc)
-
-        # 每个epoch结束后记录训练损失
-        writer.add_scalar('train/loss', epoch_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/cls_loss', epoch_cls_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/reg_loss', epoch_reg_loss /
-                          len(trainloader), epoch + 1)
-        writer.add_scalar('train/iou_loss', epoch_iou_loss /
-                          len(trainloader), epoch + 1)
-
-        # 记录多尺度训练损失
-        if enable_multiscale:
-            for i, loss in enumerate(epoch_scale_losses):
-                writer.add_scalar(
-                    f'train/scale{i+3}_loss', loss / len(trainloader), epoch + 1)
-
-        # 记录学习率
-        writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch + 1)
-
-        # 保存最后的模型，用于恢复训练
-        last_checkpoint = {
-            'net': model.state_dict(),
-            'optimizer': opt.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'epoch': epoch,
-            'best_map': best_map,
-            'model_configs': model_configs,
-            'amp_scaler': scaler.state_dict() if scaler is not None else None,  # 修复None调用问题
-        }
-        last_model = os.path.join(path, "last.pt")
-        torch.save(last_checkpoint, last_model)
-
-        # 验证
-        if (epoch + 1) % val_step == 0 and (epoch + 1) >= val_step:
-            model.eval()
-            val_loss = 0
-            val_cls_loss = 0
-            val_reg_loss = 0
-            val_iou_loss = 0
-
-            # 多尺度验证相关指标
-            if enable_multiscale:
-                val_scale_losses = [0, 0, 0]
-
-            # === 修改：使用新的变量名收集解码结果和稀疏GT ===
-            all_predictions = []
-            all_targets_sparse = []  # 用于存储从dataloader加载的稀疏GT
-            # ---
-
-            visualized_this_epoch = False
-
-            with torch.no_grad():
-                # --- 修改：更新循环变量以接收 sparse_gts_batch --- #
-                for batch_idx, (imgs, rots, trans, intrins, post_rots, post_trans, lidar_bev, targets_list, sparse_gts_batch, sample_tokens) in enumerate(valloader):
-                    # ---
-                    context_manager = nullcontext()
-                    with context_manager:
-                        preds = model(imgs.to(device),
-                                      rots.to(device),
-                                      trans.to(device),
-                                      intrins.to(device),
-                                      post_rots.to(device),
-                                      post_trans.to(device),
-                                      )
-
-                        # Ensure targets is a dictionary and move to device (for loss calculation)
-                        targets_dict = {}
-                        for key, val in targets_list.items():
-                            if isinstance(val, torch.Tensor):
-                                targets_dict[key] = val.to(device)
-                            else:
-                                # Keep non-tensors as is (e.g., potential metadata)
-                                targets_dict[key] = val
-
-                        # 1. 计算和累加损失 (using dense targets_dict)
-                        losses = loss_fn(preds, targets_dict)
-                        # ... (accumulate validation losses - similar to train_3d) ...
-                        val_loss += losses['total_loss'].item()
-                        val_cls_loss += losses['cls_loss'].item()
-                        # Assuming reg_loss and iou_loss are present in fusion loss output
-                        val_reg_loss += losses.get('reg_loss',
-                                                   torch.tensor(0.0)).item()
-                        val_iou_loss += losses.get('iou_loss',
-                                                   torch.tensor(0.0)).item()
-                        if enable_multiscale and 'scale_losses' in losses:
-                            for i, loss in enumerate(losses['scale_losses']):
-                                val_scale_losses[i] += loss.item()
-
-                    # Decode predictions outside context
-                    # --- FIX: Ensure preds_dict is defined correctly --- #
-                    if not isinstance(preds, dict) and isinstance(preds, torch.Tensor):
-                        B, C, H, W_bev = preds.shape
-                        cls_channels = num_classes
-                        reg_channels = 9
-                        iou_channels = 1
-                        expected_channels = cls_channels + reg_channels + iou_channels
-                        preds_dict = {}  # Initialize
-                        if C >= expected_channels:
-                            preds_dict = {
-                                'cls_pred': preds[:, :cls_channels],
-                                'reg_pred': preds[:, cls_channels: cls_channels + reg_channels],
-                                'iou_pred': preds[:, -iou_channels:]
-                            }
-                        else:
-                            print(
-                                f"Warning: Pred tensor channels ({C}) < expected ({expected_channels}). Skipping decode.")
-                            preds_dict = {'cls_pred': torch.empty(B, 0, H, W_bev), 'reg_pred': torch.empty(
-                                B, 0, H, W_bev), 'iou_pred': torch.empty(B, 0, H, W_bev)}
-                        preds = preds_dict
-                    # ---
-
-                    from .evaluate_3d import decode_predictions  # Reuse decode
-                    batch_dets = decode_predictions(
-                        preds, device, score_thresh=0.2, grid_conf=grid_conf)
-
-                    # === 修改：直接使用从dataloader加载的 sparse_gts_batch ===
-                    processed_sparse_gts_for_eval = []
-                    for sample_gt_list in sparse_gts_batch:
-                        if not sample_gt_list:
-                            processed_sparse_gts_for_eval.append({
-                                'box_cls': torch.empty(0, dtype=torch.long, device=device),
-                                'box_xyz': torch.empty(0, 3, device=device),
-                                'box_wlh': torch.empty(0, 3, device=device),
-                                'box_rot_sincos': torch.empty(0, 2, device=device),
-                                'box_vel': torch.empty(0, 2, device=device)
-                            })
-                            continue
-                        keys = sample_gt_list[0].keys()
-                        sample_batched_gts = {}
-                        for k in keys:
-                            sample_batched_gts[k] = torch.stack(
-                                [gt[k] for gt in sample_gt_list], dim=0).to(device)
-                        processed_sparse_gts_for_eval.append(
-                            sample_batched_gts)
-                    # --- End sparse GT processing --- #
-
-                    # Extend lists using NMS preds and sparse GTs
-                    all_predictions.extend(batch_dets)
-                    # FIX: Use the defined variable
-                    all_targets_sparse.extend(processed_sparse_gts_for_eval)
-
-                    # ... (visualization) ...
-
-            # Outside validation loop
-            # ... (calculate and log average validation losses - unchanged) ...
-
-            # Calculate simplified mAP
-            def calculate_simple_ap(preds_list, targets_list, num_classes, iou_threshold=0.5, dist_threshold=2.0):
-                class_aps = {}
-                map_score = 0.0
-                for cls_id in range(num_classes):
-                    # --- Restore TP/FP calculation logic --- #
-                    tp = 0
-                    fp = 0
-                    total_gt_for_class = 0
-                    for sample_preds, sample_targets in zip(preds_list, targets_list):
-                        if 'box_cls' not in sample_targets or 'box_xyz' not in sample_targets:
-                            print(
-                                f"Warning: Skipping sample in AP calc due to missing keys in targets: {sample_targets.keys()}")
-                            continue
-                        if 'box_cls' not in sample_preds or 'box_xyz' not in sample_preds or 'box_scores' not in sample_preds:
-                            print(
-                                f"Warning: Skipping sample in AP calc due to missing keys in preds: {sample_preds.keys()}")
-                            continue
-
-                        gt_mask_sample = sample_targets['box_cls'] == cls_id
-                        total_gt_for_class += gt_mask_sample.sum().item()
-
-                        pred_mask_sample = sample_preds['box_cls'] == cls_id
-                        num_preds_sample = pred_mask_sample.sum().item()
-
-                        if num_preds_sample == 0:
-                            continue
-
-                        pred_boxes_sample = sample_preds['box_xyz'][pred_mask_sample]
-                        pred_scores_sample = sample_preds['box_scores'][pred_mask_sample]
-                        gt_boxes_sample = sample_targets['box_xyz'][gt_mask_sample]
-
-                        if gt_boxes_sample.shape[0] == 0:
-                            fp += num_preds_sample
-                            continue
-
-                        # Simplified distance-based matching
-                        sample_tp = 0
-                        sample_fp = 0
-                        sorted_indices = torch.argsort(
-                            pred_scores_sample, descending=True)
-                        pred_boxes_sorted = pred_boxes_sample[sorted_indices]
-                        gt_matched_flags = torch.zeros(
-                            gt_boxes_sample.shape[0], dtype=torch.bool, device=device)
-
-                        for p_idx, p_box in enumerate(pred_boxes_sorted):
-                            match_found_for_pred = False
-                            if gt_boxes_sample.shape[0] > 0:
-                                distances = torch.norm(
-                                    gt_boxes_sample - p_box.unsqueeze(0), p=2, dim=1)
-                                min_dist, best_gt_idx = torch.min(
-                                    distances, dim=0)
-                                if min_dist < dist_threshold and not gt_matched_flags[best_gt_idx]:
-                                    sample_tp += 1
-                                    gt_matched_flags[best_gt_idx] = True
-                                    match_found_for_pred = True
-                            if not match_found_for_pred:
-                                sample_fp += 1
-
-                        tp += sample_tp
-                        fp += sample_fp
-                    # --- End TP/FP calculation logic --- #
-
-                    ap = 0.0
-                    if total_gt_for_class == 0:
-                        ap = 0.0
-                    elif tp + fp == 0:
-                        ap = 0.0
-                    else:
-                        precision = tp / (tp + fp)
-                        recall = tp / total_gt_for_class
-                        if (precision + recall) > 0:
-                            ap = 2 * (precision * recall) / \
-                                (precision + recall)
-                        else:
-                            ap = 0.0
-                    class_aps[cls_id] = ap if not np.isnan(ap) else 0.0
-
-                valid_aps = [v for v in class_aps.values() if not np.isnan(v)]
-                map_score = sum(valid_aps) / \
-                    len(valid_aps) if valid_aps else 0.0
-                print(
-                    f"Simplified AP calculation results (dist_thresh={dist_threshold}): mAP: {map_score:.4f}")
-                return map_score, class_aps
-
-            # Call calculate_simple_ap and use results
-            if all_predictions and all_targets_sparse:
-                map_dist_2, class_aps_dist_2 = calculate_simple_ap(
-                    all_predictions, all_targets_sparse, num_classes, dist_threshold=2.0)
-                map_dist_1, class_aps_dist_1 = calculate_simple_ap(
-                    all_predictions, all_targets_sparse, num_classes, dist_threshold=1.0)
-                val_map_score = map_dist_2
-
-                # Log and print results
-                writer.add_scalar('val/simple_mAP_dist_2m',
-                                  val_map_score, epoch + 1)
-                writer.add_scalar('val/simple_mAP_dist_1m',
-                                  map_dist_1, epoch + 1)
-                print('||Val Loss: %.4f | Simple mAP@dist=2m: %.4f | Simple mAP@dist=1m: %.4f||' %
-                      (val_loss, val_map_score, map_dist_1))
-
-                # Save best model based on mAP
-                if val_map_score > best_map:
-                    best_map = val_map_score
-                    best_checkpoint = {
-                        'net': model.state_dict(),
-                        'optimizer': opt.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'epoch': epoch,
-                        'best_map': best_map,
-                        'model_configs': model_configs,
-                        'amp_scaler': scaler.state_dict() if scaler is not None else None,
-                    }
-                    best_model_path = os.path.join(path, "best_map.pt")
-                    torch.save(best_checkpoint, best_model_path)
-                    print(f"Best model saved... mAP@dist=2m: {best_map:.4f}")
-            else:
-                print(
-                    "Warning: No predictions/targets collected during validation, skipping simple mAP calculation.")
-                val_map_score = 0.0  # Assign default value if no calculation happened
-
-        epoch += 1
-        pbar.close()
-
-    writer.close()
+                # Calculate weighted total loss
+                total_loss = torch.tensor(0.0, device=device)
+                for key in cp_dwa_loss_keys:
+                    loss_key = f'raw_{key}_loss'
+                    if loss_key in raw_losses and raw_losses[loss_key] is not None:
+                        total_loss += dwa_weights[key] * raw_losses[loss_key]

@@ -20,6 +20,7 @@ from pyquaternion import Quaternion
 import json
 from typing import Dict, List, Any
 from torch.cuda.amp import autocast
+import torch.nn.functional as F  # Add import for max_pool2d
 
 # --- Constants for nuScenes Mapping ---
 
@@ -330,239 +331,187 @@ def evaluate_with_nuscenes(
 
 # --- Modified decode functions ---
 
-def decode_predictions(preds: Dict[str, torch.Tensor], device: torch.device, score_thresh: float, grid_conf: Dict[str, Any]):
+def _gather_feat(feat, ind, mask=None):
+    """Gather feature based on index"""
+    dim = feat.size(2)
+    ind = ind.unsqueeze(2).expand(ind.size(0), ind.size(1), dim)
+    feat = feat.gather(1, ind)
+    if mask is not None:
+        mask = mask.unsqueeze(2).expand_as(feat)
+        feat = feat[mask]
+        feat = feat.view(-1, dim)
+    return feat
+
+
+def _transpose_and_gather_feat(feat, ind):
+    """Transpose and gather feature"""
+    feat = feat.permute(0, 2, 3, 1).contiguous()
+    feat = feat.view(feat.size(0), -1, feat.size(3))
+    feat = _gather_feat(feat, ind)
+    return feat
+
+# --- Function to perform NMS on heatmap ---
+
+
+def _nms(heat, kernel=3):
+    pad = (kernel - 1) // 2
+    hmax = F.max_pool2d(
+        heat, (kernel, kernel), stride=1, padding=pad)
+    keep = (hmax == heat).float()
+    return heat * keep  # Return heatmap with non-maximum suppressed values zeroed out
+
+
+def _topk(scores, K=100):
+    batch, cat, height, width = scores.size()
+
+    # Perform NMS first to reduce redundant peaks
+    scores = _nms(scores)
+
+    # Find top K scores across all classes and spatial locations
+    topk_scores, topk_inds = torch.topk(scores.view(batch, cat, -1), K)
+
+    topk_inds = topk_inds % (height * width)
+    topk_ys = (topk_inds // width).int().float()
+    topk_xs = (topk_inds % width).int().float()
+
+    # Find top K scores *per category*
+    topk_score, topk_ind = torch.topk(
+        scores.view(batch, cat, -1).permute(0, 2, 1), K)
+    # topk_score: [B, K] (top scores regardless of class)
+    # topk_ind: [B, K] (class index for each top score)
+    topk_clses = topk_ind.int()
+    # Get the spatial indices corresponding to these top scores
+    # Need to map topk_score back to original spatial index and class index
+    # Re-calculate indices based on topk scores across all classes
+    topk_inds = _gather_feat(topk_inds.view(
+        batch, -1, 1), topk_ind).view(batch, K)
+
+    topk_ys = (topk_inds // width).int().float()
+    topk_xs = (topk_inds % width).int().float()
+
+    return topk_scores, topk_inds, topk_clses, topk_ys, topk_xs
+
+# --- Decode function modified for CenterPoint ---
+
+
+def decode_predictions(
+    preds_dict: Dict[str, torch.Tensor],
+    device: torch.device,  # Device is implicitly handled by input tensors
+    score_thresh: float,
+    grid_conf: Dict[str, Any],
+    K: int = 100  # Number of top predictions to consider
+):
     """
-    Decodes model predictions into bounding boxes, scores, and classes.
-    Transforms relative grid cell offsets to global coordinates.
-    Args:
-        preds: Dictionary of prediction tensors from the model.
-        device: The torch device.
-        score_thresh: Minimum score threshold to keep a detection.
-        grid_conf: Dictionary containing BEV grid configuration (xbound, ybound).
-    """
-    batch_size = preds['cls_pred'].shape[0]
-    predictions = []
-
-    # Extract grid parameters needed for coordinate transformation
-    xbound = grid_conf['xbound']
-    ybound = grid_conf['ybound']
-    min_x, max_x, res_x = xbound
-    min_y, max_y, res_y = ybound
-
-    for b in range(batch_size):
-        cls_pred = preds['cls_pred'][b]  # [C, H, W]
-        # [9, H, W] (x,y,z, w,l,h, sin,cos, vel_xy)
-        reg_pred = preds['reg_pred'][b]
-        iou_pred = preds['iou_pred'][b]  # [1, H, W]
-
-        cls_scores, cls_ids = torch.max(
-            torch.softmax(cls_pred, dim=0), dim=0)  # [H, W]
-        iou_scores = torch.sigmoid(iou_pred.squeeze(0))  # [H, W]
-        scores = cls_scores * iou_scores  # Combined score [H, W]
-
-        # Filter based on class ID > 0 and score threshold
-        final_mask = (cls_ids > 0) & (scores > score_thresh)
-
-        if final_mask.sum() > 0:
-            # filtered_cls_ids = cls_ids[mask]    # [N]
-            filtered_cls_ids = cls_ids[final_mask]    # [N]
-            filtered_scores = scores[final_mask]      # [N]
-
-            h, w = final_mask.shape  # Use final_mask shape
-            # Fix meshgrid warning for PyTorch >= 1.10
-            ys, xs = torch.meshgrid(torch.arange(
-                h, device=device), torch.arange(w, device=device), indexing='ij')
-            # [N], [N] - Coordinates in feature map
-            xs, ys = xs[final_mask], ys[final_mask]
-
-            reg_pred_permuted = reg_pred.permute(1, 2, 0)  # [H, W, 9]
-            filtered_reg = reg_pred_permuted[final_mask]       # [N, 9]
-
-            # --- Add Top-K Filtering (nuScenes limit is 500) ---
-            max_boxes_per_sample = 500
-            num_filtered_dets = filtered_scores.shape[0]
-
-            if num_filtered_dets > max_boxes_per_sample:
-                # Sort scores in descending order and get top-k indices
-                topk_scores, topk_indices = torch.topk(
-                    filtered_scores, k=max_boxes_per_sample)
-
-                # Apply top-k indices to all relevant tensors
-                filtered_scores = topk_scores
-                filtered_cls_ids = filtered_cls_ids[topk_indices]
-                xs = xs[topk_indices]
-                ys = ys[topk_indices]
-                filtered_reg = filtered_reg[topk_indices]
-
-            # Assuming offsets are relative to grid cell *centers*
-            # Calculate grid cell center coordinates in global frame
-            grid_cell_center_x = min_x + (xs.float() + 0.5) * res_x
-            grid_cell_center_y = min_y + (ys.float() + 0.5) * res_y
-
-            # --- Decode Normalized Z ---
-            zbound = grid_conf['zbound']
-            z_min, z_max, z_res = zbound
-            z_range = z_max - z_min
-            if z_range <= 0:
-                print(
-                    f"Warning: Invalid z_range ({z_range}) from zbound: {zbound}. Cannot decode Z.")
-                # Handle error case, maybe predict Z=0 or skip?
-                # Predict Z=0 as fallback
-                pred_z = torch.zeros_like(filtered_reg[:, 2])
-            else:
-                # Reverse the normalization: normalized_z = (Z - z_min) / z_range - 0.5
-                # => Z = (normalized_z + 0.5) * z_range + z_min
-                pred_z = (filtered_reg[:, 2] + 0.5) * z_range + z_min
-            # --- End Decode Z ---
-
-            # Transform offsets to global coordinates
-            pred_x = grid_cell_center_x + filtered_reg[:, 0]  # Add X offset
-            pred_y = grid_cell_center_y + filtered_reg[:, 1]  # Add Y offset
-
-            # Combine into [N, 3]
-            pred_xyz = torch.stack([pred_x, pred_y, pred_z], dim=1)
-
-            # [N, 3] (w, l, h) - Check order! nuScenes expects w, l, h
-            pred_wlh = filtered_reg[:, 3:6]
-            # [N, 2] (sin(yaw), cos(yaw))
-            pred_rot_sincos = filtered_reg[:, 6:8]
-            # [N, 1] or [N, 2]? Assuming [N, 2] for (vx, vy)
-            pred_vel = filtered_reg[:, 8:]
-            # Ensure velocity has 2 components, pad with 0 if needed
-            if pred_vel.shape[1] == 1:
-                pred_vel = torch.cat(
-                    [pred_vel, torch.zeros_like(pred_vel)], dim=1)
-
-            dets = {
-                'box_cls': filtered_cls_ids,
-                'box_scores': filtered_scores,
-                'box_reg': filtered_reg,  # Keep raw regression output if needed elsewhere
-                'box_xyz': pred_xyz,
-                'box_wlh': pred_wlh,
-                'box_rot_sincos': pred_rot_sincos,
-                # Ensure only 2 velocity components (vx, vy)
-                'box_vel': pred_vel[:, :2]
-            }
-            predictions.append(dets)
-        else:
-            empty_dets = {
-                'box_cls': torch.zeros(0, dtype=torch.long, device=device),
-                'box_scores': torch.zeros(0, device=device),
-                'box_reg': torch.zeros(0, 9, device=device),
-                'box_xyz': torch.zeros(0, 3, device=device),
-                'box_wlh': torch.zeros(0, 3, device=device),
-                'box_rot_sincos': torch.zeros(0, 2, device=device),
-                'box_vel': torch.zeros(0, 2, device=device)
-            }
-            predictions.append(empty_dets)
-
-    return predictions
-
-
-def decode_targets(targets_dict: Dict[str, torch.Tensor], device: torch.device) -> List[Dict[str, torch.Tensor]]:
-    """Decodes target maps (from dictionary) into a list of ground truth boxes per sample.
+    Decodes predictions from CenterPoint heads into 3D bounding boxes.
 
     Args:
-        targets_dict (Dict[str, torch.Tensor]): Dictionary containing target tensors.
-                                                Expected keys: 'cls_map', 'reg_map'.
-        device (torch.device): The device to place tensors on.
+        preds_dict (Dict[str, torch.Tensor]): Dictionary of raw predictions from the model.
+            Expected keys: 'heatmap', 'offset', 'z_coord', 'dimension', 'rotation', 'velocity'.
+        score_thresh (float): Threshold to filter detections based on heatmap score.
+        grid_conf (Dict[str, Any]): Grid configuration (xbound, ybound, dx, bx).
+        K (int): Maximum number of detections to return per sample.
 
     Returns:
-        List[Dict[str, torch.Tensor]]: A list where each element is a dictionary
-                                       representing ground truth boxes for one sample.
-                                       Keys: 'box_cls', 'box_reg', 'box_xyz', etc.
+        List[Dict[str, torch.Tensor]]: A list of dictionaries, one per batch sample.
+            Each dictionary contains keys for 'box_scores', 'box_cls', 'box_xyz', 
+            'box_wlh', 'box_rot_sincos', 'box_vel'.
     """
-    # Access tensors using dictionary keys
-    if 'cls_map' not in targets_dict or 'reg_map' not in targets_dict:
-        raise ValueError(
-            "targets_dict must contain 'cls_map' and 'reg_map' keys.")
+    heatmap = preds_dict['heatmap'].sigmoid_()
+    offset = preds_dict['offset']
+    z_coord = preds_dict['z_coord']
+    dimension = preds_dict['dimension']  # Log scale
+    rotation = preds_dict['rotation']  # sin, cos
+    velocity = preds_dict.get('velocity')  # Optional
 
-    cls_map = targets_dict['cls_map'].to(device)
-    reg_map = targets_dict['reg_map'].to(device)
+    B, C, H, W = heatmap.shape
+    dx_bev = torch.tensor(grid_conf['xbound'][2], device=heatmap.device)
+    dy_bev = torch.tensor(grid_conf['ybound'][2], device=heatmap.device)
+    bx_bev = torch.tensor(
+        grid_conf['xbound'][0] + grid_conf['xbound'][2] / 2.0, device=heatmap.device)
+    by_bev = torch.tensor(
+        grid_conf['ybound'][0] + grid_conf['ybound'][2] / 2.0, device=heatmap.device)
 
-    # Ensure cls_map is [B, H, W] if it has a channel dimension of 1
-    if cls_map.dim() == 4 and cls_map.shape[1] == 1:
-        cls_map = cls_map.squeeze(1)
-    elif cls_map.dim() != 3:
-        raise ValueError(
-            f"Unexpected cls_map shape: {cls_map.shape}. Expected [B, H, W] or [B, 1, H, W].")
+    # 1. Find top K peaks in the heatmap after NMS
+    scores, inds, clses, ys, xs = _topk(heatmap, K=K)
+    # scores, inds, clses, ys, xs are all [B, K]
 
-    # Ensure reg_map is [B, C, H, W]
-    if reg_map.dim() != 4:
-        raise ValueError(
-            f"Unexpected reg_map shape: {reg_map.shape}. Expected [B, C, H, W].")
+    # 2. Gather regression predictions at peak locations
+    # Transpose and gather needs indices in [B, K] format
+    offset = _transpose_and_gather_feat(offset, inds)  # [B, K, 2]
+    z_coord = _transpose_and_gather_feat(z_coord, inds)  # [B, K, 1]
+    dimension = _transpose_and_gather_feat(dimension, inds)  # [B, K, 3]
+    rotation = _transpose_and_gather_feat(rotation, inds)  # [B, K, 2]
+    if velocity is not None:
+        velocity = _transpose_and_gather_feat(velocity, inds)  # [B, K, 2]
+    else:  # Create dummy zero velocity if head doesn't exist
+        velocity = torch.zeros_like(offset)  # [B, K, 2]
 
-    batch_size = cls_map.shape[0]
-    gt_list = []
+    # 3. Convert grid coordinates + offset to original coordinates
+    # Add offset to integer grid coordinates
+    xs = xs.view(B, K, 1) + offset[:, :, 0:1]
+    ys = ys.view(B, K, 1) + offset[:, :, 1:2]
 
-    for b in range(batch_size):
-        cls_targets = cls_map[b]  # [H, W]
-        reg_targets = reg_map[b]  # [C, H, W], C should be 9 (or similar)
+    # Convert grid coords to meters
+    # x_m = (xs * dx_bev) + bx_bev - dx_bev / 2.0 # Center of the bin adjustment
+    # y_m = (ys * dy_bev) + by_bev - dy_bev / 2.0 # Center of the bin adjustment
+    # Simpler: Add grid center offset (bx_bev, by_bev includes half-bin offset)
+    x_m = xs * dx_bev + bx_bev
+    y_m = ys * dy_bev + by_bev
 
-        # --- Sanity check for reg_targets channels ---
-        # Example: Assuming 9 channels: x, y, z, w, l, h, sin, cos, vel(xy)
-        num_reg_channels = reg_targets.shape[0]
-        if num_reg_channels < 8:  # At least pos, dim, rot needed
-            print(
-                f"Warning: reg_targets channel dimension is {num_reg_channels}, expected >= 8.")
-            # Handle potentially missing channels gracefully if possible, or raise error
+    # Combine with z coordinate
+    xyz = torch.cat([x_m, y_m, z_coord], dim=2)  # [B, K, 3]
 
-        mask = cls_targets > 0  # Find locations with ground truth objects
+    # 4. Decode dimensions (exp for log scale)
+    wlh = dimension.exp()  # [B, K, 3] - w, l, h
 
-        if mask.sum() > 0:
-            # Ensure class IDs are long integers [N]
-            filtered_cls_ids = cls_targets[mask].long()
+    # 5. Prepare outputs per batch item
+    detections = []
+    for b in range(B):
+        scores_b = scores[b]  # [K]
+        clses_b = clses[b]  # [K]
+        xyz_b = xyz[b]  # [K, 3]
+        wlh_b = wlh[b]  # [K, 3]
+        rotation_b = rotation[b]  # [K, 2]
+        velocity_b = velocity[b]  # [K, 2]
 
-            # Get corresponding regression targets
-            # Permute reg_targets to [H, W, C] for easier indexing
-            reg_targets_permuted = reg_targets.permute(1, 2, 0)
-            filtered_reg = reg_targets_permuted[mask]  # [N, C]
+        # Apply score threshold
+        keep_mask = scores_b >= score_thresh
+        if keep_mask.sum() == 0:
+            # Add empty dict if no detections pass threshold
+            detections.append({
+                'box_scores': torch.empty(0, device=heatmap.device),
+                'box_cls': torch.empty(0, dtype=torch.long, device=heatmap.device),
+                'box_xyz': torch.empty(0, 3, device=heatmap.device),
+                'box_wlh': torch.empty(0, 3, device=heatmap.device),
+                'box_rot_sincos': torch.empty(0, 2, device=heatmap.device),
+                'box_vel': torch.empty(0, 2, device=heatmap.device)
+            })
+            continue
 
-            # --- Extract target components (adapt based on actual channel order) ---
-            # IMPORTANT: Verify the channel order (x,y,z, w,l,h, sin,cos, vel?)
-            # Example assuming 9 channels: [x,y,z, w,l,h, sin,cos, vel_x] (adapt if different)
-            if num_reg_channels >= 9:
-                gt_xyz = filtered_reg[:, :3]
-                gt_wlh = filtered_reg[:, 3:6]  # Assuming order is w, l, h
-                gt_rot_sincos = filtered_reg[:, 6:8]
-                # Assuming single velocity component
-                gt_vel_x = filtered_reg[:, 8:9]
-                # Create a 2D velocity vector (vx, vy), assuming vy=0 if not present
-                gt_vel = torch.cat(
-                    [gt_vel_x, torch.zeros_like(gt_vel_x)], dim=1)
-            elif num_reg_channels == 8:  # Example: No velocity
-                gt_xyz = filtered_reg[:, :3]
-                gt_wlh = filtered_reg[:, 3:6]
-                gt_rot_sincos = filtered_reg[:, 6:8]
-                gt_vel = torch.zeros(
-                    (filtered_reg.shape[0], 2), device=device)  # Zero velocity
-            else:
-                # Handle cases with fewer channels if necessary, or raise error
-                raise ValueError(
-                    f"Regression map has insufficient channels ({num_reg_channels})")
+        # Filter based on score
+        scores_b = scores_b[keep_mask]
+        clses_b = clses_b[keep_mask]
+        xyz_b = xyz_b[keep_mask]
+        wlh_b = wlh_b[keep_mask]
+        rotation_b = rotation_b[keep_mask]
+        velocity_b = velocity_b[keep_mask]
 
-            gt = {
-                'box_cls': filtered_cls_ids,
-                'box_reg': filtered_reg,  # Raw regression targets
-                'box_xyz': gt_xyz,
-                'box_wlh': gt_wlh,
-                'box_rot_sincos': gt_rot_sincos,
-                'box_vel': gt_vel  # Already ensured to be [N, 2]
-            }
-            gt_list.append(gt)
-        else:
-            # No ground truth objects for this sample
-            empty_gt = {
-                'box_cls': torch.zeros(0, dtype=torch.long, device=device),
-                'box_reg': torch.zeros(0, 9, device=device),
-                'box_xyz': torch.zeros(0, 3, device=device),
-                'box_wlh': torch.zeros(0, 3, device=device),
-                'box_rot_sincos': torch.zeros(0, 2, device=device),
-                'box_vel': torch.zeros(0, 2, device=device)
-            }
-            gt_list.append(empty_gt)
+        detections.append({
+            'box_scores': scores_b,
+            'box_cls': clses_b,
+            'box_xyz': xyz_b,
+            'box_wlh': wlh_b,
+            'box_rot_sincos': rotation_b,
+            'box_vel': velocity_b
+        })
 
-    return gt_list
+    return detections
+
+# --- Original decode_predictions (KEEP FOR REFERENCE OR REMOVE) ---
+# def decode_predictions_original(...):
+#    ... (Previous implementation) ...
+
+# --- Function to decode GT targets (Optional, might be useful for debugging/vis) ---
 
 
 # --- Deprecated/Removed Functions ---
@@ -613,7 +562,7 @@ def evaluate_3d_detection(
 
     Args:
         checkpoint_path: 模型检查点 (.pth) 文件的路径。
-        version: nuScenes 数据集版本（例如，“v1.0-mini”，“v1.0-trainval”）。
+        version: nuScenes 数据集版本（例如，"v1.0-mini"，"v1.0-trainval"）。
         dataroot: nuScenes 数据集的根目录。
         gpuid: 用于评估的 GPU ID（-1 表示 CPU）。
         H, W: 原始图像的高度和宽度。

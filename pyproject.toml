@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lift-splat-shoot"
+version = "0.1.0"
+description = "PyTorch implementation of the Lift-Splat-Shoot paper for 3D object detection from camera images."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" } # Please confirm and update if needed
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License", # Please confirm and update if needed
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "torch>=1.10", # Adjust based on your CUDA version/needs
+    "torchvision>=0.11", # Adjust based on your torch version
+    "torchaudio>=0.10", # Adjust based on your torch version
+    "tensorboardX",
+    "numpy",
+    "tqdm",
+    "nuscenes-devkit", # Note: Installation might require specific steps or git cloning. Check its documentation.
+    "pillow", # Often needed for image loading
+    "opencv-python-headless", # Often used for image augmentations
+]
+
+# Optional: Define where to find torch packages easily
+# Adjust the URL based on your CUDA version (e.g., cu118, cu121) or use 'cpu'.
+# See https://pytorch.org/get-started/locally/
+# You can also specify this directly during 'uv pip compile' using --extra-index-url
+# [tool.uv.sources]
+# torch = { url = "https://download.pytorch.org/whl/cu118" } 
+
+[project.urls]
+"Homepage" = "https://github.com/your-username/lift-splat-shoot" # Placeholder - Update with your repo URL
+"Bug Tracker" = "https://github.com/your-username/lift-splat-shoot/issues" # Placeholder - Update with your repo URL 
