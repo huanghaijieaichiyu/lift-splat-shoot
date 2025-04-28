@@ -461,28 +461,20 @@ def train_fusion(version,
                     colour='#8762A5', desc=f"Epoch {epoch+1}/{nepochs}")
 
         for batchi, batch_data in pbar:
-            # Expect 9 items: imgs, rots, trans, intrins, post_rots, post_trans, binimgs, lidar_bev, sample_tokens
-            # We don't need sample_tokens during training loop itself
-            # Handle both cases: dataloader yielding 8 items (old) or 9 items (new, with token)
+            # 处理batch_data，确保正确处理sample_token
             if len(batch_data) == 9:
-                # Unpack 9 items, ignore the last one (token)
-                imgs, rots, trans, intrins, post_rots, post_trans, binimgs, lidar_bev, _ = batch_data
+                imgs, rots, trans, intrins, post_rots, post_trans, binimgs, lidar_bev, sample_tokens = batch_data
             elif len(batch_data) == 8:
-                # Unpack only 8 items (no token provided by dataloader)
-                # Optional warning
-                print(
-                    "Warning: Training dataloader yielding only 8 items. sample_token unavailable.")
                 imgs, rots, trans, intrins, post_rots, post_trans, binimgs, lidar_bev = batch_data
+                sample_tokens = None
             else:
-                print(
-                    f"Error: Expected 8 or 9 items from train dataloader, got {len(batch_data)}. Check dataset implementation. Skipping batch.")
+                print(f"错误：期望从训练数据加载器获取8或9个项，但得到了{len(batch_data)}个。跳过该批次。")
                 continue
 
             opt.zero_grad()
             context = autocast(enabled=amp)
             with context:
-                # Ensure model call matches expected inputs
-                # Assuming model returns (preds, depth_prob) based on original code
+                # 确保模型调用匹配预期输入
                 model_output = model(imgs.to(device),
                                      rots.to(device),
                                      trans.to(device),
@@ -495,10 +487,9 @@ def train_fusion(version,
                     preds, depth_prob = model_output
                 elif isinstance(model_output, torch.Tensor):
                     preds = model_output
-                    depth_prob = None  # Model doesn't return depth
+                    depth_prob = None
                 else:
-                    print(
-                        f"Error: Unexpected model output format: {type(model_output)}. Skipping batch.")
+                    print(f"错误：意外的模型输出格式：{type(model_output)}。跳过该批次。")
                     continue
 
                 binimgs = binimgs.to(device)
@@ -506,15 +497,11 @@ def train_fusion(version,
 
             if not torch.isfinite(loss):
                 print(
-                    f"Warning: Epoch {epoch+1}, Batch {batchi}, NaN/Inf loss detected. Skipping update. Loss: {loss.item()}")
-                # Consider adding gradient inspection here if NaNs persist
-                # for name, param in model.named_parameters():
-                #     if param.grad is not None and torch.isnan(param.grad).any():
-                #         print(f"NaN gradient in {name}")
-                continue  # Skip backward/step
+                    f"警告：第{epoch+1}轮，第{batchi}批次，检测到NaN/Inf损失。跳过更新。损失：{loss.item()}")
+                continue
 
             scaler.scale(loss).backward()
-            scaler.unscale_(opt)  # Unscale before clipping
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(opt)
             scaler.update()
@@ -523,52 +510,51 @@ def train_fusion(version,
             global_step += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            # --- Training Visualization (Optional) ---
+            # 训练可视化（可选）
             if log_vis_interval > 0 and global_step % log_vis_interval == 0:
                 with torch.no_grad():
                     try:
-                        vis_idx = 0  # Visualize first sample in batch
-                        # Input Image
-                        # Assuming index 1 is CAM_FRONT
+                        vis_idx = 0
+                        # 输入图像
                         input_img_vis = imgs[vis_idx, 1].cpu()
                         writer.add_image(
                             'train/input_image_front', input_img_vis, global_step)
 
-                        # LiDAR BEV Input
+                        # LiDAR BEV输入
                         lidar_bev_vis = lidar_bev[vis_idx].cpu().sum(
                             0, keepdim=True)
                         lidar_bev_vis = (lidar_bev_vis - lidar_bev_vis.min()) / \
-                                        (lidar_bev_vis.max() -
-                                         lidar_bev_vis.min() + 1e-6)
+                            (lidar_bev_vis.max() - lidar_bev_vis.min() + 1e-6)
                         writer.add_image('train/input_lidar_bev',
                                          lidar_bev_vis, global_step)
 
-                        # Ground Truth BEV
+                        # 地面真值BEV
                         gt_bev_vis = binimgs[vis_idx].cpu().float()
                         writer.add_image(
                             'train/gt_bev', gt_bev_vis, global_step)
 
-                        # Predicted BEV
+                        # 预测BEV
                         pred_bev_vis = torch.sigmoid(preds[vis_idx]).cpu()
                         writer.add_image('train/pred_bev',
                                          pred_bev_vis, global_step)
 
-                        # Depth Map Visualization (if available)
+                        # 深度图可视化（如果可用）
                         if depth_prob is not None and D_depth is not None:
-                            # Assuming index 1 is CAM_FRONT
                             front_cam_depth_prob = depth_prob[vis_idx, 1].cpu()
                             depth_indices = torch.argmax(
                                 front_cam_depth_prob, dim=0, keepdim=True)
-                            # Avoid division by zero if D_depth is 1
                             vis_depth_map = depth_indices.float() / max(1, D_depth - 1)
-                            vis_depth_map_resized = F.interpolate(
-                                vis_depth_map.unsqueeze(0), size=final_dim_vis, mode='nearest').squeeze(0)
-                            writer.add_image('train/depth_map_front_maxprob',
-                                             vis_depth_map_resized, global_step)
+                            vis_depth_map_resized = F.interpolate(vis_depth_map.unsqueeze(
+                                0), size=final_dim_vis, mode='nearest').squeeze(0)
+                            writer.add_image(
+                                'train/depth_map_front_maxprob', vis_depth_map_resized, global_step)
+
+                        # 记录sample_token（如果可用）
+                        if sample_tokens is not None:
+                            writer.add_text('train/sample_token',
+                                            sample_tokens[vis_idx], global_step)
                     except Exception as vis_e:
-                        print(
-                            f"Warning: Error during training visualization: {vis_e}")
-                        # Prevent visualization error from stopping training
+                        print(f"警告：训练可视化期间出错：{vis_e}")
                         pass
 
         # --- End of Epoch ---
@@ -596,20 +582,18 @@ def train_fusion(version,
 
         # --- Validation Step ---
         if val_step > 0 and (epoch + 1) % val_step == 0:
-            print(f"--- Running Validation Epoch {epoch+1} ---")
-            # Pass necessary arguments to get_val_info_fusion, including writer, step, and vis params
-            # Note: Assuming the previous edit correctly added writer, global_step, final_dim_vis, D_depth to the call signature
+            print(f"--- 运行验证 第{epoch+1}轮 ---")
             val_info = get_val_info_fusion(model=model,
                                            valloader=valloader,
                                            loss_fn=loss_seg,
                                            device=device,
                                            nusc=nusc,
                                            grid_conf=grid_conf,
-                                           writer=writer,  # Pass writer
-                                           global_step=global_step,  # Pass global_step
+                                           writer=writer,
+                                           global_step=global_step,
                                            map_layers=map_layers,
-                                           final_dim_vis=final_dim_vis,  # Pass vis param
-                                           D_depth=D_depth)  # Pass vis param
+                                           final_dim_vis=final_dim_vis,
+                                           D_depth=D_depth)  # 移除sample_tokens参数
 
             # Log metrics returned by get_val_info_fusion
             # ... (Log simple and devkit metrics logic remains same) ...

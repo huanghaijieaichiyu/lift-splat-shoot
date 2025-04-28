@@ -392,86 +392,59 @@ def create_lidar_bev(points, grid_conf, lidar_inC=1):
 
 # --- Added FusionData Class ---
 class FusionData(NuscData):
-    # Removed nusc_can_bus from signature
     def __init__(self, nusc, nusc_maps, is_train, data_aug_conf, grid_conf, lidar_inC=1):
-        # Removed nusc_can_bus from super call
         super(FusionData, self).__init__(
             nusc, nusc_maps, is_train, data_aug_conf, grid_conf)
-        self.lidar_inC = lidar_inC  # Store LiDAR BEV input channels
+        self.lidar_inC = lidar_inC
         print(
             f"Initialized FusionData with is_train={is_train}, lidar_inC={self.lidar_inC}")
-        # Optional: Pre-filter scenes or samples if needed
 
     def __getitem__(self, index):
         rec = self.ixes[index]
 
-        # --- Get Camera Data (similar to SegmentationData) ---
         # Get sensor data tokens
         cam_front_token = rec['data']['CAM_FRONT']
         lidar_token = rec['data']['LIDAR_TOP']
 
+        # Get sample token for validation
+        sample_token = rec['token']
+
         cams = self.data_aug_conf['cams']
-        # Ensure all required cams are present in the record
         cams = [cam for cam in cams if cam in rec['data']]
         if len(cams) != self.data_aug_conf['Ncams']:
-            # print(f"Warning: Expected {self.data_aug_conf['Ncams']} cameras, but found {len(cams)} for record {rec['token']}. Required: {self.data_aug_conf['cams']}")
-            # Handle this case if necessary, e.g., skip sample or pad
-            # For now, return None to signal skipping in the collate_fn (if implemented)
-            # Or raise an error if padding isn't handled later
-            # Returning dummy data might be problematic. Let's assume skipping is intended if cams mismatch.
-            # A better approach might be to filter self.ixes in __init__
-            # For now, let's proceed but be aware this sample might cause issues downstream if not skipped.
+            print(
+                f"Warning: Expected {self.data_aug_conf['Ncams']} cameras, but found {len(cams)} for record {rec['token']}")
             pass
 
-        # Get camera info
+        # Get camera info and data
         cam_info = self.get_cam_info(rec, cam_front_token)
-        # Get images and geometric transforms for all cameras
-        # Ensure get_image_data returns binimg as well - NuscData.get_image_data does NOT return binimg
-        # SegmentationData.__getitem__ calls get_image_data and get_binimg separately.
-        # We should do the same here.
-        imgs, rots, trans, intrins, post_rots, post_trans = \
-            self.get_image_data(
-                rec, cams)  # Original NuscData method returns 6 items
-
-        # Get binary segmentation map separately
+        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(
+            rec, cams)
         binimg = self.get_binimg(rec, cam_info)
-        # --- End Camera Data ---
 
-        # --- Get LiDAR Data ---
-        # Load LiDAR points (N x 5): x, y, z, intensity, ring_index
+        # Get LiDAR data
         lidar_path = self.nusc.get_sample_data_path(lidar_token)
-        # Keep x, y, z, intensity - intensity might be useful for BEV
         points_full = LidarPointCloud.from_file(lidar_path).points.T
-        # Keep only x, y, z for geometry transforms
         points = points_full[:, :3]
-        # intensity = points_full[:, 3] # Keep intensity separately if needed
 
-        # Transform points to ego vehicle frame at the time of the lidar scan
+        # Transform points to ego vehicle frame
         lidar_sd_rec = self.nusc.get('sample_data', lidar_token)
         cs_record = self.nusc.get(
             'calibrated_sensor', lidar_sd_rec['calibrated_sensor_token'])
         pose_record = self.nusc.get('ego_pose', lidar_sd_rec['ego_pose_token'])
 
-        # Homogeneous transformation matrix from lidar sensor frame to ego frame
         lidar_to_ego_trans = np.array(pose_record['translation'])
         lidar_to_ego_rot = Quaternion(pose_record['rotation'])
 
-        # Move points to ego frame
         points_ego = np.dot(lidar_to_ego_rot.rotation_matrix, points.T).T
         points_ego += lidar_to_ego_trans
 
-        # Further transform points if needed (e.g., specific augmentations)
-        # Example: Apply same augmentation as cameras if meaningful
-        # resize, _, _, flip, rotate = self.sample_augmentation() # Get aug params
-        # Need to implement point cloud augmentation corresponding to image aug
-
-        # Create LiDAR BEV map using points in ego frame
+        # Create LiDAR BEV map
         lidar_bev = create_lidar_bev(
             points_ego, self.grid_conf, self.lidar_inC)
-        # --- End LiDAR Data ---
 
-        # Return all data needed by train_fusion (7 items from camera + 1 lidar_bev)
-        return imgs, rots, trans, intrins, post_rots, post_trans, binimg, lidar_bev
+        # Return all data including sample_token
+        return imgs, rots, trans, intrins, post_rots, post_trans, binimg, lidar_bev, sample_token
 # --- End FusionData Class ---
 
 
@@ -508,7 +481,6 @@ def compile_data(version, dataroot, data_aug_conf=None, grid_conf=None, bsz=4, n
         print("Using FusionData parser.")
         # Get lidar_inC from kwargs or default to 1
         lidar_inC = kwargs.get('lidar_inC', 1)
-        # Removed nusc_can_bus from constructor call
         traindata = FusionData(nusc, nusc_maps, is_train=True,
                                data_aug_conf=data_aug_conf, grid_conf=grid_conf, lidar_inC=lidar_inC)
         valdata = FusionData(nusc, nusc_maps, is_train=False,
