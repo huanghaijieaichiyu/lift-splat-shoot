@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import time  # 直接导入time模块
 from tensorboardX import SummaryWriter
 from torch.backends import cudnn
@@ -15,6 +16,7 @@ from contextlib import nullcontext  # 导入nullcontext
 from .nuscenes_info import load_nuscenes_infos  # 导入数据集缓存加载函数
 import torchvision  # 导入 torchvision 用于可视化
 import torch.autograd  # 导入 autograd
+from nuscenes import NuScenes    # Import NuScenes
 
 
 def check_and_ensure_cache(dataroot, version):
@@ -120,37 +122,61 @@ def train(version,
 
     if resume != '':
         path = os.path.dirname(resume)
+        if not os.path.exists(path):
+            print(
+                f"Resume directory {path} does not exist. Creating log directory instead.")
+            path = save_path(logdir)
     else:
         path = save_path(logdir)
+
     writer = SummaryWriter(logdir=path)
     val_step = 10 if version == 'mini' else 30
     model.train()
     counter = 0
     epoch = 0
+    max_f1 = 0.0  # Track best F1 score
+
     if resume != '':
-        print("Loading checkpoint '{}'".format(resume))
-        checkpoint = torch.load(resume)
-        model.load_state_dict(checkpoint['net'])
-        opt.load_state_dict(checkpoint['optimizer'])
-        epoch = checkpoint['epoch']
+        if os.path.exists(resume):
+            print("Loading checkpoint '{}'".format(resume))
+            checkpoint = torch.load(resume, map_location=device)
+            model.load_state_dict(checkpoint['net'])
+            opt.load_state_dict(checkpoint['optimizer'])
+            epoch = checkpoint.get('epoch', 0) + 1
+            max_f1 = checkpoint.get('max_f1', 0.0)
+            print(
+                f"Resuming training from epoch {epoch}, best F1 so far: {max_f1:.4f}")
+        else:
+            print(
+                f"Resume checkpoint {resume} not found. Starting from scratch.")
 
     if load_weight != '':
-        print("Loading weight '{}'".format(load_weight))
-        checkpoint = torch.load(load_weight)
-        model.load_state_dict(checkpoint['net'], strict=False)
-        opt.load_state_dict(checkpoint['optimizer'])
+        if os.path.exists(load_weight):
+            print("Loading weight '{}'".format(load_weight))
+            checkpoint = torch.load(load_weight, map_location=device)
+            # Handle checkpoints that might be just the state_dict or a dict containing 'net'
+            state_dict_to_load = checkpoint.get('net', checkpoint)
+            model.load_state_dict(state_dict_to_load, strict=False)
+            # Optionally load optimizer state if available and needed
+            # if 'optimizer' in checkpoint:
+            #     opt.load_state_dict(checkpoint['optimizer'])
+        else:
+            print(
+                f"Weight file {load_weight} not found. Skipping weight loading.")
 
     while epoch < nepochs:
         np.random.seed()
-        Iou = [0.0]  # 初始化为浮点数
-        t0, t1 = 0.0, 0.0  # Initialize time variables
+        # Iou = [0.0]  # Keep track of IoU history if needed
+        t0_epoch = time.time()
         pbar = tqdm(enumerate(trainloader), total=len(
-            trainloader), colour='#8762A5')
+            trainloader), colour='#8762A5', desc=f"Epoch {epoch+1}/{nepochs}")
 
+        epoch_loss_total = 0.0
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
-            t0 = time.time()  # 确保是浮点数
+            t0_batch = time.time()
             opt.zero_grad()
-            with autocast(enabled=amp):
+            context = autocast(enabled=amp)
+            with context:
                 preds = model(imgs.to(device),
                               rots.to(device),
                               trans.to(device),
@@ -160,53 +186,84 @@ def train(version,
                               )
             binimgs = binimgs.to(device)
 
-            with autocast(enabled=amp):
+            with context:
                 loss = loss_seg(preds, binimgs)  # 使用分割损失变量名
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_grad_norm)
-            opt.step()
-            counter += 1
-            t1 = time.time()  # 确保是浮点数
 
-            pbar.set_description('||Epoch: [%d/%d]|-----|-----||Batch: [%d/%d]||-----|-----|| Loss: %.4f||'
-                                 % (epoch + 1, nepochs, batchi + 1, len(trainloader), loss.item()))
+            if torch.isfinite(loss):
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm)
+                opt.step()
+                epoch_loss_total += loss.item()
+            else:
+                print(
+                    f"Warning: Epoch {epoch+1}, Batch {batchi}, NaN/Inf loss detected. Skipping update. Loss: {loss.item()}")
+
+            counter += 1
+            t1_batch = time.time()
+
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_epoch_loss = epoch_loss_total / \
+            len(trainloader) if len(trainloader) > 0 else 0.0
+        t1_epoch = time.time()
+        print(
+            f"Epoch {epoch+1} finished. Avg Loss: {avg_epoch_loss:.4f}, Time: {t1_epoch-t0_epoch:.2f}s")
+        writer.add_scalar('train/loss_epoch', avg_epoch_loss, epoch + 1)
 
         # Save the last model for resume
         last_checkpoint = {
             'net': model.state_dict(),
             'optimizer': opt.state_dict(),
             'epoch': epoch,
+            'max_f1': max_f1  # Save current best f1
         }
-        last_model = os.path.join(path, "last.pt")
-        torch.save(last_checkpoint, last_model)
+        last_model_path = os.path.join(path, "last.pt")
+        torch.save(last_checkpoint, last_model_path)
 
-        if (epoch + 1) % 10 == 0 and (epoch + 1) >= 10:
-            writer.add_scalar('train/loss', loss, counter)
-
-        if (epoch + 1) % val_step == 0 and (epoch + 1) >= val_step:
-            intersect, union, iou = get_batch_iou(preds, binimgs)
-            # Save the bast model in iou
-            if float(iou) > max(Iou):
-                best_model = os.path.join(path, "best.pt")
-                torch.save(model, best_model)
-
-            Iou.append(float(iou))  # 确保添加的是浮点数
-            writer.add_scalar('train/iou', iou, epoch + 1)
-            step_time = t1 - t0  # 两个time.time()函数返回值相减得到的就是浮点数
-            writer.add_scalar('train/step_time', step_time, epoch + 1)
+        if (epoch + 1) % val_step == 0:
+            # --- Validation Step for Simple Model ---
             val_info = get_val_info(model, valloader, loss_seg, device)
+            current_iou = val_info['iou']
+            current_f1 = val_info['f1']
+            current_precision = val_info['precision']
+            current_recall = val_info['recall']
+            current_loss = val_info['loss']
+
             print(
-                '||val/loss: {} ||-----|-----||val/iou: {}||'.format(val_info['loss'], val_info['iou']))
-            writer.add_scalar('val/loss', val_info['loss'], epoch + 1)
-            writer.add_scalar('val/iou', val_info['iou'], epoch + 1)
-            print('---------|Debug data print here|-----------')
-            print(
-                '|intersect: {}|-----|-----|union: {}|-----|-----|iou: {}|'.format(intersect, union, iou))
-            print('-----------------|done|--------------------')
+                f"|| Val Metrics Epoch {epoch+1}: Loss: {current_loss:.4f} | IoU: {current_iou:.4f} | Precision: {current_precision:.4f} | Recall: {current_recall:.4f} | F1: {current_f1:.4f} ||")
+
+            writer.add_scalar('val/loss', current_loss, epoch + 1)
+            writer.add_scalar('val/iou', current_iou, epoch + 1)
+            writer.add_scalar('val/precision', current_precision, epoch + 1)
+            writer.add_scalar('val/recall', current_recall, epoch + 1)
+            writer.add_scalar('val/f1', current_f1, epoch + 1)
+
+            # Save the best model based on F1-score
+            if current_f1 > max_f1:
+                max_f1 = current_f1
+                print(
+                    f"*** New best F1: {max_f1:.4f}. Saving best model... ***")
+                best_model_path = os.path.join(path, "best_f1.pt")
+                best_checkpoint = {
+                    'net': model.state_dict(),
+                    'optimizer': opt.state_dict(),
+                    'epoch': epoch,
+                    'max_f1': max_f1,
+                    'iou_at_best_f1': current_iou  # Store IoU corresponding to best F1
+                }
+                torch.save(best_checkpoint, best_model_path)
+                print(f"Saved best model checkpoint to {best_model_path}")
+
+            # Optional: Debug print from original code
+            # print(
+            #     '||val/loss: {} ||-----|-----||val/iou: {}||'.format(current_loss, current_iou))
+            # print('-----------------|done|--------------------')
+            # --- End Validation Step ---
 
         epoch += 1
-        pbar.close()
+        # pbar.close() # Closing inside loop might cause issues if tqdm is outside
+    pbar.close()  # Close pbar after the loop finishes
     writer.close()
 
 
@@ -243,320 +300,401 @@ def train_fusion(version,
                  lr=1e-3,
                  weight_decay=1e-7,
                  log_vis_interval=500,  # 每 N 个 batch 记录一次可视化信息
+                 # Add arg for map layers to evaluate
+                 map_layers=['drivable_area'],
+                 val_step=10,  # Ensure val_step is defined or passed
                  ):
-    # --- 设置 Autograd Anomaly Detection ---
-    torch.autograd.set_detect_anomaly(True)
-    # --------------------------------------
-
-    # 训练前验证并确保数据集缓存存在
+    # --- Setup Autograd Anomaly Detection & Cache Check ---
+    # torch.autograd.set_detect_anomaly(True) # Enable only if debugging NaNs
     check_and_ensure_cache(dataroot, version)
 
-    grid_conf = {
-        'xbound': xbound,
-        'ybound': ybound,
-        'zbound': zbound,
-        'dbound': dbound,
-        'lidar_xbound': lidar_xbound,
-        'lidar_ybound': lidar_ybound,
+    # --- Configs ---
+    grid_conf = {  # Ensure grid_conf includes lidar bounds if used by model compilation
+        'xbound': xbound, 'ybound': ybound, 'zbound': zbound, 'dbound': dbound,
+        'lidar_xbound': lidar_xbound, 'lidar_ybound': lidar_ybound
     }
-    data_aug_conf = {
-        'resize_lim': resize_lim,
-        'final_dim': final_dim,
-        'rot_lim': rot_lim,
-        'H': H, 'W': W,
-        'rand_flip': rand_flip,
-        'bot_pct_lim': bot_pct_lim,
+    data_aug_conf = {  # Ensure data_aug_conf includes final_dim
+        'resize_lim': resize_lim, 'final_dim': final_dim, 'rot_lim': rot_lim,
+        'H': H, 'W': W, 'rand_flip': rand_flip, 'bot_pct_lim': bot_pct_lim,
         'cams': ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                  'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
         'Ncams': ncams,
     }
+    # Necessary for visualization if used
+    final_dim_vis = data_aug_conf['final_dim']
 
-    # --- Data Loading for Fusion ---
-    print("Attempting to load data using 'fusiondata' parser...")
+    # --- Data Loading ---
+    print("Loading data with 'fusiondata' parser (ensure it yields sample_token as 9th item)...")
+    # Pass lidar_inC if required by your compile_data/model
     trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
                                           parser_name='fusiondata', lidar_inC=lidar_inC)
     print("Data loaded.")
-    # --- End Data Loading ---
 
+    # --- Device and Model ---
     device = torch.device(
         'cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
-
-    # --- Model Compilation for Fusion ---
     print("Compiling FusionNet model...")
+    # Pass lidar_inC if required by your model compilation
     model = compile_model(grid_conf, data_aug_conf,
                           outC=1, lidar_inC=lidar_inC)
-    D_depth = model.D  # 从模型获取深度维度 D
+    # Get depth dimension if needed for visualization, handle case where model might not have D
+    D_depth = getattr(model, 'D', None)
     print("Model compiled.")
-    # --- End Model Compilation ---
+    model.to(device)
 
+    # --- Loss, Optimizer, Scaler ---
     loss_seg = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight)).to(device)
-    model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr,
                            weight_decay=weight_decay)
+    scaler = GradScaler(enabled=amp)
 
+    # --- Logging and Checkpointing Setup ---
     if resume != '':
         path = os.path.dirname(resume)
         if not os.path.exists(path):
             print(
                 f"Resume directory {path} does not exist. Creating log directory instead.")
-            path = save_path(logdir)  # Fallback to default logdir
+            path = save_path(logdir)
     else:
-        path = save_path(logdir)  # Use the potentially different logdir
+        path = save_path(logdir)
     writer = SummaryWriter(logdir=path)
     print(f"Logging to: {path}")
 
-    val_step = 10 if version == 'mini' else 30
-    scaler = GradScaler(enabled=amp)
-    model.train()
-    global_step = 0  # 使用 global_step 记录 TensorBoard
-    epoch = 0
-    max_iou = 0.0
+    # --- Initialize NuScenes API ---
+    nusc = None  # Initialize nusc to None
+    try:
+        print("Initializing NuScenes API...")
+        nusc_version_str = f'v1.0-{version}'
+        print(
+            f"Using NuScenes version: {nusc_version_str}, dataroot: {dataroot}")
+        nusc = NuScenes(version=nusc_version_str,
+                        dataroot=dataroot, verbose=False)
+        print("NuScenes API initialized successfully.")
+    except ImportError:
+        print("WARNING: nuscenes-devkit not found. Devkit validation will be skipped.")
+        print("Install with: pip install nuscenes-devkit")
+    except Exception as e:
+        print(f"WARNING: Failed to initialize NuScenes API: {e}")
+        print("Devkit validation will be skipped. Check dataroot and version.")
 
+    # --- Training State Init ---
+    global_step = 0
+    epoch = 0
+    max_iou = 0.0  # Track best simple IoU
+    max_f1 = 0.0   # Track best simple F1
+    max_devkit_f1 = 0.0  # Track best devkit F1
+
+    # --- Resume Logic ---
     if resume != '':
         if os.path.exists(resume):
-            print("Loading checkpoint '{}'".format(resume))
+            print(f"Loading checkpoint '{resume}'")
             checkpoint = torch.load(resume, map_location=device)
-            model.load_state_dict(checkpoint['net'])
-            opt.load_state_dict(checkpoint['optimizer'])
-            epoch = checkpoint['epoch'] + 1
-            if 'max_iou' in checkpoint:
-                max_iou = checkpoint['max_iou']
+
+            # Load model state
+            model_state_dict = checkpoint.get(
+                'net', checkpoint.get('model', None))
+            if model_state_dict:
+                model.load_state_dict(model_state_dict)
+            else:
+                print(
+                    "Warning: Could not find model state ('net' or 'model') in checkpoint.")
+
+            # Load optimizer state
+            if 'optimizer' in checkpoint:
+                opt.load_state_dict(checkpoint['optimizer'])
+            else:
+                print("Warning: Could not find optimizer state in checkpoint.")
+
+            # Load scaler state
             if amp and 'scaler' in checkpoint and checkpoint['scaler'] is not None:
                 try:
                     scaler.load_state_dict(checkpoint['scaler'])
                 except Exception as e:
                     print(f"Warning: Could not load scaler state: {e}")
-            if 'global_step' in checkpoint:  # 恢复 global_step
-                global_step = checkpoint['global_step']
+            elif amp and 'scaler' not in checkpoint:
+                print(
+                    "Warning: AMP is enabled, but no scaler state found in checkpoint.")
+
+            # Load epoch, step, and best metrics
+            epoch = checkpoint.get('epoch', 0) + 1
+            max_iou = checkpoint.get('max_iou', 0.0)
+            max_f1 = checkpoint.get('max_f1', 0.0)
+            max_devkit_f1 = checkpoint.get(
+                'max_devkit_f1', 0.0)  # Load devkit metric
+            global_step = checkpoint.get('global_step', 0)
+
             print(
-                f"Resuming training from epoch {epoch}, step {global_step}, best IoU so far: {max_iou:.4f}")
+                f"Resuming training from epoch {epoch}, step {global_step}, best Simple IoU: {max_iou:.4f}, Simple F1: {max_f1:.4f}, Devkit F1: {max_devkit_f1:.4f}")
         else:
             print(
                 f"Resume checkpoint {resume} not found. Starting from scratch.")
 
+    # --- Load Weight Logic ---
     if load_weight != '':
         if os.path.exists(load_weight):
             print("Loading weight '{}'".format(load_weight))
             checkpoint = torch.load(load_weight, map_location=device)
             model_dict = model.state_dict()
+            # Handle weights saved directly or within 'net' key
             pretrained_dict_source = checkpoint.get('net', checkpoint)
-            pretrained_dict = {k: v for k, v in pretrained_dict_source.items(
-            ) if k in model_dict and v.shape == model_dict[k].shape}
+            # Filter out unnecessary keys and layers with size mismatches
+            pretrained_dict = {k: v for k, v in pretrained_dict_source.items()
+                               if k in model_dict and v.shape == model_dict[k].shape}
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict)
             print(
-                f"Loaded weights from {load_weight}. {len(pretrained_dict)} matching keys found.")
+                f"Loaded {len(pretrained_dict)} matching weights from {load_weight}. Ignored {len(pretrained_dict_source) - len(pretrained_dict)} keys.")
         else:
             print(
                 f"Weight file {load_weight} not found. Skipping weight loading.")
 
+    # --- Training Loop ---
     print(f"Starting training from epoch {epoch}...")
     while epoch < nepochs:
-        np.random.seed()
+        np.random.seed(epoch)  # Seed with epoch for reproducibility if needed
         t0_epoch = time.time()
         model.train()
         epoch_loss = 0.0
-        pbar = tqdm(enumerate(trainloader), total=len(
-            trainloader), colour='#8762A5', desc=f"Epoch {epoch+1}/{nepochs}")
+        pbar = tqdm(enumerate(trainloader), total=len(trainloader),
+                    colour='#8762A5', desc=f"Epoch {epoch+1}/{nepochs}")
 
         for batchi, batch_data in pbar:
-            if len(batch_data) != 8:
+            # Expect 9 items: imgs, rots, trans, intrins, post_rots, post_trans, binimgs, lidar_bev, sample_tokens
+            # We don't need sample_tokens during training loop itself
+            # Handle both cases: dataloader yielding 8 items (old) or 9 items (new, with token)
+            if len(batch_data) == 9:
+                # Unpack 9 items, ignore the last one (token)
+                imgs, rots, trans, intrins, post_rots, post_trans, binimgs, lidar_bev, _ = batch_data
+            elif len(batch_data) == 8:
+                # Unpack only 8 items (no token provided by dataloader)
+                # Optional warning
                 print(
-                    f"Error: Expected 8 items from dataloader, got {len(batch_data)}. Check 'fusiondata' parser. Skipping batch.")
-                continue
-            try:
+                    "Warning: Training dataloader yielding only 8 items. sample_token unavailable.")
                 imgs, rots, trans, intrins, post_rots, post_trans, binimgs, lidar_bev = batch_data
-            except ValueError as e:
+            else:
                 print(
-                    f"Error unpacking batch data: {e}. Expected 8 items. Skipping batch.")
+                    f"Error: Expected 8 or 9 items from train dataloader, got {len(batch_data)}. Check dataset implementation. Skipping batch.")
                 continue
 
             opt.zero_grad()
             context = autocast(enabled=amp)
             with context:
-                preds, depth_prob = model(imgs.to(device),
-                                          rots.to(device),
-                                          trans.to(device),
-                                          intrins.to(device),
-                                          post_rots.to(device),
-                                          post_trans.to(device),
-                                          lidar_bev.to(device)
-                                          )
+                # Ensure model call matches expected inputs
+                # Assuming model returns (preds, depth_prob) based on original code
+                model_output = model(imgs.to(device),
+                                     rots.to(device),
+                                     trans.to(device),
+                                     intrins.to(device),
+                                     post_rots.to(device),
+                                     post_trans.to(device),
+                                     lidar_bev.to(device)
+                                     )
+                if isinstance(model_output, tuple) and len(model_output) == 2:
+                    preds, depth_prob = model_output
+                elif isinstance(model_output, torch.Tensor):
+                    preds = model_output
+                    depth_prob = None  # Model doesn't return depth
+                else:
+                    print(
+                        f"Error: Unexpected model output format: {type(model_output)}. Skipping batch.")
+                    continue
+
                 binimgs = binimgs.to(device)
                 loss = loss_seg(preds, binimgs)
 
             if not torch.isfinite(loss):
                 print(
-                    f"警告: Epoch {epoch+1}, Batch {batchi}, 检测到无效损失值 (nan/inf)。跳过梯度更新。 Loss: {loss.item()}")
-                continue
+                    f"Warning: Epoch {epoch+1}, Batch {batchi}, NaN/Inf loss detected. Skipping update. Loss: {loss.item()}")
+                # Consider adding gradient inspection here if NaNs persist
+                # for name, param in model.named_parameters():
+                #     if param.grad is not None and torch.isnan(param.grad).any():
+                #         print(f"NaN gradient in {name}")
+                continue  # Skip backward/step
 
             scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_grad_norm)
+            scaler.unscale_(opt)  # Unscale before clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(opt)
             scaler.update()
 
             epoch_loss += loss.item()
             global_step += 1
-
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            if global_step % log_vis_interval == 0:
+            # --- Training Visualization (Optional) ---
+            if log_vis_interval > 0 and global_step % log_vis_interval == 0:
                 with torch.no_grad():
-                    vis_idx = 0
-                    input_img_vis = imgs[vis_idx, 1].cpu()
-                    writer.add_image('train/input_image_front',
-                                     input_img_vis, global_step)
+                    try:
+                        vis_idx = 0  # Visualize first sample in batch
+                        # Input Image
+                        # Assuming index 1 is CAM_FRONT
+                        input_img_vis = imgs[vis_idx, 1].cpu()
+                        writer.add_image(
+                            'train/input_image_front', input_img_vis, global_step)
 
-                    lidar_bev_vis = lidar_bev[vis_idx].cpu().sum(
-                        0, keepdim=True)
-                    lidar_bev_vis = (lidar_bev_vis - lidar_bev_vis.min()) / \
-                        (lidar_bev_vis.max() - lidar_bev_vis.min() + 1e-6)
-                    writer.add_image('train/input_lidar_bev',
-                                     lidar_bev_vis, global_step)
+                        # LiDAR BEV Input
+                        lidar_bev_vis = lidar_bev[vis_idx].cpu().sum(
+                            0, keepdim=True)
+                        lidar_bev_vis = (lidar_bev_vis - lidar_bev_vis.min()) / \
+                                        (lidar_bev_vis.max() -
+                                         lidar_bev_vis.min() + 1e-6)
+                        writer.add_image('train/input_lidar_bev',
+                                         lidar_bev_vis, global_step)
 
-                    gt_bev_vis = binimgs[vis_idx].cpu().float()
-                    writer.add_image('train/gt_bev', gt_bev_vis, global_step)
+                        # Ground Truth BEV
+                        gt_bev_vis = binimgs[vis_idx].cpu().float()
+                        writer.add_image(
+                            'train/gt_bev', gt_bev_vis, global_step)
 
-                    pred_bev_vis = torch.sigmoid(preds[vis_idx]).cpu()
-                    writer.add_image('train/pred_bev',
-                                     pred_bev_vis, global_step)
+                        # Predicted BEV
+                        pred_bev_vis = torch.sigmoid(preds[vis_idx]).cpu()
+                        writer.add_image('train/pred_bev',
+                                         pred_bev_vis, global_step)
 
-                    front_cam_depth_prob = depth_prob[vis_idx, 1].cpu()
-                    depth_indices = torch.argmax(
-                        front_cam_depth_prob, dim=0, keepdim=True)
-                    vis_depth_map = depth_indices.float() / (D_depth - 1)
-                    vis_depth_map_resized = F.interpolate(vis_depth_map.unsqueeze(
-                        0), size=final_dim, mode='nearest').squeeze(0)
-                    writer.add_image('train/depth_map_front_maxprob',
-                                     vis_depth_map_resized, global_step)
+                        # Depth Map Visualization (if available)
+                        if depth_prob is not None and D_depth is not None:
+                            # Assuming index 1 is CAM_FRONT
+                            front_cam_depth_prob = depth_prob[vis_idx, 1].cpu()
+                            depth_indices = torch.argmax(
+                                front_cam_depth_prob, dim=0, keepdim=True)
+                            # Avoid division by zero if D_depth is 1
+                            vis_depth_map = depth_indices.float() / max(1, D_depth - 1)
+                            vis_depth_map_resized = F.interpolate(
+                                vis_depth_map.unsqueeze(0), size=final_dim_vis, mode='nearest').squeeze(0)
+                            writer.add_image('train/depth_map_front_maxprob',
+                                             vis_depth_map_resized, global_step)
+                    except Exception as vis_e:
+                        print(
+                            f"Warning: Error during training visualization: {vis_e}")
+                        # Prevent visualization error from stopping training
+                        pass
 
+        # --- End of Epoch ---
         avg_epoch_loss = epoch_loss / \
             len(trainloader) if len(trainloader) > 0 else 0.0
         t1_epoch = time.time()
         print(
-            f"Epoch {epoch + 1} Average Train Loss: {avg_epoch_loss:.4f}, Time: {t1_epoch - t0_epoch:.2f}s")
+            f"Epoch {epoch + 1} Avg Train Loss: {avg_epoch_loss:.4f}, Time: {t1_epoch - t0_epoch:.2f}s")
         writer.add_scalar('train/loss_epoch', avg_epoch_loss, epoch + 1)
 
+        # --- Save Last Checkpoint ---
         last_checkpoint = {
-            'net': model.state_dict(),
-            'optimizer': opt.state_dict(),
+            'net': model.state_dict(), 'optimizer': opt.state_dict(),
             'scaler': scaler.state_dict() if amp else None,
             'epoch': epoch,
-            'max_iou': max_iou,
+            # Save all best metrics
+            'max_iou': max_iou, 'max_f1': max_f1, 'max_devkit_f1': max_devkit_f1,
             'global_step': global_step
         }
         last_model_path = os.path.join(path, "last_fusion.pt")
-        torch.save(last_checkpoint, last_model_path)
+        try:
+            torch.save(last_checkpoint, last_model_path)
+        except Exception as e:
+            print(f"Error saving last checkpoint: {e}")
 
-        if (epoch + 1) % val_step == 0:
-            print(f"Running validation for epoch {epoch+1}...")
-            model.eval()
-            val_loss_total = 0.0
-            val_intersect_total = 0.0
-            val_union_total = 0.0
-            num_val_batches = 0
-            visualized_val = False
+        # --- Validation Step ---
+        if val_step > 0 and (epoch + 1) % val_step == 0:
+            print(f"--- Running Validation Epoch {epoch+1} ---")
+            # Pass necessary arguments to get_val_info_fusion, including writer, step, and vis params
+            # Note: Assuming the previous edit correctly added writer, global_step, final_dim_vis, D_depth to the call signature
+            val_info = get_val_info_fusion(model=model,
+                                           valloader=valloader,
+                                           loss_fn=loss_seg,
+                                           device=device,
+                                           nusc=nusc,
+                                           grid_conf=grid_conf,
+                                           writer=writer,  # Pass writer
+                                           global_step=global_step,  # Pass global_step
+                                           map_layers=map_layers,
+                                           final_dim_vis=final_dim_vis,  # Pass vis param
+                                           D_depth=D_depth)  # Pass vis param
 
-            with torch.no_grad():
-                for batchi_val, batch_data_val in tqdm(enumerate(valloader), total=len(valloader), desc="Validation"):
-                    if len(batch_data_val) != 8:
-                        continue
-                    try:
-                        imgs_val, rots_val, trans_val, intrins_val, post_rots_val, post_trans_val, binimgs_val, lidar_bev_val = batch_data_val
-                    except ValueError:
-                        continue
+            # Log metrics returned by get_val_info_fusion
+            # ... (Log simple and devkit metrics logic remains same) ...
+            writer.add_scalar('val/loss_epoch', val_info['loss'], epoch + 1)
+            writer.add_scalar('val/simple_iou',
+                              val_info['simple_iou'], epoch + 1)
+            writer.add_scalar('val/simple_precision',
+                              val_info['simple_precision'], epoch + 1)
+            writer.add_scalar('val/simple_recall',
+                              val_info['simple_recall'], epoch + 1)
+            writer.add_scalar(
+                'val/simple_f1', val_info['simple_f1'], epoch + 1)
+            if 'devkit_f1' in val_info:
+                writer.add_scalar('val/devkit_iou',
+                                  val_info['devkit_iou'], epoch + 1)
+                writer.add_scalar('val/devkit_precision',
+                                  val_info['devkit_precision'], epoch + 1)
+                writer.add_scalar('val/devkit_recall',
+                                  val_info['devkit_recall'], epoch + 1)
+                writer.add_scalar(
+                    'val/devkit_f1', val_info['devkit_f1'], epoch + 1)
 
-                    context_val = autocast(enabled=amp)
-                    with context_val:
-                        preds_val, depth_prob_val = model(imgs_val.to(device),
-                                                          rots_val.to(device),
-                                                          trans_val.to(device),
-                                                          intrins_val.to(
-                                                              device),
-                                                          post_rots_val.to(
-                                                              device),
-                                                          post_trans_val.to(
-                                                              device),
-                                                          lidar_bev_val.to(
-                                                              device)
-                                                          )
-                        binimgs_val = binimgs_val.to(device)
-                        loss_val = loss_seg(preds_val, binimgs_val)
-
-                    if torch.isfinite(loss_val):
-                        val_loss_total += loss_val.item()
-                        intersect, union, _ = get_batch_iou(
-                            preds_val, binimgs_val)
-                        val_intersect_total += intersect.item()
-                        val_union_total += union.item()
-                        num_val_batches += 1
-
-                        if not visualized_val:
-                            vis_idx_val = 0
-                            input_img_vis_val = imgs_val[vis_idx_val, 1].cpu()
-                            writer.add_image(
-                                'val/input_image_front', input_img_vis_val, global_step)
-
-                            lidar_bev_vis_val = lidar_bev_val[vis_idx_val].cpu().sum(
-                                0, keepdim=True)
-                            lidar_bev_vis_val = (lidar_bev_vis_val - lidar_bev_vis_val.min()) / (
-                                lidar_bev_vis_val.max() - lidar_bev_vis_val.min() + 1e-6)
-                            writer.add_image(
-                                'val/input_lidar_bev', lidar_bev_vis_val, global_step)
-
-                            gt_bev_vis_val = binimgs_val[vis_idx_val].cpu(
-                            ).float()
-                            writer.add_image(
-                                'val/gt_bev', gt_bev_vis_val, global_step)
-
-                            pred_bev_vis_val = torch.sigmoid(
-                                preds_val[vis_idx_val]).cpu()
-                            writer.add_image(
-                                'val/pred_bev', pred_bev_vis_val, global_step)
-
-                            front_cam_depth_prob_val = depth_prob_val[vis_idx_val, 1].cpu(
-                            )
-                            depth_indices_val = torch.argmax(
-                                front_cam_depth_prob_val, dim=0, keepdim=True)
-                            vis_depth_map_val = depth_indices_val.float() / (D_depth - 1)
-                            vis_depth_map_resized_val = F.interpolate(
-                                vis_depth_map_val.unsqueeze(0), size=final_dim, mode='nearest').squeeze(0)
-                            writer.add_image(
-                                'val/depth_map_front_maxprob', vis_depth_map_resized_val, global_step)
-                            visualized_val = True
-
-            avg_val_loss = val_loss_total / num_val_batches if num_val_batches > 0 else 0.0
-            current_iou = val_intersect_total / \
-                val_union_total if val_union_total > 0 else 0.0
-
-            print(
-                f"Validation Results Epoch {epoch + 1}: Avg Loss: {avg_val_loss:.4f}, IoU: {current_iou:.4f}")
-            writer.add_scalar('val/loss_epoch', avg_val_loss, epoch + 1)
-            writer.add_scalar('val/iou', current_iou, epoch + 1)
-
-            if current_iou > max_iou:
-                max_iou = current_iou
+            # --- Save Best Model Checkpoints --- #
+            # ... (Save best simple F1 and devkit F1 logic remains same) ...
+            current_f1 = val_info['simple_f1']
+            if current_f1 > max_f1:
+                max_f1 = current_f1
                 print(
-                    f"*** New best IoU: {max_iou:.4f}. Saving best model... ***")
-                best_checkpoint = {
-                    'net': model.state_dict(),
-                    'optimizer': opt.state_dict(),
-                    'scaler': scaler.state_dict() if amp else None,
-                    'epoch': epoch,
-                    'max_iou': max_iou,
+                    f"*** New best Simple F1: {max_f1:.4f}. Saving best_simple_f1 model... ***")
+                best_checkpoint_f1 = {
+                    'net': model.state_dict(), 'optimizer': opt.state_dict(),
+                    'scaler': scaler.state_dict() if amp else None, 'epoch': epoch,
+                    'max_iou': val_info.get('simple_iou', 0.0),
+                    'max_f1': max_f1,
+                    'max_devkit_f1': val_info.get('devkit_f1', 0.0),
                     'global_step': global_step
                 }
-                best_model_path = os.path.join(path, "best_fusion.pt")
-                torch.save(best_checkpoint, best_model_path)
-                print(f"Saved best model checkpoint to {best_model_path}")
+                best_model_path_f1 = os.path.join(
+                    path, "best_fusion_simple_f1.pt")
+                try:
+                    torch.save(best_checkpoint_f1, best_model_path_f1)
+                    print(
+                        f"Saved best simple F1 model checkpoint to {best_model_path_f1}")
+                except Exception as e:
+                    print(f"Error saving best simple F1 checkpoint: {e}")
+            if 'devkit_f1' in val_info:
+                current_devkit_f1 = val_info['devkit_f1']
+                if current_devkit_f1 > max_devkit_f1:
+                    max_devkit_f1 = current_devkit_f1
+                    print(
+                        f"*** New best Devkit F1: {max_devkit_f1:.4f}. Saving best_devkit_f1 model... ***")
+                    best_checkpoint_devkit_f1 = {
+                        'net': model.state_dict(), 'optimizer': opt.state_dict(),
+                        'scaler': scaler.state_dict() if amp else None, 'epoch': epoch,
+                        'max_iou': val_info.get('simple_iou', 0.0),
+                        'max_f1': val_info.get('simple_f1', 0.0),
+                        'max_devkit_f1': max_devkit_f1,
+                        'global_step': global_step
+                    }
+                    best_model_path_devkit_f1 = os.path.join(
+                        path, "best_fusion_devkit_f1.pt")
+                    try:
+                        torch.save(best_checkpoint_devkit_f1,
+                                   best_model_path_devkit_f1)
+                        print(
+                            f"Saved best devkit F1 model checkpoint to {best_model_path_devkit_f1}")
+                    except Exception as e:
+                        print(f"Error saving best devkit F1 checkpoint: {e}")
+            current_iou = val_info['simple_iou']
+            if current_iou > max_iou:
+                max_iou = current_iou
+                # Optional: save best IoU model
 
-            model.train()
+            # --- Validation Visualization Block Removed ---
+            # Visualization is now handled inside get_val_info_fusion in tools.py
 
+            print(f"--- Finished Validation Epoch {epoch+1} ---")
+            model.train()  # Ensure model is back in train mode
+
+        # --- Increment Epoch --- #
         epoch += 1
 
+    # --- End Training Loop --- #
     print("Training finished.")
     writer.close()
+
+# Note: Ensure that the functions called within (like compile_data, compile_model, get_val_info_fusion, etc.)
+# are correctly defined and imported elsewhere in your project.
