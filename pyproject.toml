@@ -23,7 +23,6 @@ dependencies = [
     "torchvision>=0.11", # Adjust based on your torch version
     "torchaudio>=0.10", # Adjust based on your torch version
     "tensorboardX",
-    "numpy",
     "tqdm",
     "nuscenes-devkit", # Note: Installation might require specific steps or git cloning. Check its documentation.
     "pillow", # Often needed for image loading
